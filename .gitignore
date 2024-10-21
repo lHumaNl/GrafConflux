@@ -1,0 +1,5 @@
+.venv
+.idea
+graphs
+*.yaml
+*.yml
