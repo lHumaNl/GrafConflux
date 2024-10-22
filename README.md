@@ -51,27 +51,27 @@ downloading charts. The configuration file (`config.yaml` by default) is structu
 
 ### YAML Configuration Parameters:
 
-| Parameter                    | Type    | Default | Description                                            |
-|------------------------------|---------|---------|--------------------------------------------------------|
-| `dash_title`                 | `str`   | —       | Title of the dashboard in Grafana.                     |
-| `host`                       | `str`   | —       | URL of the Grafana instance.                           |
-| `width`                      | `int`   | `1920`  | Width of the graphs.                                   |
-| `height`                     | `int`   | `1080`  | Height of the graphs.                                  |
-| `render`                     | `bool`  | `True`  | Whether to use the Grafana render plugin.              |
-| `chrome_driver_preload_time` | `float` | `2.5`   | Preload time for the Chrome driver.                    |
-| `timeout`                    | `int`   | `30`    | Timeout for requests.                                  |
-| `tz`                         | `str`   | `None`  | Time zone to be used in Grafana.                       |
-| `threads`                    | `int`   | `4`     | Number of threads for processing.                      |
-| `vars`                       | `dict`  | `None`  | Variables to pass to the Grafana dashboard.            |
-| `white_theme`                | `bool`  | `False` | Whether to use the white theme for rendering.          |
-| `orgId`                      | `int`   | `1`     | Organization ID in Grafana.                            |
-| `login`                      | `str`   | `None`  | Grafana login (if authentication is required).         |
-| `password`                   | `str`   | `None`  | Grafana password (if authentication is required).      |
-| `token`                      | `str`   | `None`  | Grafana API token (if used instead of login/password). |
-| `auth`                       | `bool`  | `True`  | Whether authentication is enabled for Grafana.         |
-| `domain`                     | `bool`  | `False` | Whether to use domain-based login (for LDAP).          |
-| `verify_ssl`                 | `bool`  | `True`  | Whether to verify SSL certificates in Grafana.         |
-| `folder`                     | `str`   | `None`  | Folder to save graphs locally.                         |
+| Parameter                    | Type    | Default | Description                                                    |
+|------------------------------|---------|---------|----------------------------------------------------------------|
+| `dash_title`                 | `str`   | —       | Title of the dashboard in Grafana.                             |
+| `host`                       | `str`   | —       | URL of the Grafana instance.                                   |
+| `width`                      | `int`   | `1920`  | Width of the graphs.                                           |
+| `height`                     | `int`   | `1080`  | Height of the graphs.                                          |
+| `render`                     | `bool`  | `True`  | Whether to use the Grafana render plugin.                      |
+| `chrome_driver_preload_time` | `float` | `2.5`   | Preload time for the Chrome driver.                            |
+| `timeout`                    | `int`   | `30`    | Timeout for requests.                                          |
+| `tz`                         | `str`   | `None`  | Time zone to be used in Grafana.                               |
+| `threads`                    | `int`   | `4`     | Number of threads for processing.                              |
+| `vars`                       | `dict`  | `None`  | Variables to pass to the Grafana dashboard.                    |
+| `white_theme`                | `bool`  | `False` | Whether to use the white theme for rendering.                  |
+| `orgId`                      | `int`   | `1`     | Organization ID in Grafana.                                    |
+| `login`                      | `str`   | `None`  | Grafana login (if authentication is required).                 |
+| `password`                   | `str`   | `None`  | Grafana password (if authentication is required).              |
+| `token`                      | `str`   | `None`  | Grafana API token (if used instead of login/password).         |
+| `auth`                       | `bool`  | `True`  | Whether authentication is enabled for Grafana.                 |
+| `domain`                     | `bool`  | `False` | Whether to use domain-based login (use Confluence login\pass). |
+| `verify_ssl`                 | `bool`  | `True`  | Whether to verify SSL certificates in Grafana.                 |
+| `folder`                     | `str`   | `None`  | Folder to save graphs locally.                                 |
 
 Each Grafana instance should have its own entry in the configuration file. The `render` parameter specifies whether the
 Grafana render plugin should be used (`true`) or if screenshots should be taken using Selenium (`false`).
