@@ -4,7 +4,8 @@ blinker==1.7.0
 selenium==4.25.0
 selenium-wire==5.1.0
 python-dotenv==1.0.0
-atlassian-python-api==3.41.0
+atlassian-python-api>=3.41.0
 urllib3==2.2.3
 lxml==5.3.0
 demjson3==3.0.6
+pytz>=2024.2

@@ -2,14 +2,13 @@ import datetime
 import logging
 import os
 import sys
-import threading
+from concurrent.futures import ThreadPoolExecutor, wait
 
 import urllib3
 
-from args_parser import ArgsParser
-from grafana import GrafanaManager, GrafanaConfig
-from confluence import ConfluenceManager
-from utils import load_grafana_config
+from services.args_parser import ArgsParser
+from services.grafana import GrafanaManager, GrafanaConfig
+from services.confluence import ConfluenceManager
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -21,38 +20,36 @@ def main():
     try:
         args = ArgsParser()
         current_time = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        test_folder = os.path.join(args.test_folder, f'{args.test_id}__')
+        test_folder = os.path.join(args.test_folder, f'{args.test_id}__{current_time}')
 
         # Load Grafana configurations
-        grafana_configs = load_grafana_config(args.config_file)
+        grafana_configs = GrafanaManager.load_grafana_config(args.config_file)
 
         # Initialize Confluence manager
         confluence_manager = ConfluenceManager(
             login=args.confluence_login,
             password=args.confluence_password,
             page_id=args.confluence_page_id,
+            upload_threads=args.threads,
             wiki_url=args.wiki_url,
             verify_ssl=args.confluence_verify_ssl
         )
 
         # Process each Grafana config
-        # threads = []
-        for grafana_config in grafana_configs:
-            process_grafana_dashboard(grafana_config, test_folder, args, confluence_manager)
-            # thread = threading.Thread(target=process_grafana_dashboard, args=(
-            #     grafana_config,
-            #     args,
-            #     confluence_manager
-            # ))
-            # threads.append(thread)
-            # thread.start()
+        executor = ThreadPoolExecutor(max_workers=args.threads)
+        futures = []
 
-        # for thread in threads:
-        #    thread.join()
+        for grafana_config in grafana_configs:
+            futures.append(
+                executor.submit(process_grafana_dashboard, grafana_config, test_folder, args, confluence_manager)
+            )
+
+        wait(futures)
+        executor.shutdown()
 
         # Update Confluence page content
-        confluence_manager.update_page_content(grafana_configs, args.timestamps, args.graph_height)
-
+        if not args.only_graphs:
+            confluence_manager.update_page_content(grafana_configs, args.timestamps, args.graph_width)
     except Exception as e:
         logger.error(f'An error occurred: {e}')
         sys.exit(1)
@@ -74,10 +71,10 @@ def process_grafana_dashboard(grafana_config: GrafanaConfig, test_folder: str, a
         )
 
         # Upload to Confluence
-        # confluence_manager.upload_charts(
-        #     grafana_manager.charts_path
-        # )
-
+        if not args.only_graphs:
+            confluence_manager.upload_charts(
+                grafana_manager.charts_path
+            )
     except Exception as e:
         logger.error(f'Failed to process dashboard {grafana_config.dash_title}: {e}')
 

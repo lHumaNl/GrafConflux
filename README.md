@@ -30,6 +30,7 @@ To run GrafConflux, you need the following dependencies, which are listed in the
 - Urllib3
 - LXML
 - Demjson3
+- PyTZ
 
 To install the dependencies, run:
 
@@ -51,27 +52,27 @@ downloading charts. The configuration file (`config.yaml` by default) is structu
 
 ### YAML Configuration Parameters:
 
-| Parameter                    | Type    | Default | Description                                                    |
-|------------------------------|---------|---------|----------------------------------------------------------------|
-| `dash_title`                 | `str`   | —       | Title of the dashboard in Grafana.                             |
-| `host`                       | `str`   | —       | URL of the Grafana instance.                                   |
-| `width`                      | `int`   | `1920`  | Width of the graphs.                                           |
-| `height`                     | `int`   | `1080`  | Height of the graphs.                                          |
-| `render`                     | `bool`  | `True`  | Whether to use the Grafana render plugin.                      |
-| `chrome_driver_preload_time` | `float` | `2.5`   | Preload time for the Chrome driver.                            |
-| `timeout`                    | `int`   | `30`    | Timeout for requests.                                          |
-| `tz`                         | `str`   | `None`  | Time zone to be used in Grafana.                               |
-| `threads`                    | `int`   | `4`     | Number of threads for processing.                              |
-| `vars`                       | `dict`  | `None`  | Variables to pass to the Grafana dashboard.                    |
-| `white_theme`                | `bool`  | `False` | Whether to use the white theme for rendering.                  |
-| `orgId`                      | `int`   | `1`     | Organization ID in Grafana.                                    |
-| `login`                      | `str`   | `None`  | Grafana login (if authentication is required).                 |
-| `password`                   | `str`   | `None`  | Grafana password (if authentication is required).              |
-| `token`                      | `str`   | `None`  | Grafana API token (if used instead of login/password).         |
-| `auth`                       | `bool`  | `True`  | Whether authentication is enabled for Grafana.                 |
-| `domain`                     | `bool`  | `False` | Whether to use domain-based login (use Confluence login\pass). |
-| `verify_ssl`                 | `bool`  | `True`  | Whether to verify SSL certificates in Grafana.                 |
-| `folder`                     | `str`   | `None`  | Folder to save graphs locally.                                 |
+| Parameter                    | Type    | Default | Description                                                                      |
+|------------------------------|---------|---------|----------------------------------------------------------------------------------|
+| `dash_title`                 | `str`   | —       | Title of the dashboard in Grafana.                                               |
+| `host`                       | `str`   | —       | URL of the Grafana instance.                                                     |
+| `width`                      | `int`   | `1920`  | Width of the graphs.                                                             |
+| `height`                     | `int`   | `1080`  | Height of the graphs.                                                            |
+| `render`                     | `bool`  | `True`  | Whether to use the Grafana render plugin.                                        |
+| `chrome_driver_preload_time` | `float` | `2.5`   | Preload time for the Chrome driver.                                              |
+| `timeout`                    | `int`   | `30`    | Timeout for requests.                                                            |
+| `tz`                         | `str`   | `None`  | Time zone to be used in Grafana.                                                 |
+| `threads`                    | `int`   | `4`     | Number of threads for processing.                                                |
+| `vars`                       | `dict`  | `None`  | Variables to pass to the Grafana dashboard.                                      |
+| `white_theme`                | `bool`  | `False` | Whether to use the white theme for rendering.                                    |
+| `orgId`                      | `int`   | `1`     | Organization ID in Grafana.                                                      |
+| `login`                      | `str`   | `None`  | Grafana login (if authentication is required).                                   |
+| `password`                   | `str`   | `None`  | Grafana password (if authentication is required).                                |
+| `token`                      | `str`   | `None`  | Grafana API token (if used instead of login/password).                           |
+| `auth`                       | `bool`  | `True`  | Whether authentication is enabled for Grafana.                                   |
+| `domain`                     | `bool`  | `False` | Whether to use domain-based login (use Confluence login\pass).                   |
+| `verify_ssl`                 | `bool`  | `True`  | Whether to verify SSL certificates in Grafana.                                   |
+| `folder`                     | `str`   | `None`  | Folder in Grafana with dashboard (Need if many dashboards with identical names). |
 
 Each Grafana instance should have its own entry in the configuration file. The `render` parameter specifies whether the
 Grafana render plugin should be used (`true`) or if screenshots should be taken using Selenium (`false`).
@@ -117,9 +118,12 @@ DB Statistic:
 | `-p`, `--confluence_password`          | `str`  | Value from environment variable `CONFLUENCE_PASSWORD` | Confluence password.                                         |
 | `-i`, `--confluence_page_id`           | `int`  | —                                                     | ID of the Confluence page for uploading data.                |
 | `-f`, `--test_folder`                  | `str`  | `graphs`                                              | Folder for saving the graphs.                                |
-| `-H`, `--graph_height`                 | `int`  | `1500`                                                | Height of the graphs in Confluence.                          |
+| `-W`, `--graph_width`                  | `int`  | `1500`                                                | Width of the graphs in Confluence.                           |
 | `-I`, `--test_id`                      | `int`  | `-1`                                                  | Test ID.                                                     |
+| `-T`, `--threads`                      | `int`  | `4`                                                   | Threads for parsing Grafana dashboards.                      |
+| `-z`, `--tz`                           | `str`  | `UTC`                                                 | TZ for --timestamps.                                         |
 | `-t`, `--timestamps`                   | `list` | —                                                     | List of time ranges in the format `<tag>__&from=...&to=...`. |
+| `-g`, `--only_graphs`                  | `flag` | `False`                                               | Download only graphs.                                        |
 
 You can run the GrafConflux utility by executing the following command:
 
