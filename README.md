@@ -141,8 +141,3 @@ For example:
 ```bash
 python main.py --wiki_url "https://confluence.example.com" --confluence_page_id 12345 --confluence_login "user" --confluence_password "pass" --timestamps "Stability__&from=1609459200000&to=1609545600000"
 ```
-
-## Logging
-
-The utility uses Python's built-in logging. You can adjust the log level by modifying the `basicConfig` in the `main.py`
-file.
