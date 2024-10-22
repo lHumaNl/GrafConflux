@@ -33,6 +33,7 @@ class ArgsParser:
         parser.add_argument('-i', '--confluence_page_id', type=int, required=True,
                             help='Confluence page ID to upload data')
         parser.add_argument('-f', '--test_folder', type=str, default='graphs', help='Folder for graphs')
+        parser.add_argument('-H', '--graph_height', type=int, default=1500, help='Height of graphs in Confluence')
         parser.add_argument('-I', '--test_id', type=int, default=-1, help='Test ID')
         parser.add_argument('-t', '--timestamps', required=True, nargs='+',
                             help='Time periods in format &from=...&to=...')
@@ -45,6 +46,7 @@ class ArgsParser:
         self.confluence_password: str = args.confluence_password
         self.confluence_page_id: int = args.confluence_page_id
         self.test_folder: str = args.test_folder
+        self.graph_height: int = args.graph_height
         self.test_id: int = args.test_id
 
         self.timestamps: List[GrafanaTime] = []

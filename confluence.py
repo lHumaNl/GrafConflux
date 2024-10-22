@@ -48,7 +48,7 @@ class ConfluenceManager:
             )
         logger.debug(f'Uploaded {file_name} to Confluence.')
 
-    def update_page_content(self, grafana_configs:List[GrafanaConfig], timestamps:List[GrafanaTime]):
+    def update_page_content(self, grafana_configs:List[GrafanaConfig], timestamps:List[GrafanaTime],graph_height:int):
         """
         Update the Confluence page with the new content.
         """
@@ -76,7 +76,8 @@ class ConfluenceManager:
                     image_name = f'{grafana_config.name}__{panel.panel_id}__{timestamp.id_time}.png'
                     image_link = f'/download/attachments/{self.page_id}/{image_name}'
                     new_content += f'    <p><a href="{image_link}">{panel.title} - {period}</a></p>\n'
-                    new_content += f'    <p><ac:image><ri:attachment ri:filename="{image_name}" /></ac:image></p>\n'
+                    new_content += (f'    <p><ac:image ac:height="{graph_height}">'
+                                    f'<ri:attachment ri:filename="{image_name}" /></ac:image></p>\n')
 
                 new_content += '  </ac:rich-text-body>\n'
                 new_content += '</ac:structured-macro>\n'

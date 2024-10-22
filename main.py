@@ -51,7 +51,7 @@ def main():
         #    thread.join()
 
         # Update Confluence page content
-        confluence_manager.update_page_content(grafana_configs, args.timestamps)
+        confluence_manager.update_page_content(grafana_configs, args.timestamps, args.graph_height)
 
     except Exception as e:
         logger.error(f'An error occurred: {e}')
