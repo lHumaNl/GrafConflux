@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -9,13 +10,13 @@ from urllib.parse import urlencode, urlparse
 from concurrent.futures import ThreadPoolExecutor, wait
 
 import requests
-from selenium.webdriver.chrome.options import Options
 from seleniumwire import webdriver
+from selenium.webdriver.firefox.options import Options
 from lxml import html
 import demjson3
 import yaml
 
-from args_parser import GrafanaTime
+from services.args_parser import GrafanaTime
 
 logger = logging.getLogger(__name__)
 logging.getLogger('seleniumwire').setLevel(logging.ERROR)
@@ -42,7 +43,7 @@ class GrafanaConfig:
     width: int = 1920
     height: int = 1080
     render: bool = True
-    chrome_driver_preload_time: float = 2.5
+    firefox_driver_preload_time: float = 2.5
     timeout: int = 30
     tz: Optional[str] = None
     threads: int = 4
@@ -64,7 +65,8 @@ class GrafanaManager:
     """
 
     def __init__(self, config: GrafanaConfig):
-        self.browser_list: Optional[List[webdriver.Chrome]] = None
+        self.thread_local = threading.local()
+        self.browser_list: Optional[List[webdriver.Firefox]] = []
         self.dashboard_url = ''
         self.config = config
         self.session = requests.Session()
@@ -123,30 +125,47 @@ class GrafanaManager:
         self.config.full_links = self.__get_full_links(timestamps)
 
         futures = []
-        executor = ThreadPoolExecutor(max_workers=1)  # TODO
+        executor = ThreadPoolExecutor(max_workers=self.config.threads)
         try:
-            if not self.config.render:
-                self.__init_browser_list()
-
             for panel in self.panels:
                 for timestamp in timestamps:
-                    if not self.config.render:
-                        browser = self.browser_list[0]
-                    else:
-                        browser = None
-
                     futures.append(
                         executor.submit(
-                            self.__download_chart, panel, timestamp, browser
+                            self.__download_chart, panel, timestamp
                         )
                     )
+
+            wait(futures)
         finally:
             if self.browser_list:
-                wait(futures)
                 for browser in self.browser_list:
-                    browser.close()
+                    browser.quit()
+                self.browser_list = []
 
             executor.shutdown()
+
+        self.__save_params_to_file(timestamps, test_folder)
+
+    @classmethod
+    def __convert_to_dict(cls, obj):
+        if isinstance(obj, list):
+            return [cls.__convert_to_dict(item) for item in obj]
+        elif hasattr(obj, '__dict__'):
+            return {key: cls.__convert_to_dict(value) for key, value in obj.__dict__.items()}
+        else:
+            return obj
+
+    def __save_params_to_file(self, timestamps: List[GrafanaTime], test_folder: str):
+        save_data = {
+            'name': self.config.name,
+            'charts_path': self.charts_path,
+            'full_links': self.config.full_links,
+            'timestamps': self.__convert_to_dict(timestamps),
+            'panels': self.__convert_to_dict(self.config.panels)
+        }
+
+        with open(os.path.join(test_folder, f'{self.config.name}.yaml'), 'w+', encoding='utf-8') as yaml_file:
+            yaml_file.write(yaml.safe_dump(save_data, sort_keys=False, allow_unicode=True))
 
     def __get_full_links(self, timestamps: List[GrafanaTime]):
         url = f'{self.config.host}{self.dashboard_url}'
@@ -216,10 +235,24 @@ class GrafanaManager:
 
         return extracted_panels
 
-    def __download_chart(self, panel: Panel, timestamp: GrafanaTime, browser: Optional[webdriver.Chrome] = None):
+    def __download_chart(self, panel: Panel, timestamp: GrafanaTime):
         """
         Download or render a single chart.
         """
+        if not self.config.render:
+            browser = getattr(self.thread_local, 'browser', None)
+
+            if browser is None:
+                browser = self.__init_browser()
+                if browser:
+                    self.thread_local.browser = browser
+                    self.browser_list.append(browser)
+                else:
+                    logger.error('Failed to initialize browser')
+                    return
+        else:
+            browser = None
+
         file_name = f'{self.config.name}__{panel.panel_id}__{timestamp.id_time}.png'
 
         file_path = os.path.join(self.charts_path, file_name)
@@ -228,20 +261,26 @@ class GrafanaManager:
 
         if self.config.render:
             # Use Grafana rendering API
-            render_url = f'{self.config.host}/render/d-solo/{self.dashboard_uid}/{self.dashboard_url}'
+            del params['viewPanel']
+            params['width'] = self.config.width
+            params['height'] = self.config.height
+            params['timeout'] = self.config.timeout
 
-            response = self.session.get(render_url, params=params, verify=self.config.verify_ssl)
+            render_url = f'{self.config.host}/render/d-solo{self.dashboard_url[2:]}'
+            response = self.session.get(render_url, params=params, verify=self.config.verify_ssl,
+                                        timeout=self.config.timeout)
 
             try:
-                self.session.get(f"{final_url}&fullscreen", verify=self.config.verify_ssl)
+                self.session.get(f"{final_url}&fullscreen", verify=self.config.verify_ssl, timeout=self.config.timeout)
                 panel.links[timestamp.id_time] = f"{final_url}&fullscreen"
             except Exception:
-                self.session.get(final_url, verify=self.config.verify_ssl)
+                self.session.get(final_url, verify=self.config.verify_ssl, timeout=self.config.timeout)
                 panel.links[timestamp.id_time] = final_url
 
             if response.status_code == 200:
                 with open(file_path, 'wb') as f:
                     f.write(response.content)
+
                 logger.info(f'Downloaded chart to {file_path}')
             else:
                 logger.error(f'Failed to download chart for panel {panel.panel_id}')
@@ -272,42 +311,47 @@ class GrafanaManager:
 
         return url, params
 
-    def __init_browser_list(self):
-        self.browser_list = []
+    def __init_browser(self):
+        firefox_options = Options()
+        firefox_options.add_argument('--headless')
+        firefox_options.add_argument('--disable-gpu')
+        firefox_options.add_argument(f'--width={self.config.width}')
+        firefox_options.add_argument(f'--height={self.config.height}')
 
-        for i in range(self.config.threads):
-            options = Options()
-            options.add_argument('--headless')
-            options.add_argument('--disable-gpu')
-            options.add_argument('--no-sandbox')
-            options.add_argument(f'--window-size={self.config.width},{self.config.height}')
-            if not self.config.verify_ssl:
-                options.add_argument('--ignore-certificate-errors')
+        if not self.config.verify_ssl:
+            firefox_options.accept_insecure_certs = True
 
-            parsed_url = urlparse(self.config.host)
-            grafana_host = parsed_url.hostname
+        selenium_wire_options = {
+            'network.stricttransportsecurity.preloadlist': False,
+            'network.stricttransportsecurity.enabled': False,
+        }
 
-            cookies = {
-                name: cookie.__dict__
-                for value in self.session.cookies._cookies[grafana_host].values()
-                for name, cookie in value.items()
-            }
+        parsed_url = urlparse(self.config.host)
+        grafana_host = parsed_url.hostname
 
-            browser = webdriver.Chrome(options=options)
-            try:
-                browser.get(self.config.host)
-                browser.set_window_size(self.config.width, self.config.height)
+        cookies = {
+            name: cookie.__dict__
+            for value in self.session.cookies._cookies[grafana_host].values()
+            for name, cookie in value.items()
+        }
 
-                for name, cookie in cookies.items():
-                    browser.add_cookie(cookie)
+        browser = webdriver.Firefox(options=firefox_options, seleniumwire_options=selenium_wire_options)
 
-                browser.set_page_load_timeout(self.config.timeout)
+        try:
+            browser.get(self.config.host)
 
-                self.browser_list.append(browser)
-            except Exception as e:
-                logger.error(f'Failed to configure browser: {e}')
+            for name, cookie in cookies.items():
+                browser.add_cookie(cookie)
 
-    def __take_screenshot(self, browser: webdriver.Chrome, panel: Panel, time_id: int, final_url, file_path):
+            browser.set_page_load_timeout(self.config.timeout)
+
+            return browser
+        except Exception as e:
+            logger.error(f'Failed to configure browser: {e}')
+
+            return None
+
+    def __take_screenshot(self, browser: webdriver.Firefox, panel: Panel, time_id: int, final_url, file_path):
         """
         Use a headless browser to take a screenshot of the panel.
         """
@@ -326,6 +370,7 @@ class GrafanaManager:
             panel.links[time_id] = f"{final_url}&fullscreen"
             self.__wait_for_network_request(browser, panel_data_sources, self.config.timeout)
             browser.save_screenshot(file_path)
+
             logger.info(f'Screenshot saved to {file_path}')
         except Exception:
             try:
@@ -341,16 +386,17 @@ class GrafanaManager:
                 panel.links[time_id] = final_url
                 self.__wait_for_network_request(browser, panel_data_sources, self.config.timeout)
                 browser.save_screenshot(file_path)
+
                 logger.info(f'Screenshot saved to {file_path}')
             except Exception as e:
                 logger.error(f'Failed to take screenshot: {e}')
 
-    def __wait_for_network_request(self, browser: webdriver.Chrome, url_part: List[str], timeout):
+    def __wait_for_network_request(self, browser: webdriver.Firefox, url_part: List[str], timeout):
         """
         Wait until a network request containing `url_part` has completed.
         """
         if url_part:
-            time.sleep(self.config.chrome_driver_preload_time)
+            time.sleep(self.config.firefox_driver_preload_time)
             start_time = time.time()
 
             while True:
@@ -370,7 +416,7 @@ class GrafanaManager:
                 if is_all_200_ok and is_all_download:
                     return
 
-                if time.time() - start_time > timeout - self.config.chrome_driver_preload_time:
+                if time.time() - start_time > timeout - self.config.firefox_driver_preload_time:
                     return
 
                 time.sleep(0.1)

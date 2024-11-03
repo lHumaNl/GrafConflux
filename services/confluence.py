@@ -4,8 +4,8 @@ import html
 from concurrent.futures import ThreadPoolExecutor, wait
 from typing import List
 from atlassian import Confluence
-from args_parser import GrafanaTime
-from grafana import GrafanaConfig
+from services.args_parser import GrafanaTime
+from services.grafana import GrafanaConfig
 
 logger = logging.getLogger(__name__)
 
@@ -63,10 +63,9 @@ class ConfluenceManager:
         """
         page = self.confluence.get_page_by_id(self.page_id, expand='body.storage')
 
-        # Build new content
         new_content = ''
         for grafana_config in grafana_configs:
-            dash_title = html.escape(grafana_config.dash_title)
+            dash_title = html.escape(grafana_config.name)
             new_content += f'<h2>{dash_title}</h2>\n'
 
             for timestamp in timestamps:
@@ -85,7 +84,6 @@ class ConfluenceManager:
             new_content += f'  <ac:parameter ac:name="title">{dash_title}</ac:parameter>\n'
             new_content += '  <ac:rich-text-body>\n'
 
-            # Assuming rows are defined in panels (simplified)
             for panel in grafana_config.panels:
                 row_title = html.escape(panel.title)
                 new_content += f'<h3>{row_title}</h3>\n'
