@@ -4,59 +4,96 @@ import os
 import re
 import threading
 import time
-from dataclasses import dataclass
+from abc import ABC
 from typing import Dict, List, Optional
 from urllib.parse import urlencode, urlparse
 from concurrent.futures import ThreadPoolExecutor, wait
 
 import requests
 from seleniumwire import webdriver
+from selenium.webdriver import Keys
+from selenium.webdriver.common.by import By
 from selenium.webdriver.firefox.options import Options
 from lxml import html
 import demjson3
 import yaml
 
-from services.args_parser import GrafanaTime
+from services.args_parser import GrafanaTimeDownloader, GrafanaTimeUploader
 
 logger = logging.getLogger(__name__)
 logging.getLogger('seleniumwire').setLevel(logging.ERROR)
 
 
-@dataclass
 class Panel:
-    panel_id: int
-    type: str
-    title: str
-    links: List[Optional[str]]
+    def __init__(self, panel_id: int, graph_type: str, title: str, timestamps_count: int):
+        self.panel_id: int = panel_id
+        self.type: str = graph_type
+        self.title: str = title
+        self.links: List[Optional[str]] = []
+
+        for i in range(timestamps_count):
+            self.links.append(None)
 
 
-@dataclass
-class GrafanaConfig:
+class GrafanaConfigBase(ABC):
+    def __init__(self, name: str):
+        self.name: str = name
+        self.panels: Optional[List[Panel]] = None
+        self.full_links: Optional[List[str]] = None
+        self.snapshot_urls: Optional[List[str]] = None
+
+
+class GrafanaConfigUploader(GrafanaConfigBase):
+    def __init__(self, name: str, config: Dict):
+        super().__init__(name)
+
+        self.panels: Optional[List[Panel]] = []
+        if isinstance(config['panels'][0], Panel):
+            self.panels = config['panels']
+        else:
+            for panel in config['panels']:
+                self.panels.append(Panel(panel['panel_id'], panel['type'], panel['title'], len(config['timestamps'])))
+
+        self.full_links: Optional[List[str]] = config['full_links']
+        self.snapshot_urls: Optional[List[str]] = config['snapshot_urls']
+        self.charts_path: str = config['charts_path']
+
+        self.timestamps: List[GrafanaTimeUploader] = []
+        if isinstance(config['timestamps'][0], GrafanaTimeUploader):
+            self.timestamps = config['timestamps']
+        else:
+            for timestamp in config['timestamps']:
+                self.timestamps.append(GrafanaTimeUploader(timestamp))
+
+
+class GrafanaConfigDownloader(GrafanaConfigBase):
     """
     Class representing Grafana configuration.
     """
-    name: str
-    dash_title: str
-    host: str
-    panels: Optional[List[Panel]] = None
-    full_links: Optional[str] = None
-    width: int = 1920
-    height: int = 1080
-    render: bool = True
-    firefox_driver_preload_time: float = 2.5
-    timeout: int = 30
-    tz: Optional[str] = None
-    threads: int = 4
-    vars: Optional[Dict[str, str]] = None
-    white_theme: bool = False
-    orgId: int = 1
-    login: str = None
-    password: str = None
-    token: str = None
-    auth: bool = True
-    domain: bool = False
-    verify_ssl: bool = True
-    folder: Optional[str] = None
+
+    def __init__(self, name: str, config: Dict):
+        super().__init__(name)
+        self.dash_title: str = config['dash_title']
+        self.host: str = config['host']
+        self.width: int = config.get('width', 1920)
+        self.height: int = config.get('height', 1080)
+        self.render: bool = config.get('render', True)
+        self.snapshot: bool = config.get('snapshot', False)
+        self.snapshot_timeout: int = config.get('snapshot_timeout', 30)
+        self.firefox_driver_preload_time: float = config.get('firefox_driver_preload_time', 2.5)
+        self.timeout: int = config.get('timeout', 30)
+        self.tz: Optional[str] = config.get('tz', None)
+        self.threads: int = config.get('threads', 4)
+        self.vars: Optional[Dict[str, str]] = config.get('vars', None)
+        self.white_theme: bool = config.get('white_theme', False)
+        self.orgId: int = config.get('orgId', 1)
+        self.login: Optional[str] = config.get('login', None)
+        self.password: Optional[str] = config.get('password', None)
+        self.token: Optional[str] = config.get('token', None)
+        self.auth: bool = config.get('auth', True)
+        self.domain: bool = config.get('domain', False)
+        self.verify_ssl: bool = config.get('verify_ssl', True)
+        self.folder: Optional[str] = config.get('folder', None)
 
 
 class GrafanaManager:
@@ -64,7 +101,7 @@ class GrafanaManager:
     Manages interactions with a Grafana instance.
     """
 
-    def __init__(self, config: GrafanaConfig):
+    def __init__(self, config: GrafanaConfigDownloader):
         self.thread_local = threading.local()
         self.browser_list: Optional[List[webdriver.Firefox]] = []
         self.dashboard_url = ''
@@ -72,7 +109,6 @@ class GrafanaManager:
         self.session = requests.Session()
         self.charts_path = ''
         self.dashboard_uid = ''
-        self.panels: List[Panel] = []
 
     def authenticate(self, confluence_login: str, confluence_password: str):
         """
@@ -107,7 +143,7 @@ class GrafanaManager:
             raise ConnectionError('Failed to authenticate with Grafana.')
         logger.info('Successfully authenticated with Grafana.')
 
-    def download_charts(self, test_folder: str, timestamps: List[GrafanaTime]):
+    def download_charts(self, test_folder: str, timestamps: List[GrafanaTimeDownloader]):
         """
         Download charts from Grafana.
         """
@@ -119,15 +155,14 @@ class GrafanaManager:
         self.dashboard_uid, self.dashboard_url = self.get_dashboard_uid()
 
         # Get panels
-        self.panels = self.get_panels(timestamps)
-        self.config.panels = self.panels
+        self.config.panels = self.get_panels(timestamps)
 
         self.config.full_links = self.__get_full_links(timestamps)
 
         futures = []
         executor = ThreadPoolExecutor(max_workers=self.config.threads)
         try:
-            for panel in self.panels:
+            for panel in self.config.panels:
                 for timestamp in timestamps:
                     futures.append(
                         executor.submit(
@@ -144,30 +179,141 @@ class GrafanaManager:
 
             executor.shutdown()
 
+        if self.config.snapshot:
+            self.take_snapshot(timestamps, test_folder)
+
         self.__save_params_to_file(timestamps, test_folder)
 
+    def take_snapshot(self, timestamps: List[GrafanaTimeDownloader], test_folder: str):
+        firefox_options = Options()
+        firefox_options.add_argument('--headless')
+        firefox_options.add_argument('--disable-gpu')
+        firefox_options.add_argument(f'--width={self.config.width}')
+        firefox_options.add_argument(f'--height={self.config.height}')
+
+        if not self.config.verify_ssl:
+            firefox_options.accept_insecure_certs = True
+
+        selenium_wire_options = {
+            'network.stricttransportsecurity.preloadlist': False,
+            'network.stricttransportsecurity.enabled': False,
+        }
+
+        parsed_url = urlparse(self.config.host)
+        grafana_host = parsed_url.hostname
+
+        cookies = {
+            name: cookie.__dict__
+            for value in self.session.cookies._cookies[grafana_host].values()
+            for name, cookie in value.items()
+        }
+
+        browser = webdriver.Firefox(options=firefox_options, seleniumwire_options=selenium_wire_options)
+
+        browser.get(self.config.host)
+
+        for name, cookie in cookies.items():
+            browser.add_cookie(cookie)
+
+        browser.set_page_load_timeout(self.config.timeout)
+
+        for timestamp in timestamps:
+            try:
+                browser.get(self.config.full_links[timestamp.id_time])
+                time.sleep(5)
+
+                scrollable_div = browser.find_element(By.CSS_SELECTOR, '.scrollbar-view')
+                prev_scroll_position = browser.execute_script("return arguments[0].scrollTop", scrollable_div)
+                while True:
+                    scrollable_div.send_keys(Keys.PAGE_DOWN)
+                    current_scroll_position = browser.execute_script("return arguments[0].scrollTop", scrollable_div)
+
+                    if current_scroll_position == prev_scroll_position:
+                        break
+
+                    prev_scroll_position = current_scroll_position
+
+                dashboard_menu_button = browser.find_element(By.CSS_SELECTOR, 'button[aria-label="Share dashboard"]')
+                dashboard_menu_button.click()
+                time.sleep(1)
+
+                snapshot_tab = browser.find_element(By.CSS_SELECTOR, 'a[aria-label="Tab Snapshot"]')
+                snapshot_tab.click()
+                time.sleep(1)
+
+                snapshot_name_input = browser.find_element(By.CSS_SELECTOR, 'input[id="snapshot-name-input"]')
+                snapshot_name = f'{self.config.name}__{timestamp.time_tag}'
+                snapshot_name_input.clear()
+                snapshot_name_input.send_keys(snapshot_name)
+
+                snapshot_timeout_input = browser.find_element(By.CSS_SELECTOR, 'input[id="timeout-input"]')
+                snapshot_timeout_input.clear()
+                snapshot_timeout_input.send_keys(f"{self.config.snapshot_timeout}")
+                snapshot_timeout_input.send_keys(Keys.HOME)
+                snapshot_timeout_input.send_keys(Keys.DELETE)
+
+                save_snapshot_button = browser.find_element("xpath", "//button[.//span[text()='Local Snapshot']]")
+                save_snapshot_button.click()
+                time.sleep(self.config.snapshot_timeout + 2)
+
+                snapshot_link_element = browser.find_element(By.CSS_SELECTOR, 'input[id="snapshot-url-input"]')
+                snapshot_link = snapshot_link_element.get_attribute('value')
+
+                snapshot_key = snapshot_link.split('/')[-1]
+                snapshot_json_url = f'{self.config.host}/api/snapshots/{snapshot_key}'
+                snapshot_url = f'{self.config.host}/dashboard/snapshot/{snapshot_key}'
+
+                if self.config.snapshot_urls is None:
+                    self.config.snapshot_urls = []
+                self.config.snapshot_urls.append(snapshot_url)
+
+                logger.info(f'Link to snapshot {self.config.name}: {snapshot_url}')
+
+                browser.quit()
+
+                response = self.session.get(snapshot_json_url)
+                if response.status_code != 200:
+                    logger.error(f'Failed on {snapshot_json_url}')
+                    return
+
+                snapshot_json = response.json()
+
+                output_file = os.path.join(test_folder, f'{self.config.name}__{timestamp.time_tag}.json')
+                with open(output_file, 'w') as f:
+                    f.write(json.dumps(snapshot_json, ensure_ascii=False, sort_keys=False))
+
+                logger.info(f'Snapshot backup for {self.config.name} saved in {output_file}')
+            except Exception as e:
+                logger.error(f'Failed on dashboard {self.config.name}: {e}', exc_info=True)
+            finally:
+                if browser:
+                    browser.quit()
+
     @classmethod
-    def __convert_to_dict(cls, obj):
+    def convert_to_dict(cls, obj):
         if isinstance(obj, list):
-            return [cls.__convert_to_dict(item) for item in obj]
+            return [cls.convert_to_dict(item) for item in obj]
         elif hasattr(obj, '__dict__'):
-            return {key: cls.__convert_to_dict(value) for key, value in obj.__dict__.items()}
+            return {key: cls.convert_to_dict(value) for key, value in obj.__dict__.items()}
         else:
             return obj
 
-    def __save_params_to_file(self, timestamps: List[GrafanaTime], test_folder: str):
+    def __save_params_to_file(self, timestamps: List[GrafanaTimeDownloader], test_folder: str):
         save_data = {
             'name': self.config.name,
             'charts_path': self.charts_path,
             'full_links': self.config.full_links,
-            'timestamps': self.__convert_to_dict(timestamps),
-            'panels': self.__convert_to_dict(self.config.panels)
+            'timestamps': self.convert_to_dict(timestamps),
+            'panels': self.convert_to_dict(self.config.panels)
         }
+
+        if self.config.snapshot_urls:
+            save_data.update({'snapshot_urls': self.config.snapshot_urls})
 
         with open(os.path.join(test_folder, f'{self.config.name}.yaml'), 'w+', encoding='utf-8') as yaml_file:
             yaml_file.write(yaml.safe_dump(save_data, sort_keys=False, allow_unicode=True))
 
-    def __get_full_links(self, timestamps: List[GrafanaTime]):
+    def __get_full_links(self, timestamps: List[GrafanaTimeDownloader]):
         url = f'{self.config.host}{self.dashboard_url}'
         links = []
 
@@ -182,7 +328,7 @@ class GrafanaManager:
                 for key, value in self.config.vars.items():
                     params.update({f'var-{key}': value})
 
-            links.append(f"{url}?{urlencode(params)}")
+            links.append(f"{url}?{urlencode(params, doseq=True)}")
 
         return links
 
@@ -203,11 +349,10 @@ class GrafanaManager:
                 return dash['uid'], dash['url']
         raise ValueError(f'Dashboard with title "{self.config.dash_title}" not found.')
 
-    def get_panels(self, timestamps: List[GrafanaTime]):
+    def get_panels(self, timestamps: List[GrafanaTimeDownloader]):
         """
         Retrieve panel information from the dashboard.
         """
-        null_timestamp_list = [None for _ in timestamps]
         response = self.session.get(f'{self.config.host}/api/dashboards/uid/{self.dashboard_uid}',
                                     verify=self.config.verify_ssl)
         if response.status_code != 200:
@@ -218,7 +363,7 @@ class GrafanaManager:
 
         panels = []
         for raw_panel in raw_panels:
-            panels.append(Panel(raw_panel['id'], raw_panel['type'], raw_panel.get('title', 'Row'), null_timestamp_list))
+            panels.append(Panel(raw_panel['id'], raw_panel['type'], raw_panel.get('title', 'Row'), len(timestamps)))
 
         return panels
 
@@ -235,7 +380,7 @@ class GrafanaManager:
 
         return extracted_panels
 
-    def __download_chart(self, panel: Panel, timestamp: GrafanaTime):
+    def __download_chart(self, panel: Panel, timestamp: GrafanaTimeDownloader):
         """
         Download or render a single chart.
         """
@@ -257,7 +402,7 @@ class GrafanaManager:
 
         file_path = os.path.join(self.charts_path, file_name)
         url, params = self.__build_panel_url(panel, timestamp)
-        final_url = f"{url}?{urlencode(params)}"
+        final_url = f"{url}?{urlencode(params, doseq=True)}"
 
         if self.config.render:
             # Use Grafana rendering API
@@ -288,7 +433,7 @@ class GrafanaManager:
             # Use headless browser
             self.__take_screenshot(browser, panel, timestamp.id_time, final_url, file_path)
 
-    def __build_panel_url(self, panel: Panel, timestamp: GrafanaTime):
+    def __build_panel_url(self, panel: Panel, timestamp: GrafanaTimeDownloader):
         """
         Build the URL for a panel in view mode.
         """
@@ -445,7 +590,7 @@ class GrafanaManager:
         return panel_data_sources
 
     @staticmethod
-    def load_grafana_config(path: str) -> List[GrafanaConfig]:
+    def load_grafana_config(path: str) -> List[GrafanaConfigDownloader]:
         """
         Load YAML configuration file.
         """
@@ -454,6 +599,6 @@ class GrafanaManager:
 
         grafana_configs = []
         for config_name, config_data in config.items():
-            grafana_configs.append(GrafanaConfig(name=config_name, **config_data))
+            grafana_configs.append(GrafanaConfigDownloader(config_name, config_data))
 
         return grafana_configs
