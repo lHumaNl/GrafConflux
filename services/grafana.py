@@ -137,7 +137,8 @@ class GrafanaManager:
         }
 
         response = self.session.post(f'{self.config.host}/login', headers={'Content-type': 'application/json'},
-                                     data=json.dumps(payload), verify=self.config.verify_ssl)
+                                     data=json.dumps(payload), verify=self.config.verify_ssl,
+                                     timeout=self.config.timeout)
 
         if response.status_code != 200:
             raise ConnectionError('Failed to authenticate with Grafana.')
@@ -271,7 +272,8 @@ class GrafanaManager:
 
                 browser.quit()
 
-                response = self.session.get(snapshot_json_url)
+                response = self.session.get(snapshot_json_url, verify=self.config.verify_ssl,
+                                            timeout=self.config.timeout)
                 if response.status_code != 200:
                     logger.error(f'Failed on {snapshot_json_url}')
                     return
@@ -338,7 +340,7 @@ class GrafanaManager:
         """
         response = self.session.get(f'{self.config.host}/api/search',
                                     params={'query': self.config.dash_title},
-                                    verify=self.config.verify_ssl)
+                                    verify=self.config.verify_ssl, timeout=self.config.timeout)
         if response.status_code != 200:
             raise ConnectionError('Failed to retrieve dashboard list.')
 
@@ -354,7 +356,7 @@ class GrafanaManager:
         Retrieve panel information from the dashboard.
         """
         response = self.session.get(f'{self.config.host}/api/dashboards/uid/{self.dashboard_uid}',
-                                    verify=self.config.verify_ssl)
+                                    verify=self.config.verify_ssl, timeout=self.config.timeout)
         if response.status_code != 200:
             raise ConnectionError('Failed to retrieve dashboard details.')
 
@@ -569,7 +571,7 @@ class GrafanaManager:
             time.sleep(self.config.timeout)
 
     def __get_panel_data_sources(self, final_url):
-        response = self.session.get(final_url, verify=self.config.verify_ssl).text
+        response = self.session.get(final_url, verify=self.config.verify_ssl, timeout=self.config.timeout).text
         panel_data_sources = []
         tree = html.fromstring(response)
 
