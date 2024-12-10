@@ -87,11 +87,12 @@ def upload_already_downloaded_graphs(args: ArgsParser):
     if len(args.test_upload_folders) > 1:
         grafana_configs, folder_graphs = transform_grafana_configs(grafana_configs, args)
     else:
-        folder_graphs = args.test_upload_folders
+        folder_graphs = args.test_upload_folders[0]
 
     for grafana_config in grafana_configs:
         confluence_manager.upload_charts(grafana_config.charts_path)
 
+    confluence_manager.upload_charts(folder_graphs, [['.json', 'application/json']])
     confluence_manager.update_page_content(grafana_configs, grafana_configs[0].timestamps, args.graph_width,
                                            folder_graphs)
 

@@ -52,7 +52,7 @@ class ConfluenceManager:
                     file_content_type = [
                         file_format[1]
                         for file_format in files_format
-                        if file.__contains__(file_format[1])
+                        if file.__contains__(file_format[0])
                     ][0]
                     self.__upload_attachment(file_path, file, file_content_type)
             else:
@@ -91,30 +91,66 @@ class ConfluenceManager:
             new_content += '<ac:structured-macro ac:name="expand">\n'
             new_content += '  <ac:parameter ac:name="title">Snapshot backups</ac:parameter>\n'
             new_content += '  <ac:rich-text-body>\n'
+
             for snapshot in snapshot_list:
-                new_content += f'      <p><ac:link><ri:attachment ri:filename="{html.escape(snapshot)}" /></ac:link>{html.escape(snapshot)}</p>\n'
+                snapshot_name = html.escape(snapshot)
+                new_content += f'<p><ac:link><ri:attachment ri:filename="{snapshot_name}" />'
+                new_content += f'<ac:plain-text-link-body><![CDATA[{snapshot_name}]]></ac:plain-text-link-body>'
+                new_content += '</ac:link></p>\n'
+
             new_content += '  </ac:rich-text-body>\n'
             new_content += '</ac:structured-macro>\n'
+
+        new_content += '<ac:structured-macro ac:name="expand">\n'
+        new_content += '  <ac:parameter ac:name="title">Test times</ac:parameter>\n'
+        new_content += '  <ac:rich-text-body>\n'
+
+        new_content += '<table>\n'
+        new_content += '  <tbody>\n'
+        new_content += '    <tr>\n'
+        new_content += '      <th>Test tag</th>\n'
+        new_content += '      <th>Start test time</th>\n'
+        new_content += '      <th>End test time</th>\n'
+        new_content += '    </tr>\n'
+
+        for timestamp in timestamps:
+            new_content += '    <tr>\n'
+            new_content += f'      <td>{timestamp.time_tag}</td>\n'
+            new_content += f'      <td>{timestamp.start_time_human}</td>\n'
+            new_content += f'      <td>{timestamp.end_time_human}</td>\n'
+            new_content += '    </tr>\n'
+
+        new_content += '  </tbody>\n'
+        new_content += '</table>\n'
+
+        new_content += '  </ac:rich-text-body>\n'
+        new_content += '</ac:structured-macro>\n'
 
         for grafana_config in grafana_configs:
             dash_title = html.escape(grafana_config.name)
             new_content += f'<h2>{dash_title}</h2>\n'
 
-            for timestamp in timestamps:
+            new_content += '<p>Dashboard links</p>\n'
+            snapshot_urls = ''
 
+            for timestamp in timestamps:
                 if len(timestamps) > 1:
-                    period = f' {html.escape(timestamp.time_tag)} ' \
-                        if timestamp.time_tag else f' Test {timestamp.id_time + 1} '
+                    period = f'{html.escape(timestamp.time_tag)}' \
+                        if timestamp.time_tag else f'Test {timestamp.id_time + 1}'
                 else:
-                    period = f' {html.escape(timestamp.time_tag)} ' \
-                        if timestamp.time_tag else ' '
+                    period = f'{html.escape(timestamp.time_tag)}' if timestamp.time_tag else ''
 
                 new_content += (f'<p><a href="{html.escape(grafana_config.full_links[timestamp.id_time])}">'
-                                f'{dash_title}{period}{timestamp.start_time_human} - {timestamp.end_time_human}</a></p>\n')
+                                f'{period}</a></p>\n')
                 if grafana_config.snapshot_urls:
-                    new_content += (f'<p><a href="{html.escape(grafana_config.snapshot_urls[timestamp.id_time])}">'
-                                    f'{dash_title}{period}{timestamp.start_time_human} - {timestamp.end_time_human} (Snapshot)</a></p>\n')
+                    snapshot_urls += (f'<p><a href="{html.escape(grafana_config.snapshot_urls[timestamp.id_time])}">'
+                                      f'{period} (Snapshot)</a></p>\n')
 
+            if snapshot_urls != '':
+                new_content += '<p>Snapshots</p>\n'
+                new_content += snapshot_urls
+
+            new_content += '<p>Panels</p>\n'
             new_content += f'<ac:structured-macro ac:name="expand">\n'
             new_content += f'  <ac:parameter ac:name="title">{dash_title}</ac:parameter>\n'
             new_content += '  <ac:rich-text-body>\n'
@@ -128,14 +164,12 @@ class ConfluenceManager:
 
                 for timestamp in timestamps:
                     if len(timestamps) > 1:
-                        period = f'{html.escape(timestamp.time_tag)} ' if timestamp.time_tag else f'Test {timestamp.id_time + 1} '
-                        time_str = f'{timestamp.start_time_human} - {timestamp.end_time_human}'
+                        period = f'{html.escape(timestamp.time_tag)}' if timestamp.time_tag else f'Test {timestamp.id_time + 1}'
                     else:
                         period = f'{row_title}'
-                        time_str = f''
 
                     image_name = f'{grafana_config.name}__{panel.panel_id}__{timestamp.id_time}.png'
-                    new_content += f'    <p><a href="{html.escape(panel.links[timestamp.id_time])}">{period}{time_str}</a></p>\n'
+                    new_content += f'    <p><a href="{html.escape(panel.links[timestamp.id_time])}">{period}</a></p>\n'
                     new_content += (f'    <p><ac:image ac:width="{graph_width}">'
                                     f'<ri:attachment ri:filename="{html.escape(image_name)}" /></ac:image></p>\n')
 

@@ -83,12 +83,11 @@ class ArgsParser:
         parser.add_argument('-f', '--test_root_folder', type=str, default='graphs', help='Folder for graphs')
         parser.add_argument('-u', '--test_upload_folders', nargs='+', help='Folders with already downloaded graphs')
         parser.add_argument('-W', '--graph_width', type=int, default=1500, help='Width of graphs in Confluence')
-        parser.add_argument('-I', '--test_id', type=int, default=-1, help='Test ID')
+        parser.add_argument('-I', '--test_id', type=str, default='-1', help='Test ID')
         parser.add_argument('-T', '--threads', type=int, default=4, help='Threads for parsing Grafana dashboards')
         parser.add_argument('-z', '--tz', type=str, default='UTC', help='TZ for --timestamps')
         parser.add_argument('-t', '--timestamps', nargs='+', help='Time periods in format &from=...&to=...')
-        parser.add_argument('-g', '--only_graphs', action='store_true',
-                            help='Download only graphs')
+        parser.add_argument('-g', '--only_graphs', action='store_true', help='Download only graphs')
 
         args = parser.parse_args()
 
@@ -101,7 +100,7 @@ class ArgsParser:
         self.test_root_folder: str = args.test_root_folder
         self.test_upload_folders: List[str] = args.test_upload_folders
         self.graph_width: int = args.graph_width
-        self.test_id: int = args.test_id
+        self.test_id: str = args.test_id
         self.threads: int = args.threads
         self.only_graphs: bool = args.only_graphs
         self.tz: str = args.tz

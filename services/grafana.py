@@ -25,14 +25,18 @@ logging.getLogger('seleniumwire').setLevel(logging.ERROR)
 
 
 class Panel:
-    def __init__(self, panel_id: int, graph_type: str, title: str, timestamps_count: int):
+    def __init__(self, panel_id: int, graph_type: str, title: str, timestamps_count: int,
+                 links: Optional[List[str]] = None):
         self.panel_id: int = panel_id
         self.type: str = graph_type
         self.title: str = title
         self.links: List[Optional[str]] = []
 
-        for i in range(timestamps_count):
-            self.links.append(None)
+        if links:
+            self.links = links
+        else:
+            for i in range(timestamps_count):
+                self.links.append(None)
 
 
 class GrafanaConfigBase(ABC):
@@ -52,7 +56,13 @@ class GrafanaConfigUploader(GrafanaConfigBase):
             self.panels = config['panels']
         else:
             for panel in config['panels']:
-                self.panels.append(Panel(panel['panel_id'], panel['type'], panel['title'], len(config['timestamps'])))
+                if 'links' in panel and len(panel['links']) > 0:
+                    self.panels.append(
+                        Panel(panel['panel_id'], panel['type'], panel['title'], len(config['timestamps']),
+                              panel['links']))
+                else:
+                    self.panels.append(
+                        Panel(panel['panel_id'], panel['type'], panel['title'], len(config['timestamps'])))
 
         self.full_links: Optional[List[str]] = config['full_links']
         self.snapshot_urls: Optional[List[str]] = config['snapshot_urls']
@@ -218,78 +228,78 @@ class GrafanaManager:
 
         browser.set_page_load_timeout(self.config.timeout)
 
-        for timestamp in timestamps:
-            try:
-                browser.get(self.config.full_links[timestamp.id_time])
-                time.sleep(5)
+        try:
+            for timestamp in timestamps:
+                try:
+                    browser.get(self.config.full_links[timestamp.id_time])
+                    time.sleep(5)
 
-                scrollable_div = browser.find_element(By.CSS_SELECTOR, '.scrollbar-view')
-                prev_scroll_position = browser.execute_script("return arguments[0].scrollTop", scrollable_div)
-                while True:
-                    scrollable_div.send_keys(Keys.PAGE_DOWN)
-                    current_scroll_position = browser.execute_script("return arguments[0].scrollTop", scrollable_div)
+                    scrollable_div = browser.find_element(By.CSS_SELECTOR, '.scrollbar-view')
+                    prev_scroll_position = -1
+                    while True:
+                        scrollable_div.send_keys(Keys.PAGE_DOWN)
+                        time.sleep(0.2)
+                        current_scroll_position = browser.execute_script("return arguments[0].scrollTop", scrollable_div)
 
-                    if current_scroll_position == prev_scroll_position:
-                        break
+                        if current_scroll_position == prev_scroll_position:
+                            scrollable_div.send_keys(Keys.PAGE_DOWN)
+                            break
 
-                    prev_scroll_position = current_scroll_position
+                        prev_scroll_position = current_scroll_position
 
-                dashboard_menu_button = browser.find_element(By.CSS_SELECTOR, 'button[aria-label="Share dashboard"]')
-                dashboard_menu_button.click()
-                time.sleep(1)
+                    dashboard_menu_button = browser.find_element(By.CSS_SELECTOR, 'button[aria-label="Share dashboard"]')
+                    dashboard_menu_button.click()
+                    time.sleep(1)
 
-                snapshot_tab = browser.find_element(By.CSS_SELECTOR, 'a[aria-label="Tab Snapshot"]')
-                snapshot_tab.click()
-                time.sleep(1)
+                    snapshot_tab = browser.find_element(By.CSS_SELECTOR, 'a[aria-label="Tab Snapshot"]')
+                    snapshot_tab.click()
+                    time.sleep(1)
 
-                snapshot_name_input = browser.find_element(By.CSS_SELECTOR, 'input[id="snapshot-name-input"]')
-                snapshot_name = f'{self.config.name}__{timestamp.time_tag}'
-                snapshot_name_input.clear()
-                snapshot_name_input.send_keys(snapshot_name)
+                    snapshot_name_input = browser.find_element(By.CSS_SELECTOR, 'input[id="snapshot-name-input"]')
+                    snapshot_name = f'{self.config.name}__{timestamp.time_tag}'
+                    snapshot_name_input.clear()
+                    snapshot_name_input.send_keys(snapshot_name)
 
-                snapshot_timeout_input = browser.find_element(By.CSS_SELECTOR, 'input[id="timeout-input"]')
-                snapshot_timeout_input.clear()
-                snapshot_timeout_input.send_keys(f"{self.config.snapshot_timeout}")
-                snapshot_timeout_input.send_keys(Keys.HOME)
-                snapshot_timeout_input.send_keys(Keys.DELETE)
+                    snapshot_timeout_input = browser.find_element(By.CSS_SELECTOR, 'input[id="timeout-input"]')
+                    snapshot_timeout_input.clear()
+                    snapshot_timeout_input.send_keys(f"{self.config.snapshot_timeout}")
+                    snapshot_timeout_input.send_keys(Keys.HOME)
+                    snapshot_timeout_input.send_keys(Keys.DELETE)
 
-                save_snapshot_button = browser.find_element("xpath", "//button[.//span[text()='Local Snapshot']]")
-                save_snapshot_button.click()
-                time.sleep(self.config.snapshot_timeout + 2)
+                    save_snapshot_button = browser.find_element("xpath", "//button[.//span[text()='Local Snapshot']]")
+                    save_snapshot_button.click()
+                    time.sleep(self.config.snapshot_timeout + 2)
 
-                snapshot_link_element = browser.find_element(By.CSS_SELECTOR, 'input[id="snapshot-url-input"]')
-                snapshot_link = snapshot_link_element.get_attribute('value')
+                    snapshot_link_element = browser.find_element(By.CSS_SELECTOR, 'input[id="snapshot-url-input"]')
+                    snapshot_link = snapshot_link_element.get_attribute('value')
 
-                snapshot_key = snapshot_link.split('/')[-1]
-                snapshot_json_url = f'{self.config.host}/api/snapshots/{snapshot_key}'
-                snapshot_url = f'{self.config.host}/dashboard/snapshot/{snapshot_key}'
+                    snapshot_key = snapshot_link.split('/')[-1]
+                    snapshot_json_url = f'{self.config.host}/api/snapshots/{snapshot_key}'
+                    snapshot_url = f'{self.config.host}/dashboard/snapshot/{snapshot_key}'
 
-                if self.config.snapshot_urls is None:
-                    self.config.snapshot_urls = []
-                self.config.snapshot_urls.append(snapshot_url)
+                    if self.config.snapshot_urls is None:
+                        self.config.snapshot_urls = []
+                    self.config.snapshot_urls.append(snapshot_url)
 
-                logger.info(f'Link to snapshot {self.config.name}: {snapshot_url}')
+                    logger.info(f'Link to snapshot {self.config.name}: {snapshot_url}')
 
-                browser.quit()
+                    response = self.session.get(snapshot_json_url, verify=self.config.verify_ssl,
+                                                timeout=self.config.timeout)
+                    if response.status_code != 200:
+                        logger.error(f'Failed on {snapshot_json_url}')
+                        return
 
-                response = self.session.get(snapshot_json_url, verify=self.config.verify_ssl,
-                                            timeout=self.config.timeout)
-                if response.status_code != 200:
-                    logger.error(f'Failed on {snapshot_json_url}')
-                    return
+                    snapshot_json = response.json()
 
-                snapshot_json = response.json()
+                    output_file = os.path.join(test_folder, f'{self.config.name}__{timestamp.time_tag}.json')
+                    with open(output_file, 'w') as f:
+                        f.write(json.dumps(snapshot_json, ensure_ascii=False, sort_keys=False))
 
-                output_file = os.path.join(test_folder, f'{self.config.name}__{timestamp.time_tag}.json')
-                with open(output_file, 'w') as f:
-                    f.write(json.dumps(snapshot_json, ensure_ascii=False, sort_keys=False))
-
-                logger.info(f'Snapshot backup for {self.config.name} saved in {output_file}')
-            except Exception as e:
-                logger.error(f'Failed on dashboard {self.config.name}: {e}', exc_info=True)
-            finally:
-                if browser:
-                    browser.quit()
+                    logger.info(f'Snapshot backup for {self.config.name} saved in {output_file}')
+                except Exception as e:
+                    logger.error(f'Failed on dashboard {self.config.name}: {e}', exc_info=True)
+        finally:
+            browser.quit()
 
     @classmethod
     def convert_to_dict(cls, obj):
@@ -393,6 +403,7 @@ class GrafanaManager:
                 browser = self.__init_browser()
                 if browser:
                     self.thread_local.browser = browser
+                    self.thread_local.is_fullscreen = None
                     self.browser_list.append(browser)
                 else:
                     logger.error('Failed to initialize browser')
@@ -504,39 +515,81 @@ class GrafanaManager:
         """
         panel_data_sources = self.__get_panel_data_sources(final_url)
 
-        try:
-            browser.get(f"{final_url}&fullscreen")
-            is_200 = any(
-                request.url == f"{final_url}&fullscreen" and request.response.status_code == 200
-                for request in browser.requests
-            )
-
-            if not is_200:
-                raise Exception
-
-            panel.links[time_id] = f"{final_url}&fullscreen"
-            self.__wait_for_network_request(browser, panel_data_sources, self.config.timeout)
-            browser.save_screenshot(file_path)
-
-            logger.info(f'Screenshot saved to {file_path}')
-        except Exception:
+        if self.thread_local.is_fullscreen is None:
             try:
-                browser.get(final_url)
+                browser.get(f"{final_url}&fullscreen")
                 is_200 = any(
-                    request.url == final_url and request.response.status_code == 200
+                    request.url == f"{final_url}&fullscreen" and request.response.status_code == 200
                     for request in browser.requests
                 )
 
                 if not is_200:
-                    raise Exception(f'Request to {final_url} does not return 200 OK!')
+                    raise Exception
 
-                panel.links[time_id] = final_url
+                self.thread_local.is_fullscreen = True
+
+                panel.links[time_id] = f"{final_url}&fullscreen"
                 self.__wait_for_network_request(browser, panel_data_sources, self.config.timeout)
                 browser.save_screenshot(file_path)
 
                 logger.info(f'Screenshot saved to {file_path}')
-            except Exception as e:
-                logger.error(f'Failed to take screenshot: {e}')
+            except Exception:
+                try:
+                    browser.get(final_url)
+                    is_200 = any(
+                        request.url == final_url and request.response.status_code == 200
+                        for request in browser.requests
+                    )
+
+                    if not is_200:
+                        raise Exception(f'Request to {final_url} does not return 200 OK!')
+
+                    self.thread_local.is_fullscreen = False
+
+                    panel.links[time_id] = final_url
+                    self.__wait_for_network_request(browser, panel_data_sources, self.config.timeout)
+                    browser.save_screenshot(file_path)
+
+                    logger.info(f'Screenshot saved to {file_path}')
+                except Exception as e:
+                    logger.error(f'Failed to take screenshot: {e}')
+        else:
+            if self.thread_local.is_fullscreen:
+                try:
+                    browser.get(f"{final_url}&fullscreen")
+                    is_200 = any(
+                        request.url == f"{final_url}&fullscreen" and request.response.status_code == 200
+                        for request in browser.requests
+                    )
+
+                    if not is_200:
+                        raise Exception
+
+                    panel.links[time_id] = f"{final_url}&fullscreen"
+                    self.__wait_for_network_request(browser, panel_data_sources, self.config.timeout)
+                    browser.save_screenshot(file_path)
+
+                    logger.info(f'Screenshot saved to {file_path}')
+                except Exception as e:
+                    logger.error(f'Failed to take screenshot: {e}')
+            else:
+                try:
+                    browser.get(final_url)
+                    is_200 = any(
+                        request.url == final_url and request.response.status_code == 200
+                        for request in browser.requests
+                    )
+
+                    if not is_200:
+                        raise Exception(f'Request to {final_url} does not return 200 OK!')
+
+                    panel.links[time_id] = final_url
+                    self.__wait_for_network_request(browser, panel_data_sources, self.config.timeout)
+                    browser.save_screenshot(file_path)
+
+                    logger.info(f'Screenshot saved to {file_path}')
+                except Exception as e:
+                    logger.error(f'Failed to take screenshot: {e}')
 
     def __wait_for_network_request(self, browser: webdriver.Firefox, url_part: List[str], timeout):
         """
