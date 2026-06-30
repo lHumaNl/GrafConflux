@@ -1,0 +1,253 @@
+import os
+import tempfile
+import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+from grafconflux import confluence, confluence_content
+from grafconflux.confluence import ConfluenceManager, apply_graphs_placeholder, build_confluence_storage_content
+from grafconflux.grafana import GrafanaConfigUploader, Panel
+
+
+class TestConfluenceContent(unittest.TestCase):
+    def setUp(self):
+        self.timestamps = [
+            SimpleNamespace(
+                id_time=0,
+                time_tag="smoke",
+                start_time_human="2025/01/01 00:00:00",
+                end_time_human="2025/01/01 01:00:00",
+            )
+        ]
+        self.grafana_configs = [
+            SimpleNamespace(
+                name="Demo dashboard",
+                full_links=["https://grafana.example/d/demo?from=1&to=2"],
+                backup_dashboard_links=[],
+                snapshot_urls=None,
+                panels=[Panel(7, "timeseries", "CPU", 1, ["https://grafana.example/panel/7"])],
+            )
+        ]
+
+    def create_manager(self, mocked_confluence):
+        confluence_class = Mock(return_value=mocked_confluence)
+        patcher = patch.dict(ConfluenceManager.__init__.__globals__, {"Confluence": confluence_class})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return ConfluenceManager(
+            login="user",
+            password="secret",
+            page_id=123,
+            upload_threads=1,
+            wiki_url="https://wiki.example",
+            verify_ssl=True,
+        )
+
+    @patch("grafconflux.confluence.Confluence")
+    def test_replaces_graphs_placeholder_when_present(self, confluence_class):
+        confluence = confluence_class.return_value
+        confluence.get_page_by_id.return_value = {
+            "title": "Page",
+            "body": {"storage": {"value": "before %%%graphs%%% after"}},
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = self.create_manager(confluence)
+            manager.update_page_content(self.grafana_configs, self.timestamps, 777, temp_dir)
+
+        updated_body = confluence.update_page.call_args.kwargs["body"]
+        self.assertIn("before ", updated_body)
+        self.assertIn(" after", updated_body)
+        self.assertIn('<ac:image ac:width="777">', updated_body)
+        self.assertNotIn("%%%graphs%%%", updated_body)
+
+    @patch("grafconflux.confluence.Confluence")
+    def test_replaces_entire_body_when_placeholder_is_missing(self, confluence_class):
+        confluence = confluence_class.return_value
+        confluence.get_page_by_id.return_value = {
+            "title": "Page",
+            "body": {"storage": {"value": "existing body without placeholder"}},
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = self.create_manager(confluence)
+            manager.update_page_content(self.grafana_configs, self.timestamps, 640, temp_dir)
+
+        updated_body = confluence.update_page.call_args.kwargs["body"]
+        self.assertNotEqual(updated_body, "existing body without placeholder")
+        self.assertIn("Demo dashboard", updated_body)
+        self.assertIn('<ac:image ac:width="640">', updated_body)
+
+    def test_apply_graphs_placeholder_preserves_surrounding_body(self):
+        result = apply_graphs_placeholder("before %%%graphs%%% after", "generated")
+
+        self.assertEqual(result, "before generated after")
+
+    def test_content_helpers_remain_available_from_confluence_module(self):
+        self.assertIs(confluence.apply_graphs_placeholder, confluence_content.apply_graphs_placeholder)
+        self.assertIs(confluence.build_confluence_storage_content, confluence_content.build_confluence_storage_content)
+
+    def test_build_confluence_storage_content_escapes_dynamic_values(self):
+        timestamps = [
+            SimpleNamespace(
+                id_time=0,
+                time_tag="tag&one",
+                start_time_human="2025/01/01 00:00:00",
+                end_time_human="2025/01/01 01:00:00",
+            )
+        ]
+        configs = [
+            SimpleNamespace(
+                name="Demo & dashboard",
+                full_links=["https://grafana.example/d?a=1&b=2"],
+                backup_dashboard_links=[],
+                snapshot_urls=["https://grafana.example/snap?a=1&b=2"],
+                panels=[Panel(7, "timeseries", "CPU & Memory", 1, ["https://grafana.example/panel?a=1&b=2"])],
+            )
+        ]
+
+        content = build_confluence_storage_content(configs, timestamps, 900, ["snap&one.json"])
+
+        self.assertIn("Demo &amp; dashboard", content)
+        self.assertIn("CPU &amp; Memory", content)
+        self.assertIn("snap&amp;one.json", content)
+        self.assertIn("tag&amp;one", content)
+        self.assertIn("https://grafana.example/panel?a=1&amp;b=2", content)
+
+    def test_build_confluence_storage_content_escapes_timestamp_table_cells(self):
+        timestamps = [
+            SimpleNamespace(
+                id_time=0,
+                time_tag='<script>alert("tag")</script>',
+                start_time_human='2025/01/01 <start> & "quoted"',
+                end_time_human="2025/01/01 </end> & 'quoted'",
+            )
+        ]
+
+        content = build_confluence_storage_content(self.grafana_configs, timestamps, 900)
+
+        self.assertIn('&lt;script&gt;alert(&quot;tag&quot;)&lt;/script&gt;', content)
+        self.assertIn('2025/01/01 &lt;start&gt; &amp; &quot;quoted&quot;', content)
+        self.assertIn('2025/01/01 &lt;/end&gt; &amp; &#x27;quoted&#x27;', content)
+        self.assertNotIn('<script>alert("tag")</script>', content)
+
+    def test_build_confluence_storage_content_groups_repeating_artifacts(self):
+        panel = Panel(17, "timeseries", "CPU by host", 1, ["legacy-link"])
+        panel.is_repeating = True
+        panel.source_panel_id = 17
+        panel.repeat_var = "host"
+        panel.artifacts = [
+            {
+                "timestamp_tag": "smoke",
+                "render_status": "rendered",
+                "png_file": "Demo dashboard__17__repeat-prod-1__smoke.png",
+                "repeat_value": "prod-1",
+                "repeat_value_slug": "prod-1",
+                "link": "https://grafana.example/panel/17?var-host=prod-1",
+            },
+            {
+                "timestamp_tag": "smoke",
+                "render_status": "rendered",
+                "png_file": "Demo dashboard__17__repeat-prod-2__smoke.png",
+                "repeat_value": "prod-2",
+                "repeat_value_slug": "prod-2",
+                "link": "https://grafana.example/panel/17?var-host=prod-2",
+            },
+        ]
+        configs = [SimpleNamespace(
+            name="Demo dashboard",
+            full_links=["https://grafana.example/d/demo?from=1&to=2"],
+            snapshot_urls=None,
+            panels=[panel],
+        )]
+
+        content = build_confluence_storage_content(configs, self.timestamps, 900)
+
+        self.assertIn("CPU by host", content)
+        self.assertIn("CPU by host [host=prod-1]", content)
+        self.assertIn("CPU by host [host=prod-2]", content)
+        self.assertIn("Demo dashboard__17__repeat-prod-1__smoke.png", content)
+        self.assertIn("Demo dashboard__17__repeat-prod-2__smoke.png", content)
+
+    def test_build_confluence_storage_content_uses_display_title(self):
+        panel = Panel(7, "timeseries", "CPU", 1, ["https://grafana.example/panel/7"], display_title="Renamed CPU")
+        configs = [SimpleNamespace(
+            name="Demo dashboard",
+            full_links=["https://grafana.example/d/demo?from=1&to=2"],
+            backup_dashboard_links=[],
+            snapshot_urls=None,
+            panels=[panel],
+        )]
+
+        content = build_confluence_storage_content(configs, self.timestamps, 900)
+
+        self.assertIn("<h3>Renamed CPU</h3>", content)
+        self.assertIn("<ac:parameter ac:name=\"title\">Renamed CPU</ac:parameter>", content)
+
+    def test_upload_only_legacy_flat_repeat_metadata_renders_repeat_value(self):
+        config = {
+            "panels": [{
+                "panel_id": 17,
+                "type": "timeseries",
+                "title": "CPU by host",
+                "links": ["https://grafana.example/panel/17?var-host=prod-1"],
+                "is_repeating": True,
+                "source_panel_id": 17,
+                "repeat_var": "host",
+                "repeat_value": "prod-1",
+                "repeat_value_slug": "prod-1",
+                "png_file": "Demo dashboard__17__repeat-prod-1__0.png",
+            }],
+            "full_links": ["https://grafana.example/d/demo?from=1&to=2"],
+            "snapshot_urls": [],
+            "charts_path": "unused",
+            "timestamps": [{
+                "time_tag": "smoke",
+                "id_time": 0,
+                "start_time_timestamp": 1700000000000,
+                "end_time_timestamp": 1700003600000,
+                "start_time_human": "2023/11/14 22:13:20",
+                "end_time_human": "2023/11/14 23:13:20",
+            }],
+        }
+        uploader = GrafanaConfigUploader("Demo dashboard", config)
+
+        content = build_confluence_storage_content([uploader], uploader.timestamps, 900)
+
+        self.assertEqual(uploader.panels[0].artifacts[0]["repeat_value"], "prod-1")
+        self.assertIn("CPU by host [host=prod-1]", content)
+        self.assertIn("Demo dashboard__17__repeat-prod-1__0.png", content)
+
+    def test_build_confluence_storage_content_renders_backup_dashboard_links_with_replaced_time_range(self):
+        timestamps = [
+            SimpleNamespace(
+                id_time=0,
+                time_tag="smoke",
+                start_time_timestamp=1700000000000,
+                end_time_timestamp=1700003600000,
+                start_time_human="2023/11/14 22:13:20",
+                end_time_human="2023/11/14 23:13:20",
+            )
+        ]
+        configs = [SimpleNamespace(
+            name="Demo dashboard",
+            full_links=["https://grafana.example/d/demo?from=1&to=2"],
+            backup_dashboard_links=[
+                "https://backup.example/d/demo?orgId=7&from=1&to=2&var-x=abc#view",
+                "https://backup.example/d/demo?orgId=7&var-x=abc",
+            ],
+            snapshot_urls=None,
+            panels=[Panel(7, "timeseries", "CPU", 1, ["https://grafana.example/panel/7"])],
+        )]
+
+        content = build_confluence_storage_content(configs, timestamps, 900)
+
+        self.assertIn("Backup dashboard links", content)
+        self.assertIn(
+            "https://backup.example/d/demo?orgId=7&amp;var-x=abc&amp;from=1700000000000&amp;to=1700003600000#view",
+            content,
+        )
+        self.assertIn(
+            "https://backup.example/d/demo?orgId=7&amp;var-x=abc&amp;from=1700000000000&amp;to=1700003600000",
+            content,
+        )

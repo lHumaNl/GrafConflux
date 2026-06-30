@@ -1,0 +1,30 @@
+"""Compatibility facade for Grafana panel selection helpers."""
+
+from grafconflux._grafana.panel_selection import *  # noqa: F401,F403
+from grafconflux._grafana.panel_selection import (  # noqa: F401
+    _available_selector_context,
+    _descriptor_matches_selector_value,
+    _extract_panel_or_children,
+    _filtering_warning_sections,
+    _include_match_reason,
+    _is_descriptor_excluded,
+    _matches_regex_selector,
+    _panel_row_id,
+    _panel_row_repeat,
+    _panel_row_title,
+    _panel_selector_match_reason,
+    _panel_value_matches,
+    _panel_with_row_context,
+    _requires_include_match,
+    _row_selector_match_reason,
+    _row_value_matches,
+    _selector_match_count,
+    _selector_match_reason,
+    _should_filter_runtime_repeat_clones,
+    _skip_collapsed_panel,
+    _warn_if_panel_title_matched_multiple,
+    _warn_if_selector_matched_nothing,
+    _warn_unmatched_ids,
+    _warn_unmatched_regexes,
+    _warn_unmatched_titles,
+)
