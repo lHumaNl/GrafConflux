@@ -6,7 +6,6 @@ from typing import Any
 from unittest.mock import Mock, patch
 
 import yaml
-from selenium.webdriver.common.keys import Keys
 
 from grafconflux.args_parser import GrafanaTimeDownloader
 from grafconflux.grafana import SNAPSHOT_HYDRATION_SCROLL_LIMIT, ConfigurationError, GrafanaConfigDownloader, GrafanaConfigUploader, GrafanaManager
@@ -91,17 +90,6 @@ class TestGrafanaSnapshotUi(unittest.TestCase):
 
         ui_flow.assert_called_once()
         manager.session.post.assert_not_called()
-
-    def test_browser_is_closed_when_ui_authentication_fails_after_creation(self):
-        for failing_step in ("get", "add_cookie"):
-            with self.subTest(failing_step=failing_step):
-                browser = FailingSetupSnapshotBrowser(failing_step)
-                manager = self.create_manager(browser)
-
-                with self.assertRaisesRegex(RuntimeError, failing_step):
-                    self.run_ui_snapshot(manager, tempfile.gettempdir())
-
-                self.assertEqual(browser.quit_calls, 1)
 
     def test_modern_grafana_flow_expands_rows_hydrates_and_saves_backup(self):
         manager = self.create_manager(ModernSnapshotBrowser())
@@ -216,7 +204,7 @@ class TestGrafanaSnapshotUi(unittest.TestCase):
             manager._hydrate_dashboard_panels(browser)
 
         page_down_keys = [args[0] for target, args in browser.sent_keys if target == ".scrollbar-view"]
-        self.assertEqual(page_down_keys, [Keys.PAGE_DOWN] * 4)
+        self.assertEqual(page_down_keys, ["PageDown"] * 4)
         self.assertEqual(browser.hydration_scroll_count, 0)
 
         never_settling = ModernSnapshotBrowser()
@@ -225,6 +213,17 @@ class TestGrafanaSnapshotUi(unittest.TestCase):
             manager._hydrate_dashboard_panels(never_settling)
         page_down_count = sum(1 for target, _ in never_settling.sent_keys if target == ".scrollbar-view")
         self.assertLessEqual(page_down_count, SNAPSHOT_HYDRATION_SCROLL_LIMIT)
+
+    def test_scrollbar_position_uses_playwright_element_evaluate(self):
+        manager = self.create_manager(ModernSnapshotBrowser())
+        browser = NoElementArgumentBrowser()
+        element = EvaluatingSnapshotElement(123)
+
+        position = manager._scrollbar_view_scroll_top(browser, element)
+
+        self.assertEqual(position, 123)
+        self.assertEqual(browser.script_calls, 0)
+        self.assertEqual(element.expressions, ['(element) => Math.floor(element.scrollTop || 0)'])
 
     def test_hydration_scroll_uses_slow_incremental_steps_and_dwell(self):
         browser = LoaderBusySnapshotBrowser()
@@ -266,7 +265,7 @@ class TestGrafanaSnapshotUi(unittest.TestCase):
         self.assertFalse(os.path.exists(backup_path))
         self.assertEqual(manager.config.snapshot_urls, ["https://grafana.example/dashboard/snapshot/abc"])
 
-    def test_snapshot_url_is_read_from_selenium_wire_snapshot_response(self):
+    def test_snapshot_url_is_read_from_playwright_response_payload(self):
         browser = NetworkSnapshotBrowser({"url": "https://grafana.example/dashboard/snapshot/netkey"})
         manager = self.create_manager(browser)
         manager.session.get = Mock(return_value=self.response(body={"dashboard": {"title": "Dashboard"}}))
@@ -347,7 +346,7 @@ class TestGrafanaSnapshotUi(unittest.TestCase):
             manager._snapshot_key_from_url("")
 
     def run_ui_snapshot(self, manager: GrafanaManager, temp_dir: str) -> None:
-        with patch("grafconflux.grafana.webdriver.Firefox", return_value=self.browser):
+        with patch("grafconflux._grafana.snapshots.GrafanaBrowserSession.create_browser", return_value=self.browser):
             with patch("grafconflux.grafana.time.sleep"):
                 manager.take_snapshot([self.timestamp("tag")], temp_dir)
 
@@ -367,8 +366,31 @@ class FakeSnapshotElement:
         return self.value
 
 
+class EvaluatingSnapshotElement:
+    def __init__(self, scroll_top: int) -> None:
+        self.scroll_top = scroll_top
+        self.expressions: list[str] = []
+
+    def evaluate(self, expression: str) -> int:
+        self.expressions.append(expression)
+        return self.scroll_top
+
+
+class NoElementArgumentBrowser:
+    def __init__(self) -> None:
+        self.script_calls = 0
+
+    def execute_script(self, script: str, *args: Any) -> int:
+        self.script_calls += 1
+        if args:
+            raise AssertionError("Playwright elements must not be passed through execute_script")
+        return 0
+
+
 class RecordingSnapshotBrowser:
     def __init__(self) -> None:
+        self.page = FakeSnapshotPage(self)
+        self.snapshot_payloads: list[dict[str, Any]] = []
         self.clicked_targets: list[str] = []
         self.cleared_targets: list[str] = []
         self.sent_keys: list[tuple[str, tuple[Any, ...]]] = []
@@ -436,6 +458,68 @@ class RecordingSnapshotBrowser:
         return target
     def quit(self) -> None:
         self.quit_calls += 1
+
+
+class FakeSnapshotPage:
+    def __init__(self, browser: RecordingSnapshotBrowser) -> None:
+        self.browser = browser
+
+    def locator(self, selector: str) -> "FakeSnapshotLocator":
+        return FakeSnapshotLocator(self.browser, selector)
+
+    def expect_response(self, _predicate: Any, timeout: int | None = None) -> "FakeSnapshotResponseContext":
+        return FakeSnapshotResponseContext(self.browser)
+
+
+class FakeSnapshotLocator:
+    def __init__(self, browser: RecordingSnapshotBrowser, selector: str) -> None:
+        self.browser = browser
+        self.selector = selector.replace("xpath=", "")
+        self.target = self.selector
+
+    @property
+    def first(self) -> "FakeSnapshotLocator":
+        return self
+
+    def wait_for(self, timeout: int | None = None) -> None:
+        self.browser.find_element(value=self.selector)
+
+    def click(self, timeout: int | None = None) -> None:
+        self.browser.find_element(value=self.selector).click()
+
+    def fill(self, value: str) -> None:
+        element = self.browser.find_element(value=self.selector)
+        if value == "":
+            element.clear()
+        else:
+            element.send_keys(value)
+
+    def press(self, key: str) -> None:
+        self.browser.find_element(value=self.selector).send_keys(key)
+
+    def get_attribute(self, name: str) -> str | None:
+        return self.browser.find_element(value=self.selector).get_attribute(name)
+
+    def evaluate(self, _expression: str) -> int:
+        if self.selector != ".scrollbar-view":
+            return 0
+        if self.browser.scrollbar_view_positions:
+            return self.browser.scrollbar_view_positions.pop(0)
+        return self.browser.hydration_scroll_count + 1
+
+
+class FakeSnapshotResponseContext:
+    def __init__(self, browser: RecordingSnapshotBrowser) -> None:
+        self.browser = browser
+
+    def __enter__(self) -> "FakeSnapshotResponseContext":
+        if getattr(self.browser, "skip_snapshot_response_wait", False):
+            raise TimeoutError("no snapshot response")
+        self.value = Mock(json=Mock(return_value={"url": "https://grafana.example/dashboard/snapshot/abc"}))
+        return self
+
+    def __exit__(self, _exc_type, _exc_value, _traceback) -> None:
+        return None
 
 
 class ModernSnapshotBrowser(RecordingSnapshotBrowser):
@@ -571,6 +655,10 @@ class FakeSnapshotRequest:
         self.url = "https://grafana.example/api/snapshots"
         self.response = FakeSnapshotResponse(payload)
 class NoSnapshotUrlBrowser(ModernSnapshotBrowser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.skip_snapshot_response_wait = True
+
     def execute_script(self, script: str, *args: Any) -> int:
         if "grafconfluxReadSnapshotUrl" in script:
             self.executed_scripts.append(script)

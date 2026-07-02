@@ -1,11 +1,26 @@
 import html
+import re
+from dataclasses import dataclass
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from typing import List, Optional
 
+from grafconflux._shared.display import normalize_grafana_display_value
 from grafconflux._shared.grafana_models import GrafanaConfigBase
 from grafconflux._shared.time import GrafanaTimeBase
 
 GRAPHS_PLACEHOLDER = '%%%graphs%%%'
+DEFAULT_CHILD_TITLE_PREFIX = 'GrafConflux: '
+DEFAULT_CHILD_TITLE_FALLBACK = 'GrafConflux child page'
+MAX_CHILD_TITLE_LENGTH = 240
+TITLE_FORBIDDEN_CHARS = r'[\\/?|<>]+'
+
+
+@dataclass(frozen=True)
+class ChildPageInclude:
+    """Confluence child page reference for parent include macros."""
+
+    title: str
+    space_key: str
 
 __all__ = (
     'GRAPHS_PLACEHOLDER',
@@ -24,7 +39,13 @@ __all__ = (
     '_render_snapshot_backup_section',
     '_render_test_times_section',
     'apply_graphs_placeholder',
+    'apply_graphs_placeholder_if_present',
+    'build_child_page_title',
     'build_confluence_storage_content',
+    'build_parent_include_content',
+    'sanitize_confluence_page_title',
+    'ChildPageInclude',
+    'DEFAULT_CHILD_TITLE_PREFIX',
 )
 
 
@@ -33,6 +54,112 @@ def apply_graphs_placeholder(body: str, new_content: str) -> str:
     if body.__contains__(GRAPHS_PLACEHOLDER):
         return body.replace(GRAPHS_PLACEHOLDER, new_content)
     return new_content
+
+
+def apply_graphs_placeholder_if_present(body: str, new_content: str) -> str | None:
+    """Replace the graphs placeholder only when present."""
+    if GRAPHS_PLACEHOLDER not in body:
+        return None
+    return body.replace(GRAPHS_PLACEHOLDER, new_content)
+
+
+def sanitize_confluence_page_title(title: str | None) -> str:
+    """Normalize a generated Confluence page title."""
+    normalized = _collapse_whitespace(title or '')
+    normalized = re.sub(TITLE_FORBIDDEN_CHARS, '-', normalized).strip(' .')
+    if not normalized or normalized.strip('- ') == '':
+        normalized = DEFAULT_CHILD_TITLE_FALLBACK
+    return normalized[:MAX_CHILD_TITLE_LENGTH].rstrip(' .') or DEFAULT_CHILD_TITLE_FALLBACK
+
+
+def build_child_page_title(parent_title: str, args) -> str:
+    """Build a sanitized child page title from run arguments."""
+    direct_title = _explicit_child_title(args)
+    if direct_title is not None:
+        return sanitize_confluence_page_title(direct_title)
+    if getattr(args, 'confluence_child_title_from_test_id', False):
+        return sanitize_confluence_page_title(_test_id_label(args))
+    return sanitize_confluence_page_title(_default_child_page_title(parent_title, args))
+
+
+def build_parent_include_content(child_pages: list[ChildPageInclude]) -> str:
+    """Render expand macros that include child pages in order."""
+    return ''.join(_render_parent_include_macro(child_page) for child_page in child_pages)
+
+
+def _explicit_child_title(args) -> str | None:
+    title = getattr(args, 'confluence_child_title', None)
+    if title not in (None, ''):
+        return str(title)
+    return None
+
+
+def _default_child_page_title(parent_title: str, args) -> str:
+    prefix = getattr(args, 'confluence_child_title_prefix', DEFAULT_CHILD_TITLE_PREFIX)
+    label = _child_title_label(args)
+    return f'{parent_title} — {prefix}{label}'
+
+
+def _child_title_label(args) -> str:
+    test_id = _test_id_label(args)
+    if test_id:
+        return test_id
+    timestamps = getattr(args, 'timestamps', [])
+    time_tag = _first_time_tag(timestamps)
+    return time_tag or _first_timestamp_label(timestamps) or DEFAULT_CHILD_TITLE_FALLBACK
+
+
+def _test_id_label(args) -> str | None:
+    test_id = getattr(args, 'test_id', None)
+    if test_id in (None, '', '-1'):
+        return None
+    return str(test_id)
+
+
+def _first_time_tag(timestamps) -> str | None:
+    for timestamp in timestamps:
+        time_tag = getattr(timestamp, 'time_tag', None)
+        if time_tag not in (None, ''):
+            return str(time_tag)
+    return None
+
+
+def _first_timestamp_label(timestamps) -> str | None:
+    for timestamp in timestamps:
+        start_time = getattr(timestamp, 'start_time_human', None)
+        end_time = getattr(timestamp, 'end_time_human', None)
+        if start_time and end_time:
+            return f'{start_time} - {end_time}'
+    return None
+
+
+def _collapse_whitespace(value: str) -> str:
+    return ' '.join(str(value).split())
+
+
+def _render_parent_include_macro(child_page: ChildPageInclude) -> str:
+    title = html.escape(child_page.title)
+    include_macro = _render_include_page_macro(child_page)
+    return (
+        '<ac:structured-macro ac:name="expand">\n'
+        f'  <ac:parameter ac:name="title">{title}</ac:parameter>\n'
+        '  <ac:rich-text-body>\n'
+        f'{include_macro}'
+        '  </ac:rich-text-body>\n'
+        '</ac:structured-macro>\n'
+    )
+
+
+def _render_include_page_macro(child_page: ChildPageInclude) -> str:
+    title = html.escape(child_page.title, quote=True)
+    space_key = html.escape(child_page.space_key, quote=True)
+    return (
+        '    <ac:structured-macro ac:name="include">\n'
+        '      <ac:parameter ac:name="">'
+        f'<ac:link><ri:page ri:content-title="{title}" ri:space-key="{space_key}" /></ac:link>'
+        '</ac:parameter>\n'
+        '    </ac:structured-macro>\n'
+    )
 
 
 def build_confluence_storage_content(grafana_configs: List[GrafanaConfigBase], timestamps: List[GrafanaTimeBase],
@@ -190,7 +317,7 @@ def _artifact_title(panel, row_title: str, artifact) -> str:
     if artifact.get('repeat_value') is None:
         return _non_repeating_artifact_title(row_title, artifact)
     repeat_var = html.escape(str(artifact.get('repeat_var') or getattr(panel, 'repeat_var', 'value')))
-    repeat_value = html.escape(str(artifact.get('repeat_value')))
+    repeat_value = html.escape(normalize_grafana_display_value(artifact.get('repeat_value')))
     return f'{row_title} [{repeat_var}={repeat_value}]'
 
 

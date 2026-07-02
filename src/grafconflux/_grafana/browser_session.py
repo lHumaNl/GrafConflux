@@ -1,25 +1,28 @@
 import logging
-from typing import Callable, Type
-from urllib.parse import urlparse
-
-from selenium.webdriver.firefox.options import Options
+from http.cookiejar import Cookie
+from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import urlparse, urlunparse
 
 logger = logging.getLogger('grafconflux.grafana')
 
+DEFAULT_PLAYWRIGHT_BROWSER = 'chromium'
+SUPPORTED_PLAYWRIGHT_BROWSERS = {'chromium', 'firefox', 'webkit'}
+
 
 class GrafanaBrowserSession:
-    """Create and authenticate a Selenium browser for Grafana UI flows."""
+    """Create and authenticate a Playwright browser for Grafana UI flows."""
 
     def __init__(
         self,
         config,
         session,
-        browser_factory: Callable,
-        options_factory: Type[Options],
+        browser_factory: Optional[Callable] = None,
+        options_factory: Optional[Callable] = None,
         *,
         close_on_setup_failure: bool = True,
         suppress_setup_errors: bool = False,
         require_cookie_domain: bool = False,
+        browser_name: str = DEFAULT_PLAYWRIGHT_BROWSER,
     ) -> None:
         self.config = config
         self.session = session
@@ -28,76 +31,248 @@ class GrafanaBrowserSession:
         self.close_on_setup_failure = close_on_setup_failure
         self.suppress_setup_errors = suppress_setup_errors
         self.require_cookie_domain = require_cookie_domain
+        self.browser_name = browser_name
+        self.playwright = None
+        self.browser = None
+        self.context = None
+        self.page = None
+        self.snapshot_payloads: List[Dict[str, Any]] = []
 
     def create_browser(self):
-        browser = None
         try:
-            cookies = self.grafana_cookies()
-            browser = self.browser_factory(
-                options=self.firefox_options(),
-                seleniumwire_options=self.selenium_wire_options(),
-            )
-            self.apply_session_headers(browser)
-            self.authenticate_browser(browser, cookies)
+            return self._create_browser()
         except Exception as error:
-            if browser is not None and self.close_on_setup_failure:
-                browser.quit()
+            self._close_after_setup_failure()
             if self.suppress_setup_errors:
                 logger.error(f'Failed to configure browser: {error}')
                 return None
             raise
+
+    def _create_browser(self):
+        if self.browser_factory is not None:
+            return self._create_factory_browser()
+        self.playwright = self._sync_playwright().start()
+        self.browser = self._browser_launcher().launch(**self.launch_options())
+        self._create_authenticated_context()
+        return self
+
+    def launch_options(self) -> Dict[str, Any]:
+        options: Dict[str, Any] = {'headless': True}
+        self._append_launch_option(options, 'channel', self._config_value('playwright_browser_channel'))
+        self._append_launch_option(
+            options,
+            'executable_path',
+            self._config_value('playwright_browser_executable_path'),
+        )
+        return options
+
+    def _create_factory_browser(self):
+        browser = self.browser_factory()
+        self.browser = browser
+        self.authenticate_browser(browser)
         return browser
 
-    def firefox_options(self) -> Options:
-        firefox_options = self.options_factory()
-        firefox_options.page_load_strategy = 'eager'
-        firefox_options.add_argument('--headless')
-        firefox_options.add_argument('--disable-gpu')
-        firefox_options.add_argument(f'--width={self.config.width}')
-        firefox_options.add_argument(f'--height={self.config.height}')
-        if not self.config.verify_ssl:
-            firefox_options.accept_insecure_certs = True
-        return firefox_options
+    def _browser_launcher(self):
+        browser_name = self._effective_browser_name()
+        if browser_name == 'firefox':
+            return self.playwright.firefox
+        if browser_name == 'webkit':
+            return self.playwright.webkit
+        return self.playwright.chromium
+
+    def _effective_browser_name(self) -> str:
+        browser_name = self._config_value('playwright_browser') or self.browser_name
+        if browser_name not in SUPPORTED_PLAYWRIGHT_BROWSERS:
+            raise ValueError('playwright_browser must be one of: chromium, firefox, webkit')
+        return browser_name
+
+    def _config_value(self, option_name: str) -> Optional[str]:
+        value = getattr(self.config, option_name, None)
+        return value if value != '' else None
 
     @staticmethod
-    def selenium_wire_options() -> dict:
-        return {
-            'network.stricttransportsecurity.preloadlist': False,
-            'network.stricttransportsecurity.enabled': False,
-        }
+    def _append_launch_option(options: Dict[str, Any], option_name: str, value: Optional[str]) -> None:
+        if value is not None:
+            options[option_name] = value
 
-    def authenticate_browser(self, browser, cookies: dict | None = None) -> None:
-        cookies = self.grafana_cookies() if cookies is None else cookies
+    @staticmethod
+    def _sync_playwright():
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError as error:  # pragma: no cover - exercised only without dependency installed.
+            raise RuntimeError(
+                'Playwright is required for render:false browser screenshots. '
+                'Install dependencies and run: python -m playwright install chromium'
+            ) from error
+        return sync_playwright()
+
+    def refresh_authentication(self) -> None:
+        if self.browser_factory is not None:
+            self.authenticate_browser(self.browser)
+            return
+        old_context = self.context
+        self._create_authenticated_context()
+        if old_context is not None:
+            old_context.close()
+
+    def _create_authenticated_context(self) -> None:
+        cookies = self.playwright_cookies()
+        self.context = self.browser.new_context(**self.context_options())
+        if cookies:
+            self.context.add_cookies(cookies)
+        self.page = self.context.new_page()
+        self.page.on('response', self._record_snapshot_response)
+
+    def context_options(self) -> Dict[str, Any]:
+        options: Dict[str, Any] = {
+            'viewport': {'width': self.config.width, 'height': self.config.height},
+            'ignore_https_errors': not self.config.verify_ssl,
+        }
+        headers = self.session_headers()
+        if headers:
+            options['extra_http_headers'] = headers
+        return options
+
+    def session_headers(self) -> Dict[str, str]:
+        authorization = self.session.headers.get('Authorization')
+        return {'Authorization': authorization} if authorization else {}
+
+    def playwright_cookies(self) -> List[Dict[str, Any]]:
+        parsed_host = urlparse(self.config.host)
+        host = parsed_host.hostname
+        matching_cookies = [
+            cookie for cookie in self.session.cookies
+            if self._cookie_domain_matches_host(cookie.domain, host)
+        ]
+        self._warn_secure_cookies_on_http(parsed_host, matching_cookies)
+        cookies = [
+            self._playwright_cookie(cookie, self.config.host, self.config.nginx_prefix)
+            for cookie in matching_cookies
+        ]
+        if self.require_cookie_domain and not cookies:
+            logger.warning(f'No Grafana cookies found for host={host}')
+        return cookies
+
+    @classmethod
+    def _playwright_cookie(
+        cls,
+        cookie: Cookie,
+        host_url: str,
+        nginx_prefix: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            'name': cookie.name,
+            'value': cookie.value,
+        }
+        if cookie.domain_specified:
+            result['domain'] = cookie.domain
+            result['path'] = cookie.path or '/'
+        else:
+            result['url'] = cls._host_only_cookie_url(host_url, cookie.path, nginx_prefix)
+        if cookie.expires is not None:
+            result['expires'] = int(cookie.expires)
+        cls._append_cookie_flags(cookie, result)
+        return result
+
+    @staticmethod
+    def _warn_secure_cookies_on_http(parsed_host, cookies: List[Cookie]) -> None:
+        if parsed_host.scheme.lower() != 'http' or not any(cookie.secure for cookie in cookies):
+            return
+        logger.warning(
+            f'Secure Grafana cookies are scoped to an http origin and may be ignored host={parsed_host.hostname}'
+        )
+
+    @staticmethod
+    def _host_only_cookie_url(host_url: str, cookie_path: str, nginx_prefix: Optional[str]) -> str:
+        path = cookie_path if cookie_path not in (None, '') else nginx_prefix
+        normalized_path = path if path not in (None, '') else '/'
+        if not normalized_path.startswith('/'):
+            normalized_path = f'/{normalized_path}'
+        parsed = urlparse(host_url)
+        return urlunparse((parsed.scheme, parsed.netloc, normalized_path, '', '', ''))
+
+    @staticmethod
+    def _append_cookie_flags(cookie: Cookie, result: Dict[str, Any]) -> None:
+        result['secure'] = bool(cookie.secure)
+        if cookie.has_nonstandard_attr('HttpOnly'):
+            result['httpOnly'] = True
+        same_site = cookie.get_nonstandard_attr('SameSite')
+        if same_site in ('Strict', 'Lax', 'None'):
+            result['sameSite'] = same_site
+
+    @staticmethod
+    def _cookie_domain_matches_host(domain: str, host: Optional[str]) -> bool:
+        if host is None:
+            return False
+        if not domain:
+            return True
+        normalized_domain = domain.lstrip('.')
+        return host == normalized_domain or host.endswith(f'.{normalized_domain}')
+
+    def authenticate_browser(self, browser=None, cookies: Optional[dict] = None) -> None:
+        if browser is None or browser is self:
+            self.refresh_authentication()
+            return
         browser.get(self.config.host)
-        for cookie in cookies.values():
+        for cookie in self.grafana_cookies().values() if cookies is None else cookies.values():
             browser.add_cookie(cookie)
         browser.set_page_load_timeout(self.config.timeout)
 
-    def apply_session_headers(self, browser) -> None:
-        authorization = self.session.headers.get('Authorization')
-        if authorization:
-            browser.header_overrides = {'Authorization': authorization}
+    def apply_session_headers(self, browser=None) -> None:
+        if browser is not None and browser is not self:
+            headers = self.session_headers()
+            if headers:
+                browser.header_overrides = headers
 
-    def grafana_cookies(self) -> dict:
-        grafana_host = urlparse(self.config.host).hostname
-        cookie_domains = self.session.cookies._cookies
-        host_cookies = {
-            path: cookies
-            for domain, paths in cookie_domains.items()
-            if self._cookie_domain_matches_host(domain, grafana_host)
-            for path, cookies in paths.items()
-        }
-        if self.require_cookie_domain and not host_cookies:
-            logger.warning(f'No Grafana cookies found for host={grafana_host}')
-        return {
-            name: cookie.__dict__
-            for cookies in host_cookies.values()
-            for name, cookie in cookies.items()
-        }
+    def grafana_cookies(self) -> Dict[str, Dict[str, Any]]:
+        return {cookie['name']: cookie for cookie in self.playwright_cookies()}
 
-    @staticmethod
-    def _cookie_domain_matches_host(domain: str, host: str | None) -> bool:
-        if host is None:
-            return False
-        normalized_domain = domain.lstrip('.')
-        return host == normalized_domain or host.endswith(f'.{normalized_domain}')
+    def get(self, url: str):
+        return self.page.goto(url, wait_until='domcontentloaded', timeout=self.config.timeout * 1000)
+
+    def execute_script(self, script: str, *args: Any) -> Any:
+        if args:
+            return self.page.evaluate('(payload) => Function("arguments", payload.script)(payload.args)', {
+                'script': script,
+                'args': list(args),
+            })
+        return self.page.evaluate(f'() => {{ {script} }}')
+
+    def save_screenshot(self, file_path: str) -> None:
+        self.page.screenshot(path=file_path, full_page=False)
+
+    @property
+    def current_url(self) -> str:
+        return self.page.url if self.page is not None else ''
+
+    def quit(self) -> None:
+        self.close()
+
+    def close(self) -> None:
+        for resource in (self.context, self.browser):
+            if resource is not None:
+                resource.close()
+        if self.playwright is not None:
+            self.playwright.stop()
+
+    def _close_after_setup_failure(self) -> None:
+        if self.close_on_setup_failure:
+            self.close()
+
+    def _record_snapshot_response(self, response: Any) -> None:
+        if not _is_snapshot_response(response):
+            return
+        try:
+            payload = response.json()
+        except Exception:
+            return
+        if isinstance(payload, dict):
+            self.snapshot_payloads.append(payload)
+
+
+def _is_snapshot_response(response: Any) -> bool:
+    try:
+        request = response.request
+        return request.method.upper() == 'POST' and urlparse(response.url).path.rstrip('/').endswith('/api/snapshots')
+    except Exception:
+        return False

@@ -191,13 +191,16 @@ class TestPhase2Compatibility(unittest.TestCase):
         self.assertEqual(
             [field.name for field in fields(GrafConfluxRunOptions)],
             [
-                "wiki_url", "confluence_page_id", "confluence_login", "confluence_password",
-                "timestamps", "config_file", "test_root_folder", "test_upload_folders",
+                "wiki_url", "confluence_page_id", "confluence_parent_page_id", "confluence_child_title",
+                "confluence_child_title_prefix", "confluence_child_title_from_test_id",
+                "confluence_login", "confluence_password", "confluence_token", "timestamps", "config_file",
+                "test_root_folder", "test_upload_folders",
                 "graph_width", "test_id", "threads", "only_graphs", "tz",
                 "confluence_verify_ssl", "confluence_upload_threads", "confluence_upload_delay",
                 "confluence_upload_rate_per_second", "confluence_retry", "confluence_retry_count",
                 "confluence_retry_delay", "confluence_retry_backoff_multiplier",
                 "confluence_retry_max_delay", "confluence_retry_jitter", "confluence_continue_on_error",
+                "playwright_browser", "playwright_browser_channel", "playwright_browser_executable_path",
             ],
         )
 
@@ -216,7 +219,6 @@ class TestPhase2PipelineOrdering(unittest.TestCase):
         }))
         task_panel = Mock(panel_id=7, links=[None], artifacts=[])
         task = Mock(panel=task_panel, timestamp=self.create_timestamp()[0])
-        manager.browser_list = [Mock(quit=Mock(side_effect=lambda: calls.append("browser_quit")))]
 
         manager.get_dashboard_uid = Mock(side_effect=lambda: calls.append("lookup") or ("uid-1", "/d/uid-1"))
         manager.get_panels = Mock(side_effect=lambda timestamps: self.fake_panels(manager, task, calls))
@@ -231,10 +233,10 @@ class TestPhase2PipelineOrdering(unittest.TestCase):
 
         self.assertEqual(
             calls,
-            ["lookup", "panels", "full_links", "preflight", "download", "browser_quit", "snapshot", "metadata"],
+            ["lookup", "panels", "full_links", "preflight", "download", "snapshot", "metadata"],
         )
 
-    def test_download_charts_closes_browsers_when_download_future_raises(self) -> None:
+    def test_download_charts_does_not_close_worker_owned_browsers_from_parent_thread(self) -> None:
         calls = []
         manager = GrafanaManager(GrafanaConfigDownloader("demo", {
             "dash_title": "Dashboard",
@@ -243,7 +245,6 @@ class TestPhase2PipelineOrdering(unittest.TestCase):
         }))
         task_panel = Mock(panel_id=7, links=[None], artifacts=[])
         task = Mock(panel=task_panel, timestamp=self.create_timestamp()[0])
-        manager.browser_list = [Mock(quit=Mock(side_effect=lambda: calls.append("browser_quit")))]
 
         manager.get_dashboard_uid = Mock(return_value=("uid-1", "/d/uid-1"))
         manager.get_panels = Mock(side_effect=lambda timestamps: self.fake_panels(manager, task, calls))
@@ -256,7 +257,7 @@ class TestPhase2PipelineOrdering(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             manager.download_charts(temp_dir, [task.timestamp])
 
-        self.assertEqual(calls, ["panels", "browser_quit", "snapshot", "metadata"])
+        self.assertEqual(calls, ["panels", "snapshot", "metadata"])
         self.assertEqual(manager.browser_list, [])
 
     @staticmethod

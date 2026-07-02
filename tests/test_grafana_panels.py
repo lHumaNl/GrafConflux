@@ -299,6 +299,20 @@ class TestGrafanaPanels(unittest.TestCase):
 
         self.assertEqual(panels[0].display_title, "DPI traffic (iface: All)")
 
+    def test_panel_title_vars_normalize_grafana_all_sentinel(self):
+        manager = self.create_manager(vars={"iface": "$__all"})
+        manager.dashboard_uid = "dashboard-uid"
+        manager.session.get = Mock(return_value=Mock(status_code=200, json=Mock(return_value={
+            "dashboard": {
+                "templating": {"list": [{"name": "iface", "current": {"value": "$__all"}}]},
+                "panels": [{"id": 1, "type": "timeseries", "title": "DPI traffic (iface: $iface)"}],
+            }
+        })))
+
+        panels = manager.get_panels(self.create_timestamps(count=1))
+
+        self.assertEqual(panels[0].display_title, "DPI traffic (iface: All)")
+
     def test_config_vars_override_dashboard_current_values_in_panel_titles(self):
         manager = self.create_manager(vars={"iface": "Configured"})
         manager.dashboard_uid = "dashboard-uid"
@@ -499,6 +513,42 @@ class TestGrafanaPanels(unittest.TestCase):
         manager.authenticate("ignored", "ignored")
 
         self.assertEqual(manager.session.get.call_args.kwargs["timeout"], manager.config.timeout)
+
+    def test_authenticate_with_password_uses_nginx_prefix_login_url(self):
+        manager = self.create_manager(login="user", password="secret", nginx_prefix="/monitoring")
+        manager.session.post = Mock(return_value=Mock(status_code=200))
+
+        manager.authenticate("ignored", "ignored")
+
+        self.assertEqual(manager.session.post.call_args.args[0], "https://grafana.example/monitoring/login")
+
+    def test_domain_auth_requires_confluence_login_and_password(self):
+        manager = self.create_manager(domain=True)
+
+        with self.assertRaisesRegex(ValueError, "Confluence login/password"):
+            manager.authenticate(None, None)
+
+    def test_reauthenticate_uses_grafana_credentials_without_confluence_creds(self):
+        manager = self.create_manager(login="grafana-user", password="grafana-secret")
+        manager.session.post = Mock(return_value=Mock(status_code=200))
+
+        reauthenticated = manager._reauthenticate_grafana()
+
+        self.assertTrue(reauthenticated)
+        payload = manager.session.post.call_args.kwargs["data"]
+        self.assertIn('"user": "grafana-user"', payload)
+        self.assertIn('"password": "grafana-secret"', payload)
+
+    def test_reauthenticate_requires_confluence_credentials_for_domain_auth(self):
+        manager = self.create_manager(domain=True)
+        manager.session.post = Mock(return_value=Mock(status_code=200))
+
+        with self.assertLogs("grafconflux.grafana", level="ERROR") as logs:
+            reauthenticated = manager._reauthenticate_grafana()
+
+        self.assertFalse(reauthenticated)
+        manager.session.post.assert_not_called()
+        self.assertIn("required credentials", "\n".join(logs.output))
 
     def test_get_dashboard_uid_uses_timeout(self):
         manager = self.create_manager()
@@ -857,10 +907,8 @@ class TestGrafanaPanels(unittest.TestCase):
         manager = self.create_manager(render=False, timeout=45)
         task = self.create_screenshot_task()
         browser = FakeScreenshotBrowser({"https://grafana.example/panel?viewPanel=17&fullscreen": 200})
-        wait_calls = []
         manager.thread_local.is_fullscreen = None
         manager._GrafanaManager__get_panel_data_sources = Mock(return_value=["/api/ds/query"])
-        manager._GrafanaManager__wait_for_network_request = Mock(side_effect=lambda *args: wait_calls.append(args))
 
         manager._GrafanaManager__take_screenshot(
             browser,
@@ -874,7 +922,6 @@ class TestGrafanaPanels(unittest.TestCase):
         self.assertEqual(task.panel.links[0], "https://grafana.example/panel?viewPanel=17&fullscreen")
         self.assertEqual(task.artifact["link"], "https://grafana.example/panel?viewPanel=17&fullscreen")
         self.assertEqual(browser.saved_paths, ["panel.png"])
-        self.assertEqual(wait_calls[0], (browser, ["/api/ds/query"], 45))
 
     def test_take_screenshot_first_use_falls_back_to_non_fullscreen_route(self):
         manager = self.create_manager(render=False, timeout=45)
@@ -883,14 +930,44 @@ class TestGrafanaPanels(unittest.TestCase):
         browser = FakeScreenshotBrowser({f"{final_url}&fullscreen": 500, final_url: 200})
         manager.thread_local.is_fullscreen = None
         manager._GrafanaManager__get_panel_data_sources = Mock(return_value=[])
-        manager._GrafanaManager__wait_for_network_request = Mock()
 
         manager._GrafanaManager__take_screenshot(browser, task, final_url, "panel.png")
 
         self.assertEqual(browser.visited_urls, [f"{final_url}&fullscreen", final_url])
+        self.assertEqual(browser.refresh_count, 1)
         self.assertFalse(manager.thread_local.is_fullscreen)
         self.assertEqual(task.panel.links[0], final_url)
         self.assertEqual(task.artifact["link"], final_url)
+        self.assertEqual(browser.saved_paths, ["panel.png"])
+
+    def test_take_screenshot_resets_context_after_fullscreen_navigation_error(self):
+        manager = self.create_manager(render=False, timeout=45)
+        task = self.create_screenshot_task()
+        final_url = "https://grafana.example/panel?viewPanel=17"
+        browser = FakeScreenshotBrowser({f"{final_url}&fullscreen": RuntimeError("connection refused"), final_url: 200})
+        manager.thread_local.is_fullscreen = None
+        manager._GrafanaManager__get_panel_data_sources = Mock(return_value=[])
+
+        manager._GrafanaManager__take_screenshot(browser, task, final_url, "panel.png")
+
+        self.assertEqual(browser.visited_urls, [f"{final_url}&fullscreen", final_url])
+        self.assertEqual(browser.refresh_count, 1)
+        self.assertEqual(browser.saved_paths, ["panel.png"])
+
+    def test_take_screenshot_navigation_error_keeps_original_failure_message(self):
+        manager = self.create_manager(render=False, timeout=45)
+        manager.thread_local.is_fullscreen = True
+        task = self.create_screenshot_task()
+        final_url = "https://grafana.example/panel?viewPanel=17"
+        browser = FakeScreenshotBrowser({f"{final_url}&fullscreen": RuntimeError("connection refused"), final_url: 200})
+        manager._GrafanaManager__get_panel_data_sources = Mock(return_value=[])
+
+        with self.assertLogs("grafconflux.grafana", level="ERROR") as logs:
+            manager._GrafanaManager__take_screenshot(browser, task, final_url, "panel.png")
+
+        self.assertIn("connection refused", "\n".join(logs.output))
+        self.assertNotIn("no captured HTTP response", "\n".join(logs.output))
+        self.assertEqual(browser.visited_urls, [f"{final_url}&fullscreen", final_url])
         self.assertEqual(browser.saved_paths, ["panel.png"])
 
     def test_take_screenshot_reuses_detected_fullscreen_route(self):
@@ -900,7 +977,6 @@ class TestGrafanaPanels(unittest.TestCase):
         final_url = "https://grafana.example/panel?viewPanel=17"
         browser = FakeScreenshotBrowser({f"{final_url}&fullscreen": 200, final_url: 200})
         manager._GrafanaManager__get_panel_data_sources = Mock(return_value=[])
-        manager._GrafanaManager__wait_for_network_request = Mock()
 
         manager._GrafanaManager__take_screenshot(browser, task, final_url, "panel.png")
 
@@ -917,7 +993,6 @@ class TestGrafanaPanels(unittest.TestCase):
         final_url = "https://grafana.example/panel?viewPanel=17"
         browser = FakeScreenshotBrowser({f"{final_url}&fullscreen": 200, final_url: 200})
         manager._GrafanaManager__get_panel_data_sources = Mock(return_value=[])
-        manager._GrafanaManager__wait_for_network_request = Mock()
 
         manager._GrafanaManager__take_screenshot(browser, task, final_url, "panel.png")
 
@@ -949,6 +1024,36 @@ class TestGrafanaPanels(unittest.TestCase):
         values = [artifact["repeat_value"] for artifact in panels[0].artifacts if artifact["timestamp_tag"] == "tag0"]
 
         self.assertEqual(values, ["prod-1", "prod-2", "db-1"])
+
+    def test_download_chart_browser_mode_closes_browser_in_worker_task(self):
+        manager = self.create_manager(render=False)
+        manager.dashboard_url = "/d/dashboard-uid/dashboard"
+        task = self.create_screenshot_task()
+        browser = Mock()
+        manager._GrafanaManager__init_browser = Mock(return_value=browser)
+        manager._GrafanaManager__take_screenshot = Mock()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager.charts_path = temp_dir
+            manager._GrafanaManager__download_chart(task)
+
+        browser.quit.assert_called_once_with()
+        self.assertEqual(manager.browser_list, [])
+
+    def test_download_chart_browser_mode_closes_browser_when_screenshot_fails(self):
+        manager = self.create_manager(render=False)
+        manager.dashboard_url = "/d/dashboard-uid/dashboard"
+        task = self.create_screenshot_task()
+        browser = Mock()
+        manager._GrafanaManager__init_browser = Mock(return_value=browser)
+        manager._GrafanaManager__take_screenshot = Mock(side_effect=RuntimeError("boom"))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager.charts_path = temp_dir
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                manager._GrafanaManager__download_chart(task)
+
+        browser.quit.assert_called_once_with()
 
     def test_repeating_panel_regex_string_is_single_pattern_shorthand(self):
         _, panels = self.get_repeating_panels(
@@ -1293,14 +1398,71 @@ class TestGrafanaPanels(unittest.TestCase):
 class FakeScreenshotBrowser:
     def __init__(self, response_statuses):
         self.response_statuses = response_statuses
-        self.requests = []
+        self.page = FakeScreenshotPage(self)
         self.visited_urls = []
         self.saved_paths = []
+        self.current_url = ""
+        self.broken = False
+        self.refresh_count = 0
 
     def get(self, url):
-        self.visited_urls.append(url)
-        status_code = self.response_statuses.get(url, 404)
-        self.requests.append(Mock(url=url, response=Mock(status_code=status_code)))
+        return self.page.goto(url)
 
     def save_screenshot(self, file_path):
         self.saved_paths.append(file_path)
+
+    def refresh_authentication(self):
+        self.refresh_count += 1
+        self.broken = False
+        self.page = FakeScreenshotPage(self)
+
+
+class FakeScreenshotPage:
+    def __init__(self, browser):
+        self.browser = browser
+        self.response_handlers = []
+
+    def goto(self, url):
+        self.browser.current_url = url
+        self.browser.visited_urls.append(url)
+        if self.browser.broken:
+            status_code = 599
+        else:
+            status_code = self.browser.response_statuses.get(url, 404)
+        if isinstance(status_code, Exception):
+            self.browser.broken = True
+            raise status_code
+        response = Mock(url=url, status=status_code)
+        for handler in list(self.response_handlers):
+            handler(response)
+        return response
+
+    def on(self, event, handler):
+        if event == "response":
+            self.response_handlers.append(handler)
+
+    def remove_listener(self, event, handler):
+        if event == "response" and handler in self.response_handlers:
+            self.response_handlers.remove(handler)
+
+    def evaluate(self, _script, expected):
+        parsed = parse_qs(urlparse(self.browser.current_url).query)
+        return expected in parsed.get("panelId", []) or expected in parsed.get("viewPanel", [])
+
+    def locator(self, _selector):
+        return FakeScreenshotLocator()
+
+    def wait_for_timeout(self, _milliseconds):
+        return None
+
+
+class FakeScreenshotLocator:
+    @property
+    def first(self):
+        return self
+
+    def wait_for(self, timeout=None):
+        return None
+
+    def count(self):
+        return 0

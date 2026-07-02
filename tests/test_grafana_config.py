@@ -1,31 +1,36 @@
 import os
 import tempfile
+import textwrap
 import unittest
 
 from grafconflux.grafana import ConfigurationError, GrafanaConfigDownloader, GrafanaManager
 
 
 class TestGrafanaConfigLoading(unittest.TestCase):
-    def write_config(self, content: str):
+    def write_config(self, content: str, raw: bool = False):
         temp_dir = tempfile.TemporaryDirectory()
         config_path = os.path.join(temp_dir.name, "config.yaml")
         with open(config_path, "w", encoding="utf-8") as config_file:
-            config_file.write(content)
+            config_file.write(content if raw else self.new_config(content))
         self.addCleanup(temp_dir.cleanup)
         return config_path
 
-    def test_loads_legacy_top_level_dashboards(self):
+    @staticmethod
+    def new_config(dashboards_yaml: str) -> str:
+        if dashboards_yaml.lstrip().startswith("settings:"):
+            return dashboards_yaml
+        return "settings: {}\ndashboards:\n" + textwrap.indent(dashboards_yaml, "  ")
+
+    def test_rejects_legacy_top_level_dashboards(self):
         config_path = self.write_config(
             "legacy_dashboard:\n"
             "  dash_title: Legacy\n"
-            "  host: https://grafana.example\n"
+            "  host: https://grafana.example\n",
+            raw=True,
         )
 
-        configs = GrafanaManager.load_grafana_config(config_path)
-
-        self.assertEqual(len(configs), 1)
-        self.assertEqual(configs[0].name, "legacy_dashboard")
-        self.assertEqual(configs[0].dash_title, "Legacy")
+        with self.assertRaisesRegex(ConfigurationError, "Legacy top-level dashboard YAML format"):
+            GrafanaManager.load_grafana_config(config_path)
 
     def test_loads_new_format_dashboards_when_settings_present(self):
         config_path = self.write_config(
@@ -43,10 +48,34 @@ class TestGrafanaConfigLoading(unittest.TestCase):
         self.assertEqual(configs[0].name, "new_dashboard")
         self.assertEqual(configs[0].dash_title, "New")
 
+    def test_loads_new_format_dashboards_when_settings_are_absent(self):
+        config_path = self.write_config(
+            "dashboards:\n"
+            "  new_dashboard:\n"
+            "    dash_title: New\n"
+            "    host: https://grafana.example\n",
+            raw=True,
+        )
+
+        configs = GrafanaManager.load_grafana_config(config_path)
+
+        self.assertEqual(len(configs), 1)
+        self.assertEqual(configs[0].name, "new_dashboard")
+
+    def test_rejects_settings_without_dashboards(self):
+        config_path = self.write_config(
+            "settings:\n"
+            "  wiki_url: https://wiki.example\n",
+            raw=True,
+        )
+
+        with self.assertRaisesRegex(ConfigurationError, "non-empty top-level 'dashboards' mapping"):
+            GrafanaManager.load_grafana_config(config_path)
+
     def test_applies_documented_default_values(self):
         config_path = self.write_config(
-            "legacy_dashboard:\n"
-            "  dash_title: Legacy\n"
+            "dashboard:\n"
+            "  dash_title: Dashboard\n"
             "  host: https://grafana.example\n"
         )
 
@@ -60,6 +89,51 @@ class TestGrafanaConfigLoading(unittest.TestCase):
         self.assertFalse(config.download_collapse_panels)
         self.assertFalse(config.download_collapsed_rows)
         self.assertEqual(config.disable_graph_types, [])
+        self.assertIsNone(config.playwright_browser)
+        self.assertIsNone(config.playwright_browser_channel)
+        self.assertIsNone(config.playwright_browser_executable_path)
+        self.assertEqual(config.screenshot_readiness.network_idle_ms, 750)
+        self.assertEqual(config.screenshot_readiness.no_network_grace_ms, 1000)
+        self.assertEqual(config.screenshot_readiness.min_settle_ms, 200)
+        self.assertEqual(config.screenshot_readiness.poll_interval_ms, 100)
+        self.assertFalse(config.screenshot_readiness.strict_datasource_fragments)
+
+    def test_loads_dashboard_playwright_browser_options(self):
+        config_path = self.write_config(
+            "dashboard:\n"
+            "  dash_title: Dashboard\n"
+            "  host: https://grafana.example\n"
+            "  playwright_browser: chromium\n"
+            "  playwright_browser_channel: chrome\n"
+            "  playwright_browser_executable_path: C:/Browsers/chrome.exe\n"
+        )
+
+        config = GrafanaManager.load_grafana_config(config_path)[0]
+
+        self.assertEqual(config.playwright_browser, "chromium")
+        self.assertEqual(config.playwright_browser_channel, "chrome")
+        self.assertEqual(config.playwright_browser_executable_path, "C:/Browsers/chrome.exe")
+
+    def test_loads_dashboard_screenshot_readiness_options(self):
+        config_path = self.write_config(
+            "dashboard:\n"
+            "  dash_title: Dashboard\n"
+            "  host: https://grafana.example\n"
+            "  screenshot_readiness:\n"
+            "    network_idle_ms: 500\n"
+            "    no_network_grace_ms: 250\n"
+            "    min_settle_ms: 50\n"
+            "    poll_interval_ms: 25\n"
+            "    strict_datasource_fragments: true\n"
+        )
+
+        config = GrafanaManager.load_grafana_config(config_path)[0]
+
+        self.assertEqual(config.screenshot_readiness.network_idle_ms, 500)
+        self.assertEqual(config.screenshot_readiness.no_network_grace_ms, 250)
+        self.assertEqual(config.screenshot_readiness.min_settle_ms, 50)
+        self.assertEqual(config.screenshot_readiness.poll_interval_ms, 25)
+        self.assertTrue(config.screenshot_readiness.strict_datasource_fragments)
 
     def test_new_download_collapsed_rows_config_key_loads(self):
         config_path = self.write_config(

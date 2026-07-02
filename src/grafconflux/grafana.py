@@ -10,11 +10,6 @@ from urllib.parse import urlencode
 from concurrent.futures import ThreadPoolExecutor, wait
 
 import requests
-from seleniumwire import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.common.exceptions import TimeoutException
-from selenium.webdriver.firefox.options import Options
 from lxml import html
 import demjson3
 import yaml
@@ -22,6 +17,7 @@ import yaml
 from grafconflux._shared.time import GrafanaTimeDownloader, GrafanaTimeUploader
 from grafconflux._grafana.browser_session import GrafanaBrowserSession
 from grafconflux._grafana.lookup import log_lookup_mode, search_params, select_dashboard
+from grafconflux._grafana.playwright_screenshots import PlaywrightPanelScreenshotRunner
 from grafconflux._shared.grafana_models import (
     DEFAULT_INTERVAL_MS,
     DEFAULT_MAX_DATA_POINTS,
@@ -72,6 +68,7 @@ from grafconflux._shared.grafana_models import (
     PanelRenderTask,
     _SelectorConfig,
 )
+from grafconflux._shared.display import normalize_grafana_display_value
 from grafconflux._grafana.panel_selection import (
     apply_disabled_graph_type_filter,
     extract_dashboard_panels,
@@ -126,7 +123,6 @@ from grafconflux._grafana.snapshots import (
 )
 
 logger = logging.getLogger(__name__)
-logging.getLogger('seleniumwire').setLevel(logging.ERROR)
 
 class GrafanaManager:
     """
@@ -135,7 +131,7 @@ class GrafanaManager:
 
     def __init__(self, config: GrafanaConfigDownloader):
         self.thread_local = threading.local()
-        self.browser_list: Optional[List[webdriver.Firefox]] = []
+        self.browser_list: Optional[List[Any]] = []
         self.dashboard_url = ''
         self.config = config
         self.session = requests.Session()
@@ -153,7 +149,7 @@ class GrafanaManager:
     def render_tasks(self) -> List[PanelRenderTask]:
         return self._render_tasks
 
-    def authenticate(self, confluence_login: str, confluence_password: str):
+    def authenticate(self, confluence_login: Optional[str], confluence_password: Optional[str]):
         """
         Authenticate with Grafana using the specified method.
         """
@@ -164,6 +160,8 @@ class GrafanaManager:
             return
 
         if self.config.domain:
+            if confluence_login in (None, '') or confluence_password in (None, ''):
+                raise ValueError('Confluence login/password are required for Grafana domain authentication.')
             login = confluence_login.split('@')[0]
             password = confluence_password
         elif (self.config.login and self.config.password) and not self.config.login_url:
@@ -193,7 +191,7 @@ class GrafanaManager:
         }
 
         response = self.session.post(
-            f'{self.config.host}/login',
+            self._grafana_login_url(),
             headers={'Content-type': 'application/json'},
             data=json.dumps(payload),
             timeout=self.config.timeout,
@@ -203,11 +201,15 @@ class GrafanaManager:
             raise ConnectionError('Failed to authenticate with Grafana.')
         logger.info('Successfully authenticated with Grafana.')
 
-    def _reauthenticate_grafana(self, browser: Optional[webdriver.Firefox] = None) -> bool:
+    def _grafana_login_url(self) -> str:
+        prefix = (self.config.nginx_prefix or '').rstrip('/')
+        return f'{self.config.host}{prefix}/login'
+
+    def _reauthenticate_grafana(self, browser: Optional[Any] = None) -> bool:
         if not self.config.auth:
             return False
-        if self._confluence_login is None or self._confluence_password is None:
-            logger.error('Cannot re-authenticate Grafana: original credentials are not available')
+        if not self._has_reauthentication_credentials():
+            logger.error('Cannot re-authenticate Grafana: required credentials are not available')
             return False
         try:
             logger.warning('Grafana session expired; re-authenticating')
@@ -220,17 +222,20 @@ class GrafanaManager:
             logger.error(f'Grafana re-authentication failed: {error}')
             return False
 
-    def _refresh_browser_authentication(self, browser: webdriver.Firefox) -> None:
-        browser.delete_all_cookies()
-        browser_session = GrafanaBrowserSession(
-            self.config,
-            self.session,
-            webdriver.Firefox,
-            Options,
-            require_cookie_domain=True,
-        )
-        browser_session.apply_session_headers(browser)
-        browser_session.authenticate_browser(browser)
+    def _has_reauthentication_credentials(self) -> bool:
+        if self.config.domain:
+            return self._has_values(self._confluence_login, self._confluence_password)
+        if self.config.token:
+            return True
+        return self._has_values(self.config.login, self.config.password)
+
+    @staticmethod
+    def _has_values(*values: Optional[str]) -> bool:
+        return all(value not in (None, '') for value in values)
+
+    def _refresh_browser_authentication(self, browser: Any) -> None:
+        if hasattr(browser, 'refresh_authentication'):
+            browser.refresh_authentication()
 
     def download_charts(self, test_folder: str, timestamps: List[GrafanaTimeDownloader]):
         """
@@ -260,7 +265,6 @@ class GrafanaManager:
         try:
             wait(self._submit_render_tasks(executor))
         finally:
-            self._close_browsers()
             executor.shutdown()
 
     def _submit_render_tasks(self, executor: ThreadPoolExecutor) -> List[Any]:
@@ -343,13 +347,13 @@ class GrafanaManager:
         self._snapshot_ui_runner().take_snapshots(timestamps, test_folder)
 
     def _snapshot_ui_runner(self) -> SnapshotUiRunner:
-        return SnapshotUiRunner(self, webdriver.Firefox, Options)
+        return SnapshotUiRunner(self)
 
     @staticmethod
     def _snapshot_sleep(seconds: int) -> None:
         time.sleep(seconds)
 
-    def _create_ui_snapshot(self, browser: webdriver.Firefox, timestamp: GrafanaTimeDownloader,
+    def _create_ui_snapshot(self, browser: Any, timestamp: GrafanaTimeDownloader,
                             test_folder: str) -> None:
         self._open_dashboard_for_snapshot(browser, self.config.full_links[timestamp.id_time])
         self._prepare_dashboard_for_snapshot(browser)
@@ -359,7 +363,7 @@ class GrafanaManager:
         self._record_snapshot_url(f'{self.config.host}/dashboard/snapshot/{snapshot_key}')
         self._save_snapshot_backup(snapshot_key, timestamp, test_folder)
 
-    def _open_dashboard_for_snapshot(self, browser: webdriver.Firefox, dashboard_link: str) -> None:
+    def _open_dashboard_for_snapshot(self, browser: Any, dashboard_link: str) -> None:
         browser.get(dashboard_link)
         time.sleep(5)
         if self._dashboard_loaded_for_snapshot(browser):
@@ -370,7 +374,7 @@ class GrafanaManager:
         browser.execute_script('window.location.href = arguments[0]; return window.location.href;', dashboard_link)
         time.sleep(5)
 
-    def _dashboard_loaded_for_snapshot(self, browser: webdriver.Firefox) -> bool:
+    def _dashboard_loaded_for_snapshot(self, browser: Any) -> bool:
         return bool(browser.execute_script(self._dashboard_loaded_for_snapshot_script()))
 
     @staticmethod
@@ -389,7 +393,7 @@ class GrafanaManager:
         })();
         """
 
-    def _prepare_dashboard_for_snapshot(self, browser: webdriver.Firefox) -> None:
+    def _prepare_dashboard_for_snapshot(self, browser: Any) -> None:
         for attempt in range(2):
             self._expand_collapsed_rows(browser)
             self._hydrate_dashboard_panels(browser)
@@ -401,7 +405,7 @@ class GrafanaManager:
                 f'count={remaining_count} rows={remaining_titles} retry={attempt == 0}'
             )
 
-    def _expand_collapsed_rows(self, browser: webdriver.Firefox) -> None:
+    def _expand_collapsed_rows(self, browser: Any) -> None:
         expanded_titles = []
         expanded_count = 0
         expected_count = self._expected_collapsed_row_count()
@@ -416,12 +420,12 @@ class GrafanaManager:
             time.sleep(SNAPSHOT_ROW_SETTLE_SECONDS)
         self._warn_incomplete_row_expansion(expanded_count, expanded_titles, expected_count)
 
-    def _expand_collapsed_rows_full_sweep(self, browser: webdriver.Firefox) -> Tuple[int, List[str]]:
+    def _expand_collapsed_rows_full_sweep(self, browser: Any) -> Tuple[int, List[str]]:
         up_count, up_titles = self._expand_collapsed_rows_sweep(browser, 'up')
         down_count, down_titles = self._expand_collapsed_rows_sweep(browser, 'down')
         return up_count + down_count, up_titles + down_titles
 
-    def _expand_collapsed_rows_sweep(self, browser: webdriver.Firefox, direction: str) -> Tuple[int, List[str]]:
+    def _expand_collapsed_rows_sweep(self, browser: Any, direction: str) -> Tuple[int, List[str]]:
         expanded_count = 0
         expanded_titles = []
         for _ in range(SNAPSHOT_ROW_SWEEP_STEP_LIMIT):
@@ -434,15 +438,15 @@ class GrafanaManager:
                 break
         return expanded_count, expanded_titles
 
-    def _expand_visible_collapsed_rows(self, browser: webdriver.Firefox) -> Tuple[int, List[str]]:
+    def _expand_visible_collapsed_rows(self, browser: Any) -> Tuple[int, List[str]]:
         result = browser.execute_script(self._expand_visible_collapsed_rows_script())
         return self._expanded_row_result(result)
 
-    def _row_sweep_reached_edge(self, browser: webdriver.Firefox, direction: str) -> bool:
+    def _row_sweep_reached_edge(self, browser: Any, direction: str) -> bool:
         result = browser.execute_script(self._row_sweep_scroll_script(direction))
         return bool(isinstance(result, dict) and result.get('atEdge'))
 
-    def _scroll_dashboard_to_edge(self, browser: webdriver.Firefox, edge: str) -> None:
+    def _scroll_dashboard_to_edge(self, browser: Any, edge: str) -> None:
         browser.execute_script(self._scroll_dashboard_to_edge_script(edge))
 
     def _expected_collapsed_row_count(self) -> Optional[int]:
@@ -624,7 +628,7 @@ class GrafanaManager:
         })();
         """.replace('EDGE', edge)
 
-    def _remaining_collapsed_rows(self, browser: webdriver.Firefox) -> Tuple[int, List[str]]:
+    def _remaining_collapsed_rows(self, browser: Any) -> Tuple[int, List[str]]:
         result = browser.execute_script(self._remaining_collapsed_rows_script())
         return self._expanded_row_result(result)
 
@@ -677,13 +681,13 @@ class GrafanaManager:
         })();
         """
 
-    def _hydrate_dashboard_panels(self, browser: webdriver.Firefox) -> None:
+    def _hydrate_dashboard_panels(self, browser: Any) -> None:
         self._reset_dashboard_scroll_to_top(browser)
         if self._hydrate_dashboard_panels_with_page_down(browser):
             return
         self._hydrate_dashboard_panels_with_js(browser)
 
-    def _reset_dashboard_scroll_to_top(self, browser: webdriver.Firefox) -> None:
+    def _reset_dashboard_scroll_to_top(self, browser: Any) -> None:
         browser.execute_script(self._reset_dashboard_scroll_top_script())
 
     @staticmethod
@@ -702,18 +706,18 @@ class GrafanaManager:
         })();
         """
 
-    def _hydrate_dashboard_panels_with_page_down(self, browser: webdriver.Firefox) -> bool:
+    def _hydrate_dashboard_panels_with_page_down(self, browser: Any) -> bool:
         scrollable_div = self._find_css(browser, '.scrollbar-view')
         if scrollable_div is None:
             return False
         previous_scroll_position = -1
         for _ in range(SNAPSHOT_HYDRATION_SCROLL_LIMIT):
-            scrollable_div.send_keys(Keys.PAGE_DOWN)
+            scrollable_div.send_keys('PageDown')
             time.sleep(SNAPSHOT_PAGE_DOWN_DWELL_SECONDS)
             self._wait_for_snapshot_loaders(browser)
             current_scroll_position = self._scrollbar_view_scroll_top(browser, scrollable_div)
             if current_scroll_position == previous_scroll_position:
-                scrollable_div.send_keys(Keys.PAGE_DOWN)
+                scrollable_div.send_keys('PageDown')
                 time.sleep(SNAPSHOT_PAGE_DOWN_DWELL_SECONDS)
                 self._wait_for_snapshot_loaders(browser)
                 break
@@ -722,10 +726,12 @@ class GrafanaManager:
         return True
 
     @staticmethod
-    def _scrollbar_view_scroll_top(browser: webdriver.Firefox, scrollable_div: Any) -> int:
+    def _scrollbar_view_scroll_top(browser: Any, scrollable_div: Any) -> int:
+        if hasattr(scrollable_div, 'evaluate'):
+            return int(scrollable_div.evaluate('(element) => Math.floor(element.scrollTop || 0)') or 0)
         return int(browser.execute_script('return Math.floor(arguments[0].scrollTop || 0)', scrollable_div) or 0)
 
-    def _hydrate_dashboard_panels_with_js(self, browser: webdriver.Firefox) -> None:
+    def _hydrate_dashboard_panels_with_js(self, browser: Any) -> None:
         previous_scroll_position = -1
         stable_scrolls = 0
         for _ in range(SNAPSHOT_HYDRATION_SCROLL_LIMIT):
@@ -739,14 +745,14 @@ class GrafanaManager:
             previous_scroll_position = current_scroll_position
         time.sleep(SNAPSHOT_HYDRATION_FINAL_DWELL_SECONDS)
 
-    def _wait_for_snapshot_loaders(self, browser: webdriver.Firefox) -> None:
+    def _wait_for_snapshot_loaders(self, browser: Any) -> None:
         for _ in range(SNAPSHOT_LOADER_WAIT_LIMIT):
             if not self._snapshot_loaders_busy(browser):
                 return
             time.sleep(SNAPSHOT_LOADER_WAIT_INTERVAL_SECONDS)
         logger.debug(f'Snapshot loader wait reached limit dashboard={self.config.name}')
 
-    def _snapshot_loaders_busy(self, browser: webdriver.Firefox) -> bool:
+    def _snapshot_loaders_busy(self, browser: Any) -> bool:
         return bool(browser.execute_script(self._snapshot_loaders_busy_script()))
 
     @staticmethod
@@ -809,17 +815,17 @@ class GrafanaManager:
         })();
         """
 
-    def _snapshot_scroll_container(self, browser: webdriver.Firefox):
+    def _snapshot_scroll_container(self, browser: Any):
         for selector in ('.scrollbar-view', '[data-testid="data-testid Dashboard scroll container"]'):
             element = self._find_css(browser, selector)
             if element is not None:
                 return element
-        return browser.find_element(By.TAG_NAME, 'body')
+        return self._find_css(browser, 'body')
 
-    def _open_snapshot_dialog(self, browser: webdriver.Firefox) -> bool:
+    def _open_snapshot_dialog(self, browser: Any) -> bool:
         return self._snapshot_ui_runner()._open_snapshot_dialog(browser)
 
-    def _open_modern_snapshot_dialog(self, browser: webdriver.Firefox) -> bool:
+    def _open_modern_snapshot_dialog(self, browser: Any) -> bool:
         return self._snapshot_ui_runner()._open_modern_snapshot_dialog(browser)
 
     @staticmethod
@@ -834,27 +840,21 @@ class GrafanaManager:
     def _share_snapshot_xpaths() -> List[str]:
         return SnapshotUiRunner._share_snapshot_xpaths()
 
-    def _open_classic_snapshot_dialog(self, browser: webdriver.Firefox) -> None:
+    def _open_classic_snapshot_dialog(self, browser: Any) -> None:
         self._snapshot_ui_runner()._open_classic_snapshot_dialog(browser)
 
-    def _submit_snapshot_form(self, browser: webdriver.Firefox, timestamp: GrafanaTimeDownloader,
+    def _submit_snapshot_form(self, browser: Any, timestamp: GrafanaTimeDownloader,
                               modern_dialog: bool) -> None:
-        self._fill_optional_snapshot_field(browser, 'input[id="snapshot-name-input"]', self._snapshot_name(timestamp))
-        if modern_dialog:
-            self._click_required_css(browser, '[data-testid="data-testid share snapshot publish button"]')
-        else:
-            self._fill_optional_snapshot_field(browser, 'input[id="timeout-input"]', f'{self.config.snapshot_timeout}')
-            self._click_required_xpath(browser, "//button[.//span[text()='Local Snapshot']]")
-        time.sleep(self.config.snapshot_timeout + 2)
+        self._snapshot_ui_runner()._submit_snapshot_form(browser, timestamp, modern_dialog)
 
-    def _fill_optional_snapshot_field(self, browser: webdriver.Firefox, selector: str, value: str) -> None:
+    def _fill_optional_snapshot_field(self, browser: Any, selector: str, value: str) -> None:
         element = self._find_css(browser, selector)
         if element is None:
             return
         element.clear()
         element.send_keys(value)
 
-    def _read_snapshot_key(self, browser: webdriver.Firefox, timestamp: GrafanaTimeDownloader) -> str:
+    def _read_snapshot_key(self, browser: Any, timestamp: GrafanaTimeDownloader) -> str:
         snapshot_link = self._read_snapshot_url(browser, timestamp)
         if not snapshot_link:
             raise ValueError('Snapshot URL was not found after publishing.')
@@ -864,7 +864,7 @@ class GrafanaManager:
     def _snapshot_key_from_url(snapshot_link: str) -> str:
         return snapshot_key_from_url(snapshot_link)
 
-    def _read_snapshot_url(self, browser: webdriver.Firefox,
+    def _read_snapshot_url(self, browser: Any,
                            timestamp: Optional[GrafanaTimeDownloader] = None) -> Optional[str]:
         for selector in self._snapshot_url_selectors():
             snapshot_link = self._snapshot_url_from_element(browser, selector)
@@ -878,14 +878,18 @@ class GrafanaManager:
             return snapshot_link
         return self._lookup_snapshot_url_by_name(timestamp)
 
-    def _snapshot_url_from_browser_requests(self, browser: webdriver.Firefox) -> Optional[str]:
-        for request in reversed(list(getattr(browser, 'requests', []))):
-            if not self._is_snapshot_post_request(request):
-                continue
-            payload = self._snapshot_response_payload(getattr(request, 'response', None))
+    def _snapshot_url_from_browser_requests(self, browser: Any) -> Optional[str]:
+        for payload in reversed(list(getattr(browser, 'snapshot_payloads', []))):
             snapshot_link = self._snapshot_url_from_payload(payload)
             if snapshot_link:
                 return snapshot_link
+        for request in reversed(list(getattr(browser, 'requests', []))):
+            if self._is_snapshot_post_request(request):
+                snapshot_link = self._snapshot_url_from_payload(
+                    self._snapshot_response_payload(getattr(request, 'response', None))
+                )
+                if snapshot_link:
+                    return snapshot_link
         return None
 
     @staticmethod
@@ -924,7 +928,7 @@ class GrafanaManager:
     def _snapshot_url_from_lookup_response(self, response: Any, snapshot_name: str) -> Optional[str]:
         return snapshot_url_from_lookup_response(response, snapshot_name, self.config.host, self.config.name)
 
-    def _snapshot_url_from_element(self, browser: webdriver.Firefox, selector: str) -> Optional[str]:
+    def _snapshot_url_from_element(self, browser: Any, selector: str) -> Optional[str]:
         element = self._find_css(browser, selector)
         if element is None:
             return None
@@ -954,26 +958,26 @@ class GrafanaManager:
         })();
         """
 
-    def _click_first_css(self, browser: webdriver.Firefox, selectors: List[str]) -> bool:
+    def _click_first_css(self, browser: Any, selectors: List[str]) -> bool:
         return self._snapshot_ui_runner()._click_first_css(browser, selectors)
 
-    def _click_first_xpath(self, browser: webdriver.Firefox, xpaths: List[str]) -> bool:
+    def _click_first_xpath(self, browser: Any, xpaths: List[str]) -> bool:
         return self._snapshot_ui_runner()._click_first_xpath(browser, xpaths)
 
-    def _click_first(self, browser: webdriver.Firefox, locators: List[Tuple[str, str]]) -> bool:
+    def _click_first(self, browser: Any, locators: List[Tuple[str, str]]) -> bool:
         return self._snapshot_ui_runner()._click_first(browser, locators)
 
-    def _click_required_css(self, browser: webdriver.Firefox, selector: str) -> None:
+    def _click_required_css(self, browser: Any, selector: str) -> None:
         self._snapshot_ui_runner()._click_required_css(browser, selector)
 
-    def _click_required_xpath(self, browser: webdriver.Firefox, xpath: str) -> None:
+    def _click_required_xpath(self, browser: Any, xpath: str) -> None:
         self._snapshot_ui_runner()._click_required_xpath(browser, xpath)
 
-    def _find_css(self, browser: webdriver.Firefox, selector: str):
+    def _find_css(self, browser: Any, selector: str):
         return self._snapshot_ui_runner()._find_css(browser, selector)
 
     @staticmethod
-    def _find_element(browser: webdriver.Firefox, by: str, value: str):
+    def _find_element(browser: Any, by: str, value: str):
         return SnapshotUiRunner._find_element(browser, by, value)
 
     @classmethod
@@ -1188,8 +1192,8 @@ class GrafanaManager:
     @staticmethod
     def _stringify_panel_title_var(value) -> str:
         if isinstance(value, (list, tuple, set)):
-            return ', '.join(str(item) for item in value)
-        return str(value)
+            return ', '.join(normalize_grafana_display_value(item) for item in value)
+        return normalize_grafana_display_value(value)
 
     @staticmethod
     def _is_unresolved_repeating_rule(rule: Optional[Dict[str, Any]]) -> bool:
@@ -1216,55 +1220,67 @@ class GrafanaManager:
         """
         Download or render a single chart.
         """
+        browser = None
         if not self.config.render:
-            browser = getattr(self.thread_local, 'browser', None)
-
+            browser = self.__init_screenshot_browser()
             if browser is None:
-                browser = self.__init_browser()
-                if browser:
-                    self.thread_local.browser = browser
-                    self.thread_local.is_fullscreen = None
-                    self.browser_list.append(browser)
+                return
+
+        try:
+            panel = task.panel
+            timestamp = task.timestamp
+            file_path = build_render_file_path(self.charts_path, self.config.name, panel.panel_id, timestamp, task.file_name)
+            url, params = self.__build_panel_url(panel, timestamp, task.variables)
+            final_url = f"{url}?{urlencode(params, doseq=True)}"
+
+            if self.config.render:
+                # Use Grafana rendering API
+                render_params = build_render_api_params(params, self.config.width, self.config.height, self.config.timeout)
+                render_url = build_render_api_url(self.config.host, self.config.nginx_prefix, self.dashboard_url)
+                try:
+                    response = self.session.get(render_url, params=render_params, timeout=self.config.timeout)
+                    response.raise_for_status()
+                except Exception as e:
+                    logger.error(f'Failed to download chart for panel {panel.panel_id}: {e}')
+                    response = None
+
+                try:
+                    self.session.get(f"{final_url}&fullscreen", timeout=self.config.timeout)
+                    self.__record_task_link(task, f"{final_url}&fullscreen")
+                except Exception:
+                    self.session.get(final_url, timeout=self.config.timeout)
+                    self.__record_task_link(task, final_url)
+
+                if response and response.status_code == 200:
+                    with open(file_path, 'wb') as f:
+                        f.write(response.content)
+
+                    logger.info(f'Downloaded chart to {file_path}')
                 else:
-                    logger.error('Failed to initialize browser')
-                    return
-        else:
-            browser = None
-
-        panel = task.panel
-        timestamp = task.timestamp
-        file_path = build_render_file_path(self.charts_path, self.config.name, panel.panel_id, timestamp, task.file_name)
-        url, params = self.__build_panel_url(panel, timestamp, task.variables)
-        final_url = f"{url}?{urlencode(params, doseq=True)}"
-
-        if self.config.render:
-            # Use Grafana rendering API
-            render_params = build_render_api_params(params, self.config.width, self.config.height, self.config.timeout)
-            render_url = build_render_api_url(self.config.host, self.config.nginx_prefix, self.dashboard_url)
-            try:
-                response = self.session.get(render_url, params=render_params, timeout=self.config.timeout)
-                response.raise_for_status()
-            except Exception as e:
-                logger.error(f'Failed to download chart for panel {panel.panel_id}: {e}')
-                response = None
-
-            try:
-                self.session.get(f"{final_url}&fullscreen", timeout=self.config.timeout)
-                self.__record_task_link(task, f"{final_url}&fullscreen")
-            except Exception:
-                self.session.get(final_url, timeout=self.config.timeout)
-                self.__record_task_link(task, final_url)
-
-            if response and response.status_code == 200:
-                with open(file_path, 'wb') as f:
-                    f.write(response.content)
-
-                logger.info(f'Downloaded chart to {file_path}')
+                    logger.error(f'Failed to download chart for panel {panel.panel_id}')
             else:
-                logger.error(f'Failed to download chart for panel {panel.panel_id}')
-        else:
-            # Use headless browser
-            self.__take_screenshot(browser, task, final_url, file_path)
+                # Use headless browser
+                self.__take_screenshot(browser, task, final_url, file_path)
+        finally:
+            if not self.config.render:
+                self._close_worker_browser(browser)
+
+    def __init_screenshot_browser(self):
+        browser = self.__init_browser()
+        if browser is None:
+            logger.error('Failed to initialize browser')
+            return None
+        if not hasattr(self.thread_local, 'is_fullscreen'):
+            self.thread_local.is_fullscreen = None
+        return browser
+
+    @staticmethod
+    def _close_worker_browser(browser: Any) -> None:
+        if browser is None:
+            return
+        close = getattr(browser, 'quit', None) or getattr(browser, 'close', None)
+        if callable(close):
+            close()
 
     def __record_task_link(self, task: PanelRenderTask, link: str) -> None:
         task.panel.links[task.timestamp.id_time] = link
@@ -1291,169 +1307,15 @@ class GrafanaManager:
         return GrafanaBrowserSession(
             self.config,
             self.session,
-            webdriver.Firefox,
-            Options,
             suppress_setup_errors=True,
             require_cookie_domain=True,
         ).create_browser()
 
-    def __take_screenshot(self, browser: webdriver.Firefox, task: PanelRenderTask, final_url, file_path):
+    def __take_screenshot(self, browser: Any, task: PanelRenderTask, final_url, file_path):
         """
-        Use a headless browser to take a screenshot of the panel.
+        Use a Playwright headless browser to take a screenshot of the panel.
         """
-        panel_data_sources = self.__get_panel_data_sources(final_url)
-
-        if self.thread_local.is_fullscreen is None:
-            if self.__try_screenshot_route(
-                browser, task, f"{final_url}&fullscreen", file_path, panel_data_sources, False, fullscreen_state=True,
-            ):
-                return
-            self.__try_screenshot_route(
-                browser, task, final_url, file_path, panel_data_sources, True,
-                request_error_message=f'Request to {final_url} does not return 200 OK!', fullscreen_state=False,
-            )
-            return
-
-        route_url = f"{final_url}&fullscreen" if self.thread_local.is_fullscreen else final_url
-        request_error_message = None if self.thread_local.is_fullscreen else f'Request to {final_url} does not return 200 OK!'
-        self.__try_screenshot_route(browser, task, route_url, file_path, panel_data_sources, True, request_error_message)
-
-    def __try_screenshot_route(self, browser: webdriver.Firefox, task: PanelRenderTask, route_url: str,
-                               file_path: str, panel_data_sources: List[str], log_errors: bool,
-                               request_error_message: Optional[str] = None,
-                               fullscreen_state: Optional[bool] = None) -> bool:
-        try:
-            status_code = self.__open_screenshot_route(browser, task, route_url)
-            if status_code in (401, 403) and self._reauthenticate_grafana(browser):
-                logger.info(f'Retrying panel after re-authentication panel_id={task.panel.panel_id}')
-                status_code = self.__open_screenshot_route(browser, task, route_url)
-            if status_code != 200:
-                message = self.__route_error_message(route_url, status_code, request_error_message)
-                raise Exception(message)
-            if fullscreen_state is not None:
-                self.thread_local.is_fullscreen = fullscreen_state
-            if not self.__browser_loaded_panel(browser, task.panel.panel_id):
-                raise Exception(f'Browser did not load expected panel_id={task.panel.panel_id}; current_url={browser.current_url}')
-            self.__record_task_link(task, route_url)
-            self.__wait_for_network_request(browser, panel_data_sources, self.config.timeout)
-            self.__close_grafana_sidebar(browser)
-            browser.save_screenshot(file_path)
-            logger.info(f'Screenshot saved to {file_path}')
-            return True
-        except Exception as e:
-            if log_errors:
-                logger.error(f'Failed to take screenshot: {e}')
-            return False
-
-    def __open_screenshot_route(self, browser: webdriver.Firefox, task: PanelRenderTask, route_url: str) -> Optional[int]:
-        logger.info(f'Opening panel for screenshot panel_id={task.panel.panel_id} url={route_url}')
-        self.__clear_browser_requests(browser)
-        try:
-            browser.get(route_url)
-        except TimeoutException as error:
-            logger.warning(f'Panel navigation timed out, checking loaded response panel_id={task.panel.panel_id}: {error}')
-        status_code = self.__route_status_code(browser, route_url)
-        logger.info(f'Panel navigation response panel_id={task.panel.panel_id} status={status_code} url={route_url}')
-        return status_code
-
-    @staticmethod
-    def __browser_loaded_panel(browser: webdriver.Firefox, panel_id: int) -> bool:
-        expected_values = {str(panel_id)}
-        try:
-            return bool(browser.execute_script("""
-            const expected = arguments[0];
-            const current = new URL(window.location.href);
-            return current.searchParams.get('panelId') === expected
-              || current.searchParams.get('viewPanel') === expected;
-            """, str(panel_id)))
-        except Exception:
-            current_url = getattr(browser, 'current_url', None)
-            if current_url is None:
-                return True
-            return any(f'panelId={value}' in current_url or f'viewPanel={value}' in current_url for value in expected_values)
-
-    @staticmethod
-    def __clear_browser_requests(browser: webdriver.Firefox) -> None:
-        try:
-            requests = getattr(browser, 'requests')
-            if hasattr(requests, 'clear'):
-                requests.clear()
-            else:
-                del browser.requests
-        except Exception as error:
-            logger.warning(f'Failed to clear browser request history: {error}')
-
-    @staticmethod
-    def __route_error_message(route_url: str, status_code: Optional[int], fallback_message: Optional[str]) -> str:
-        if status_code is None:
-            return fallback_message or f'Request to {route_url} has no captured HTTP response'
-        if fallback_message:
-            return f'{fallback_message} HTTP status={status_code}'
-        return f'Request to {route_url} returned HTTP {status_code}'
-
-    @staticmethod
-    def __close_grafana_sidebar(browser: webdriver.Firefox) -> None:
-        try:
-            browser.execute_script("""
-            const buttons = Array.from(document.querySelectorAll('button'));
-            const closeButton = buttons.find((button) => {
-              const label = (button.getAttribute('aria-label') || button.getAttribute('title') || '').toLowerCase();
-              const text = (button.textContent || '').trim().toLowerCase();
-              return label.includes('close') || label.includes('collapse') || text === '×' || text === 'x';
-            });
-            if (closeButton) {
-              closeButton.click();
-              return;
-            }
-            const sidebar = document.querySelector('nav, aside, [aria-label="Navigation"], [data-testid*="sidemenu"]');
-            if (sidebar && sidebar.getBoundingClientRect().width > 120) {
-              sidebar.style.display = 'none';
-            }
-            """)
-        except Exception as error:
-            logger.debug(f'Grafana sidebar was not closed: {error}')
-
-    @staticmethod
-    def __route_status_code(browser: webdriver.Firefox, route_url: str) -> Optional[int]:
-        matching_requests = [
-            request
-            for request in browser.requests
-            if request.url == route_url and request.response is not None
-        ]
-        if not matching_requests:
-            return None
-        return matching_requests[-1].response.status_code
-
-    def __wait_for_network_request(self, browser: webdriver.Firefox, url_part: List[str], timeout):
-        """
-        Wait until a network request containing `url_part` has completed.
-        """
-        if url_part:
-            time.sleep(self.config.firefox_driver_preload_time)
-            start_time = time.time()
-
-            while True:
-                if self.__all_network_parts_loaded(browser, url_part):
-                    return
-
-                if time.time() - start_time > timeout - self.config.firefox_driver_preload_time:
-                    return
-
-                time.sleep(0.1)
-        else:
-            time.sleep(self.config.timeout)
-
-    @staticmethod
-    def __all_network_parts_loaded(browser: webdriver.Firefox, url_part: List[str]) -> bool:
-        for url in url_part:
-            if not any(
-                url in request.url
-                and request.response is not None
-                and request.response.status_code == 200
-                for request in browser.requests
-            ):
-                return False
-        return True
+        PlaywrightPanelScreenshotRunner(self).take_screenshot(browser, task, final_url, file_path)
 
     def __get_panel_data_sources(self, final_url):
         response = self.session.get(final_url, verify=self.config.verify_ssl, timeout=self.config.timeout)
@@ -1485,15 +1347,29 @@ class GrafanaManager:
     @staticmethod
     def load_grafana_config(path: str) -> List[GrafanaConfigDownloader]:
         with open(path, 'r', encoding='utf-8') as file:
-            config = yaml.safe_load(file)
+            config = yaml.safe_load(file) or {}
 
-        grafana_configs = []
-        
-        if 'settings' in config:
-            for config_name, config_data in config['dashboards'].items():
-                grafana_configs.append(GrafanaConfigDownloader(config_name, config_data))
-        else:
-            for config_name, config_data in config.items():
-                grafana_configs.append(GrafanaConfigDownloader(config_name, config_data))
-        
-        return grafana_configs
+        dashboards = GrafanaManager._dashboard_configs_from_yaml(config)
+        return [
+            GrafanaConfigDownloader(config_name, config_data)
+            for config_name, config_data in dashboards.items()
+        ]
+
+    @staticmethod
+    def _dashboard_configs_from_yaml(config: Any) -> Dict[str, Any]:
+        if not isinstance(config, dict):
+            raise ConfigurationError("YAML config must be a mapping with top-level 'dashboards' and optional 'settings'.")
+        if 'dashboards' not in config and any(
+            key != 'settings' and isinstance(value, dict)
+            for key, value in config.items()
+        ):
+            raise ConfigurationError(
+                "Legacy top-level dashboard YAML format is not supported; "
+                "move dashboard entries under top-level 'dashboards'."
+            )
+        if 'settings' in config and not isinstance(config['settings'], dict):
+            raise ConfigurationError("YAML top-level 'settings' must be a mapping.")
+        dashboards = config.get('dashboards')
+        if not isinstance(dashboards, dict) or not dashboards:
+            raise ConfigurationError("YAML config must contain a non-empty top-level 'dashboards' mapping.")
+        return dashboards

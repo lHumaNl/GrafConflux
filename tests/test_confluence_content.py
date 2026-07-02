@@ -6,6 +6,12 @@ from unittest.mock import Mock, patch
 
 from grafconflux import confluence, confluence_content
 from grafconflux.confluence import ConfluenceManager, apply_graphs_placeholder, build_confluence_storage_content
+from grafconflux._confluence.content import (
+    ChildPageInclude,
+    build_child_page_title,
+    build_parent_include_content,
+    sanitize_confluence_page_title,
+)
 from grafconflux.grafana import GrafanaConfigUploader, Panel
 
 
@@ -184,6 +190,32 @@ class TestConfluenceContent(unittest.TestCase):
         self.assertIn("<h3>Renamed CPU</h3>", content)
         self.assertIn("<ac:parameter ac:name=\"title\">Renamed CPU</ac:parameter>", content)
 
+    def test_build_confluence_storage_content_normalizes_all_repeat_value_in_titles(self):
+        panel = Panel(17, "timeseries", "CPU by iface", 1, ["legacy-link"])
+        panel.is_repeating = True
+        panel.repeat_var = "iface"
+        panel.artifacts = [
+            {
+                "timestamp_tag": "smoke",
+                "render_status": "rendered",
+                "png_file": "Demo dashboard__17__repeat-all__smoke.png",
+                "repeat_value": "$__all",
+                "link": "https://grafana.example/panel/17?var-iface=$__all",
+            }
+        ]
+        configs = [SimpleNamespace(
+            name="Demo dashboard",
+            full_links=["https://grafana.example/d/demo?from=1&to=2"],
+            backup_dashboard_links=[],
+            snapshot_urls=None,
+            panels=[panel],
+        )]
+
+        content = build_confluence_storage_content(configs, self.timestamps, 900)
+
+        self.assertIn("CPU by iface [iface=All]", content)
+        self.assertNotIn("CPU by iface [iface=$__all]", content)
+
     def test_upload_only_legacy_flat_repeat_metadata_renders_repeat_value(self):
         config = {
             "panels": [{
@@ -251,3 +283,128 @@ class TestConfluenceContent(unittest.TestCase):
             "https://backup.example/d/demo?orgId=7&amp;var-x=abc&amp;from=1700000000000&amp;to=1700003600000",
             content,
         )
+
+    def test_child_page_title_uses_default_formula_and_sanitizes(self):
+        args = SimpleNamespace(
+            confluence_child_title=None,
+            confluence_child_title_prefix="GrafConflux: ",
+            confluence_child_title_from_test_id=False,
+            test_id="Release / A",
+            timestamps=self.timestamps,
+        )
+
+        title = build_child_page_title("Parent", args)
+
+        self.assertEqual(title, "Parent — GrafConflux: Release - A")
+
+    def test_child_page_title_can_use_test_id_directly(self):
+        args = SimpleNamespace(
+            confluence_child_title=None,
+            confluence_child_title_prefix="ignored",
+            confluence_child_title_from_test_id=True,
+            test_id="Run 42",
+            timestamps=self.timestamps,
+        )
+
+        self.assertEqual(build_child_page_title("Parent", args), "Run 42")
+
+    def test_sanitize_confluence_page_title_has_fallback(self):
+        self.assertEqual(sanitize_confluence_page_title(" / <> "), "GrafConflux child page")
+        self.assertEqual(sanitize_confluence_page_title("   "), "GrafConflux child page")
+
+    def test_build_parent_include_content_escapes_titles_and_space(self):
+        content = build_parent_include_content([ChildPageInclude('Child "A" & B', 'S&P')])
+
+        self.assertIn('<ac:structured-macro ac:name="expand">', content)
+        self.assertIn('Child &quot;A&quot; &amp; B', content)
+        self.assertIn('ri:content-title="Child &quot;A&quot; &amp; B"', content)
+        self.assertIn('ri:space-key="S&amp;P"', content)
+
+    @patch("grafconflux.confluence.Confluence")
+    def test_parent_include_replaces_marker_when_present(self, confluence_class):
+        confluence = confluence_class.return_value
+        confluence.get_page_by_id.return_value = {
+            "title": "Parent",
+            "space": {"key": "OPS"},
+            "body": {"storage": {"value": "before %%%graphs%%% after"}},
+        }
+        manager = self.create_manager(confluence)
+
+        updated = manager.update_parent_include_block(123, [ChildPageInclude("Child", "OPS")])
+
+        self.assertTrue(updated)
+        updated_body = confluence.update_page.call_args.kwargs["body"]
+        self.assertIn("before ", updated_body)
+        self.assertIn("ri:content-title=\"Child\"", updated_body)
+        self.assertIn(" after", updated_body)
+        self.assertNotIn("%%%graphs%%%", updated_body)
+
+    @patch("grafconflux.confluence.Confluence")
+    def test_parent_include_skips_update_when_marker_missing(self, confluence_class):
+        confluence = confluence_class.return_value
+        confluence.get_page_by_id.return_value = {
+            "title": "Parent",
+            "space": {"key": "OPS"},
+            "body": {"storage": {"value": "existing body"}},
+        }
+        manager = self.create_manager(confluence)
+
+        updated = manager.update_parent_include_block(123, [ChildPageInclude("Child", "OPS")])
+
+        self.assertFalse(updated)
+        confluence.update_page.assert_not_called()
+
+    @patch("grafconflux.confluence.Confluence")
+    def test_create_or_get_child_page_creates_missing_page_under_parent(self, confluence_class):
+        confluence = confluence_class.return_value
+        confluence.get_page_by_id.return_value = {
+            "title": "Parent",
+            "space": {"key": "OPS"},
+            "body": {"storage": {"value": "%%%graphs%%%"}},
+        }
+        confluence.get_page_child_by_type.return_value = {"results": []}
+        confluence.create_page.return_value = {"id": "456", "title": "Child"}
+        args = SimpleNamespace(
+            confluence_child_title="Child",
+            confluence_child_title_prefix="GrafConflux: ",
+            confluence_child_title_from_test_id=False,
+            test_id="ignored",
+            timestamps=self.timestamps,
+        )
+        manager = self.create_manager(confluence)
+
+        child_page = manager.create_or_get_child_page(123, args)
+
+        self.assertEqual(args.confluence_page_id, 456)
+        self.assertEqual(child_page, ChildPageInclude("Child", "OPS"))
+        confluence.create_page.assert_called_once_with(
+            space="OPS",
+            title="Child",
+            body="%%%graphs%%%",
+            parent_id=123,
+            representation="storage",
+        )
+
+    @patch("grafconflux.confluence.Confluence")
+    def test_create_or_get_child_page_reuses_existing_child(self, confluence_class):
+        confluence = confluence_class.return_value
+        confluence.get_page_by_id.return_value = {
+            "title": "Parent",
+            "space": {"key": "OPS"},
+            "body": {"storage": {"value": "%%%graphs%%%"}},
+        }
+        confluence.get_page_child_by_type.return_value = {"results": [{"id": "456", "title": "Child"}]}
+        args = SimpleNamespace(
+            confluence_child_title="Child",
+            confluence_child_title_prefix="GrafConflux: ",
+            confluence_child_title_from_test_id=False,
+            test_id="ignored",
+            timestamps=self.timestamps,
+        )
+        manager = self.create_manager(confluence)
+
+        child_page = manager.create_or_get_child_page(123, args)
+
+        self.assertEqual(args.confluence_page_id, 456)
+        self.assertEqual(child_page, ChildPageInclude("Child", "OPS"))
+        confluence.create_page.assert_not_called()

@@ -1,0 +1,352 @@
+import logging
+import time
+from typing import Any, List, Optional, Set, Tuple
+from urllib.parse import parse_qs, urlparse
+
+logger = logging.getLogger('grafconflux.grafana')
+
+UNAUTHORIZED_STATUSES = {401, 403}
+RELEVANT_GRAFANA_API_FRAGMENTS: Tuple[str, ...] = (
+    '/api/ds/query',
+    '/api/datasources/proxy',
+    '/api/datasources/proxy/uid',
+    '/api/annotations',
+    '/api/dashboard',
+    '/api/dashboards/uid',
+    '/api/dashboards/db',
+    '/api/tsdb/query',
+)
+PANEL_READY_SELECTOR = ', '.join([
+    '[data-testid^="data-testid Panel header"]',
+    '[data-testid="data-testid Panel chrome"]',
+    '[data-testid="data-testid panel content"]',
+    '.panel-container',
+    '.react-grid-item',
+])
+SIDEBAR_BUTTON_SELECTORS = [
+    'button[aria-label*="Collapse"]',
+    'button[aria-label*="Close"]',
+    'button[title*="Collapse"]',
+    'button[title*="Close"]',
+]
+LOADING_INDICATOR_SCRIPT = """
+() => {
+  const selectors = [
+    '[data-testid*="Loading"]',
+    '[aria-label*="Loading"]',
+    '.panel-loading',
+    '[class*="spinner"]'
+  ];
+  return selectors.some((selector) => Array.from(document.querySelectorAll(selector)).some((element) => {
+    if (element.closest('[aria-hidden="true"]')) {
+      return false;
+    }
+    const style = window.getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return style.display !== 'none'
+      && style.visibility !== 'hidden'
+      && Number(style.opacity || '1') > 0
+      && rect.width > 0
+      && rect.height > 0;
+  }));
+}
+"""
+
+
+class PlaywrightResponseCollector:
+    """Collect network responses scoped to one Playwright navigation attempt."""
+
+    def __init__(self, page: Any) -> None:
+        self.page = page
+        self.responses: List[Any] = []
+        self._inflight_relevant: Set[int] = set()
+        self._seen_relevant = False
+        self._last_relevant_activity_ms: Optional[int] = None
+
+    def __enter__(self):
+        self.page.on('request', self._record_request)
+        self.page.on('response', self._record)
+        self.page.on('requestfinished', self._record_request_done)
+        self.page.on('requestfailed', self._record_request_done)
+        return self
+
+    def __exit__(self, _exc_type, _exc_value, _traceback) -> None:
+        try:
+            self.page.remove_listener('request', self._record_request)
+            self.page.remove_listener('response', self._record)
+            self.page.remove_listener('requestfinished', self._record_request_done)
+            self.page.remove_listener('requestfailed', self._record_request_done)
+        except Exception:
+            try:
+                self.page.off('request', self._record_request)
+                self.page.off('response', self._record)
+                self.page.off('requestfinished', self._record_request_done)
+                self.page.off('requestfailed', self._record_request_done)
+            except Exception:
+                pass
+
+    def _record(self, response: Any) -> None:
+        self.responses.append(response)
+        if is_relevant_grafana_api(response_url(response)):
+            self._mark_relevant_activity()
+
+    def _record_request(self, request: Any) -> None:
+        if not is_relevant_grafana_api(request_url(request)):
+            return
+        self._inflight_relevant.add(id(request))
+        self._mark_relevant_activity()
+
+    def _record_request_done(self, request: Any) -> None:
+        request_id = id(request)
+        if request_id not in self._inflight_relevant:
+            return
+        self._inflight_relevant.remove(request_id)
+        self._mark_relevant_activity()
+
+    def _mark_relevant_activity(self) -> None:
+        self._seen_relevant = True
+        self._last_relevant_activity_ms = monotonic_ms()
+
+    def all_fragments_loaded(self, fragments: List[str]) -> bool:
+        return all(self._has_successful_fragment(fragment) for fragment in fragments)
+
+    def unauthorized_status(self, fragments: List[str]) -> Optional[int]:
+        for response in self.responses:
+            status = response_status(response)
+            if status not in UNAUTHORIZED_STATUSES:
+                continue
+            url = response_url(response)
+            if not fragments or any(fragment in url for fragment in fragments) or is_relevant_grafana_api(url):
+                return status
+        return None
+
+    def has_relevant_requests(self) -> bool:
+        return self._seen_relevant
+
+    def relevant_network_idle(self, idle_ms: int) -> bool:
+        if self._inflight_relevant or self._last_relevant_activity_ms is None:
+            return False
+        return monotonic_ms() - self._last_relevant_activity_ms >= idle_ms
+
+    def _has_successful_fragment(self, fragment: str) -> bool:
+        return any(fragment in response_url(response) and response_status(response) == 200 for response in self.responses)
+
+
+class PlaywrightPanelScreenshotRunner:
+    """Take Grafana panel screenshots through the Playwright sync API."""
+
+    def __init__(self, manager) -> None:
+        self.manager = manager
+
+    def take_screenshot(self, browser: Any, task: Any, final_url: str, file_path: str) -> None:
+        data_sources = self.manager._GrafanaManager__get_panel_data_sources(final_url)
+        fullscreen_state = self._fullscreen_state()
+        if fullscreen_state is False:
+            self._try_route(browser, task, final_url, file_path, data_sources, True, False)
+            return
+        if self._try_route(
+            browser,
+            task,
+            f'{final_url}&fullscreen',
+            file_path,
+            data_sources,
+            fullscreen_state is True,
+            True,
+        ):
+            return
+        self._recover_browser_for_fallback(browser, task)
+        self._try_route(browser, task, final_url, file_path, data_sources, True, False)
+
+    def _try_route(self, browser: Any, task: Any, route_url: str, file_path: str,
+                   data_sources: List[str], log_errors: bool, fullscreen_state: Optional[bool]) -> bool:
+        try:
+            status_code = self._open_validate_and_settle(browser, task, route_url, data_sources)
+            if status_code in UNAUTHORIZED_STATUSES and self.manager._reauthenticate_grafana(browser):
+                logger.info(f'Retrying panel after re-authentication panel_id={task.panel.panel_id}')
+                status_code = self._open_validate_and_settle(browser, task, route_url, data_sources)
+            if status_code != 200:
+                raise RuntimeError(self._route_error_message(route_url, status_code))
+            self._set_fullscreen_state(fullscreen_state)
+            self._close_sidebar(browser)
+            browser.save_screenshot(file_path)
+            self.manager._GrafanaManager__record_task_link(task, route_url)
+            logger.info(f'Screenshot saved to {file_path}')
+            return True
+        except Exception as error:
+            if log_errors:
+                logger.error(f'Failed to take screenshot: {error}')
+            return False
+
+    def _open_validate_and_settle(self, browser: Any, task: Any, route_url: str, data_sources: List[str]) -> Optional[int]:
+        collector = PlaywrightResponseCollector(browser.page)
+        with collector:
+            status_code = self._open_route(browser, task, route_url)
+            if status_code in UNAUTHORIZED_STATUSES:
+                return status_code
+            if status_code != 200:
+                return status_code
+            if not self._loaded_expected_panel(browser, task.panel.panel_id):
+                raise RuntimeError(
+                    f'Browser did not load expected panel_id={task.panel.panel_id}; current_url={browser.current_url}'
+                )
+            settle_status = self._wait_for_network_settle(browser, collector, data_sources)
+            return settle_status or status_code
+
+    def _open_route(self, browser: Any, task: Any, route_url: str) -> Optional[int]:
+        logger.info(f'Opening panel for screenshot panel_id={task.panel.panel_id} url={route_url}')
+        try:
+            response = browser.get(route_url)
+        except Exception as error:
+            logger.warning(f'Panel navigation failed panel_id={task.panel.panel_id}: {error}')
+            raise RuntimeError(
+                f'Panel navigation failed panel_id={task.panel.panel_id} url={route_url}: {error}'
+            ) from error
+        status_code = response_status(response)
+        logger.info(f'Panel navigation response panel_id={task.panel.panel_id} status={status_code} url={route_url}')
+        return status_code
+
+    @staticmethod
+    def _recover_browser_for_fallback(browser: Any, task: Any) -> None:
+        refresh = getattr(browser, 'refresh_authentication', None)
+        if not callable(refresh):
+            logger.debug(f'Browser context reset is unavailable panel_id={task.panel.panel_id}')
+            return
+        try:
+            logger.warning(f'Resetting browser context before panel fallback panel_id={task.panel.panel_id}')
+            refresh()
+        except Exception as error:
+            logger.warning(f'Browser context reset before panel fallback failed panel_id={task.panel.panel_id}: {error}')
+
+    def _wait_for_network_settle(self, browser: Any, collector: PlaywrightResponseCollector,
+                                 fragments: List[str]) -> Optional[int]:
+        readiness = self.manager.config.screenshot_readiness
+        self._wait_for_panel_dom(browser)
+        start_ms = monotonic_ms()
+        deadline_ms = start_ms + max(0, self.manager.config.timeout) * 1000
+        while monotonic_ms() < deadline_ms:
+            unauthorized_status = collector.unauthorized_status(fragments)
+            if unauthorized_status is not None:
+                return unauthorized_status
+            if self._readiness_reached(browser, collector, fragments, start_ms):
+                return None
+            browser.page.wait_for_timeout(readiness.poll_interval_ms)
+        return collector.unauthorized_status(fragments)
+
+    def _readiness_reached(self, browser: Any, collector: PlaywrightResponseCollector,
+                           fragments: List[str], start_ms: int) -> bool:
+        readiness = self.manager.config.screenshot_readiness
+        if not self._minimum_settle_elapsed(readiness.min_settle_ms, start_ms):
+            return False
+        if not self._datasource_fragments_ready(collector, fragments):
+            return False
+        if not self._loading_indicators_hidden(browser):
+            return False
+        if collector.has_relevant_requests():
+            return collector.relevant_network_idle(readiness.network_idle_ms)
+        return monotonic_ms() - start_ms >= readiness.no_network_grace_ms
+
+    @staticmethod
+    def _minimum_settle_elapsed(min_settle_ms: int, start_ms: int) -> bool:
+        return monotonic_ms() - start_ms >= min_settle_ms
+
+    def _datasource_fragments_ready(self, collector: PlaywrightResponseCollector, fragments: List[str]) -> bool:
+        readiness = self.manager.config.screenshot_readiness
+        return not readiness.strict_datasource_fragments or collector.all_fragments_loaded(fragments)
+
+    @staticmethod
+    def _loading_indicators_hidden(browser: Any) -> bool:
+        try:
+            return not bool(browser.page.evaluate(LOADING_INDICATOR_SCRIPT))
+        except Exception as error:
+            logger.debug(f'Grafana loading indicator check skipped: {error}')
+            return True
+
+    @staticmethod
+    def _wait_for_panel_dom(browser: Any) -> None:
+        try:
+            browser.page.locator(PANEL_READY_SELECTOR).first.wait_for(timeout=5000)
+        except Exception:
+            logger.debug('Panel readiness selector wait reached timeout')
+
+    @staticmethod
+    def _loaded_expected_panel(browser: Any, panel_id: int) -> bool:
+        try:
+            return bool(browser.page.evaluate(
+                """
+                (expected) => {
+                  const current = new URL(window.location.href);
+                  return current.searchParams.get('panelId') === expected
+                    || current.searchParams.get('viewPanel') === expected;
+                }
+                """,
+                str(panel_id),
+            ))
+        except Exception:
+            return url_has_panel_id(browser.current_url, panel_id)
+
+    @staticmethod
+    def _close_sidebar(browser: Any) -> None:
+        try:
+            for selector in SIDEBAR_BUTTON_SELECTORS:
+                locator = browser.page.locator(selector).first
+                if locator.count():
+                    locator.click(timeout=1000)
+                    return
+            browser.page.evaluate(_hide_sidebar_script())
+        except Exception as error:
+            logger.debug(f'Grafana sidebar was not closed: {error}')
+
+    def _fullscreen_state(self) -> Optional[bool]:
+        return getattr(self.manager.thread_local, 'is_fullscreen', None)
+
+    def _set_fullscreen_state(self, fullscreen_state: Optional[bool]) -> None:
+        if fullscreen_state is not None:
+            self.manager.thread_local.is_fullscreen = fullscreen_state
+
+    @staticmethod
+    def _route_error_message(route_url: str, status_code: Optional[int]) -> str:
+        if status_code is None:
+            return f'Request to {route_url} completed without an HTTP response'
+        return f'Request to {route_url} returned HTTP {status_code}'
+
+
+def response_status(response: Any) -> Optional[int]:
+    if response is None:
+        return None
+    status = getattr(response, 'status', None)
+    if status is None:
+        status = getattr(response, 'status_code', None)
+    return int(status) if status is not None else None
+
+
+def response_url(response: Any) -> str:
+    return str(getattr(response, 'url', ''))
+
+
+def request_url(request: Any) -> str:
+    return str(getattr(request, 'url', ''))
+
+
+def is_relevant_grafana_api(url: str) -> bool:
+    return any(fragment in url for fragment in RELEVANT_GRAFANA_API_FRAGMENTS)
+
+
+def monotonic_ms() -> int:
+    return int(time.monotonic() * 1000)
+
+
+def url_has_panel_id(current_url: str, panel_id: int) -> bool:
+    query = parse_qs(urlparse(current_url).query)
+    expected = str(panel_id)
+    return expected in query.get('panelId', []) or expected in query.get('viewPanel', [])
+
+
+def _hide_sidebar_script() -> str:
+    return """
+    () => {
+      const sidebar = document.querySelector('nav, aside, [aria-label="Navigation"], [data-testid*="sidemenu"]');
+      if (sidebar && sidebar.getBoundingClientRect().width > 120) {
+        sidebar.style.display = 'none';
+      }
+    }
+    """

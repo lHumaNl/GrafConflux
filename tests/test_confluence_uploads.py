@@ -67,6 +67,15 @@ class TestConfluenceUploads(unittest.TestCase):
         uploaded_names = [call.kwargs["name"] for call in self.confluence.attach_file.call_args_list]
         self.assertCountEqual(uploaded_names, ["a.png", "b.png", "c.png"])
 
+    def test_token_auth_uses_confluence_token_constructor_arg(self):
+        self.create_manager(token="pat-token")
+
+        self.confluence_class.assert_called_with(
+            url="https://wiki.example",
+            verify_ssl=True,
+            token="pat-token",
+        )
+
     def test_upload_files_are_submitted_in_deterministic_order(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             self.create_files(temp_dir, ["z.png", "a.png", "m.png"])

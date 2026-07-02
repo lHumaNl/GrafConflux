@@ -1,5 +1,6 @@
 import os
 import tempfile
+import textwrap
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -13,9 +14,15 @@ class TestGrafanaDashboardLookupConfig(unittest.TestCase):
         temp_dir = tempfile.TemporaryDirectory()
         config_path = os.path.join(temp_dir.name, "config.yaml")
         with open(config_path, "w", encoding="utf-8") as config_file:
-            config_file.write(content)
+            config_file.write(self.new_config(content))
         self.addCleanup(temp_dir.cleanup)
         return config_path
+
+    @staticmethod
+    def new_config(dashboards_yaml: str) -> str:
+        if dashboards_yaml.lstrip().startswith("settings:"):
+            return dashboards_yaml
+        return "settings: {}\ndashboards:\n" + textwrap.indent(dashboards_yaml, "  ")
 
     def test_config_loading_accepts_dashboard_uid(self) -> None:
         config_path = self.write_config(
@@ -42,7 +49,7 @@ class TestGrafanaDashboardLookupConfig(unittest.TestCase):
         self.assertEqual(config.dash_title, "Payments")
         self.assertEqual(config.folder_uid, "folder-123")
 
-    def test_title_only_legacy_config_remains_valid(self) -> None:
+    def test_title_only_dashboard_config_remains_valid(self) -> None:
         config_path = self.write_config(
             "legacy_dashboard:\n"
             "  host: https://grafana.example\n"
@@ -349,7 +356,13 @@ class TestGrafanaLookupCliApiSmoke(unittest.TestCase):
         return config_path
 
     def test_existing_cli_args_still_parse_without_new_flags(self) -> None:
-        config_path = self.write_config("settings: {}\n")
+        config_path = self.write_config(
+            "settings: {}\n"
+            "dashboards:\n"
+            "  demo:\n"
+            "    dash_title: Demo\n"
+            "    host: https://grafana.example\n"
+        )
 
         from grafconflux.args_parser import ArgsParser
 

@@ -9,11 +9,25 @@ from grafconflux.args_parser import ArgsParser
 
 
 class TestArgsParser(unittest.TestCase):
-    def create_config(self, content: str = "settings: {}\n"):
+    def create_config(
+        self,
+        content: str = "dashboards:\n  demo:\n    dash_title: Demo\n    host: https://grafana.example\n",
+        *,
+        raw: bool = False,
+    ):
         temp_dir = tempfile.TemporaryDirectory()
         config_path = os.path.join(temp_dir.name, "config.yaml")
+        config_text = content
+        if not raw and "dashboards:" not in content and not content.lstrip().startswith("dashboard:"):
+            config_text = (
+                f"{content.rstrip()}\n"
+                "dashboards:\n"
+                "  demo:\n"
+                "    dash_title: Demo\n"
+                "    host: https://grafana.example\n"
+            )
         with open(config_path, "w", encoding="utf-8") as config_file:
-            config_file.write(content)
+            config_file.write(config_text)
         self.addCleanup(temp_dir.cleanup)
         return config_path
 
@@ -25,21 +39,128 @@ class TestArgsParser(unittest.TestCase):
     def test_requires_wiki_url(self):
         config_path = self.create_config()
 
-        with patch.object(sys, "argv", ["prog", "--config", config_path, "--confluence_page_id", "1"]):
-            with self.assertRaises(SystemExit):
-                ArgsParser()
+        with self.assertRaisesRegex(ValueError, "wiki_url"):
+            self.parse_args(
+                [
+                    "prog",
+                    "--config",
+                    config_path,
+                    "--confluence_page_id",
+                    "1",
+                    "--timestamps",
+                    "tag__&from=1700000000&to=1700003600",
+                ],
+                env={"CONFLUENCE_LOGIN": "user", "CONFLUENCE_PASSWORD": "secret"},
+            )
 
-    def test_requires_wiki_url_even_when_yaml_settings_provide_it(self):
+    def test_yaml_settings_wiki_url_satisfies_cli_validation(self):
         config_path = self.create_config("settings:\n  wiki_url: https://yaml.example\n")
 
-        with patch.object(sys, "argv", ["prog", "--config", config_path, "--confluence_page_id", "1"]):
-            with self.assertRaises(SystemExit):
-                ArgsParser()
+        args = self.parse_args(
+            [
+                "prog",
+                "--config",
+                config_path,
+                "--confluence_page_id",
+                "1",
+                "--timestamps",
+                "tag__&from=1700000000&to=1700003600",
+            ],
+            env={"CONFLUENCE_LOGIN": "user", "CONFLUENCE_PASSWORD": "secret"},
+        )
+
+        self.assertEqual(args.wiki_url, "https://yaml.example")
 
     def test_requires_confluence_page_id(self):
         config_path = self.create_config()
 
         with patch.object(sys, "argv", ["prog", "--config", config_path, "--wiki_url", "https://cli.example"]):
+            with self.assertRaises(SystemExit):
+                ArgsParser()
+
+    def test_accepts_child_page_mode_parent_id(self):
+        config_path = self.create_config()
+
+        args = self.parse_args(
+            [
+                "prog",
+                "--config",
+                config_path,
+                "--wiki_url",
+                "https://cli.example",
+                "--confluence_parent_page_id",
+                "2",
+                "--confluence_child_title",
+                "Child title",
+                "--timestamps",
+                "tag__&from=1700000000&to=1700003600",
+            ],
+            env={"CONFLUENCE_LOGIN": "user", "CONFLUENCE_PASSWORD": "secret"},
+        )
+
+        self.assertEqual(args.confluence_parent_page_id, 2)
+        self.assertEqual(args.confluence_child_title, "Child title")
+        self.assertIsNone(args.confluence_page_id)
+
+    def test_accepts_child_title_prefix_option(self):
+        config_path = self.create_config()
+
+        args = self.parse_args(
+            [
+                "prog",
+                "--config",
+                config_path,
+                "--wiki_url",
+                "https://cli.example",
+                "--confluence_parent_page_id",
+                "2",
+                "--confluence_child_title_prefix",
+                "Release: ",
+                "--timestamps",
+                "tag__&from=1700000000&to=1700003600",
+            ],
+            env={"CONFLUENCE_LOGIN": "user", "CONFLUENCE_PASSWORD": "secret"},
+        )
+
+        self.assertEqual(args.confluence_child_title_prefix, "Release: ")
+
+    def test_accepts_child_title_from_test_id_option(self):
+        config_path = self.create_config()
+
+        args = self.parse_args(
+            [
+                "prog",
+                "--config",
+                config_path,
+                "--wiki_url",
+                "https://cli.example",
+                "--confluence_parent_page_id",
+                "2",
+                "--confluence_child_title_from_test_id",
+                "--timestamps",
+                "tag__&from=1700000000&to=1700003600",
+            ],
+            env={"CONFLUENCE_LOGIN": "user", "CONFLUENCE_PASSWORD": "secret"},
+        )
+
+        self.assertTrue(args.confluence_child_title_from_test_id)
+
+    def test_rejects_direct_and_child_page_modes_together(self):
+        config_path = self.create_config()
+
+        with patch.object(sys, "argv", [
+            "prog",
+            "--config",
+            config_path,
+            "--wiki_url",
+            "https://cli.example",
+            "--confluence_page_id",
+            "1",
+            "--confluence_parent_page_id",
+            "2",
+            "--timestamps",
+            "tag__&from=1700000000&to=1700003600",
+        ]):
             with self.assertRaises(SystemExit):
                 ArgsParser()
 
@@ -56,6 +177,25 @@ class TestArgsParser(unittest.TestCase):
                     "https://cli.example",
                     "--confluence_page_id",
                     "1",
+                ],
+                env={"CONFLUENCE_LOGIN": "user", "CONFLUENCE_PASSWORD": "secret"},
+            )
+
+    def test_rejects_test_upload_folders_in_child_page_mode(self):
+        config_path = self.create_config()
+
+        with self.assertRaisesRegex(ValueError, "--test_upload_folders cannot be used with child page mode"):
+            self.parse_args(
+                [
+                    "prog",
+                    "--config",
+                    config_path,
+                    "--wiki_url",
+                    "https://cli.example",
+                    "--confluence_parent_page_id",
+                    "2",
+                    "--test_upload_folders",
+                    "graphs\\run-a",
                 ],
                 env={"CONFLUENCE_LOGIN": "user", "CONFLUENCE_PASSWORD": "secret"},
             )
@@ -85,6 +225,187 @@ class TestArgsParser(unittest.TestCase):
         self.assertEqual(args.confluence_retry_backoff_multiplier, 1.0)
         self.assertIsNone(args.confluence_retry_max_delay)
         self.assertEqual(args.confluence_retry_jitter, 0)
+
+    def test_yaml_confluence_credentials_override_environment(self):
+        config_path = self.create_config(
+            "settings:\n"
+            "  confluence_login: yaml-user\n"
+            "  confluence_password: yaml-pass\n"
+        )
+
+        args = self.parse_args(
+            [
+                "prog",
+                "--config",
+                config_path,
+                "--wiki_url",
+                "https://cli.example",
+                "--confluence_page_id",
+                "1",
+                "--timestamps",
+                "tag__&from=1700000000&to=1700003600",
+            ],
+            env={"CONFLUENCE_LOGIN": "env-user", "CONFLUENCE_PASSWORD": "env-pass"},
+        )
+
+        self.assertEqual(args.confluence_login, "yaml-user")
+        self.assertEqual(args.confluence_password, "yaml-pass")
+
+    def test_cli_confluence_credentials_override_yaml(self):
+        config_path = self.create_config(
+            "settings:\n"
+            "  confluence_login: yaml-user\n"
+            "  confluence_password: yaml-pass\n"
+        )
+
+        args = self.parse_args(
+            [
+                "prog",
+                "--config",
+                config_path,
+                "--wiki_url",
+                "https://cli.example",
+                "--confluence_page_id",
+                "1",
+                "--timestamps",
+                "tag__&from=1700000000&to=1700003600",
+                "--confluence_login",
+                "cli-user",
+                "--confluence_password",
+                "cli-pass",
+            ],
+        )
+
+        self.assertEqual(args.confluence_login, "cli-user")
+        self.assertEqual(args.confluence_password, "cli-pass")
+
+    def test_yaml_confluence_credentials_support_env_references(self):
+        config_path = self.create_config(
+            "settings:\n"
+            "  confluence_login: env:TEST_CONF_LOGIN\n"
+            "  confluence_password: env:TEST_CONF_PASSWORD\n"
+            "  confluence_token: env:TEST_CONF_TOKEN\n"
+        )
+
+        args = self.parse_args(
+            [
+                "prog",
+                "--config",
+                config_path,
+                "--wiki_url",
+                "https://cli.example",
+                "--confluence_page_id",
+                "1",
+                "--timestamps",
+                "tag__&from=1700000000&to=1700003600",
+            ],
+            env={
+                "TEST_CONF_LOGIN": "env-yaml-user",
+                "TEST_CONF_PASSWORD": "env-yaml-pass",
+                "TEST_CONF_TOKEN": "env-yaml-token",
+            },
+        )
+
+        self.assertEqual(args.confluence_login, "env-yaml-user")
+        self.assertEqual(args.confluence_password, "env-yaml-pass")
+        self.assertEqual(args.confluence_token, "env-yaml-token")
+
+    def test_missing_env_reference_raises_clear_error_without_secret(self):
+        config_path = self.create_config(
+            "settings:\n  confluence_token: env:GRAFCONFLUX_TEST_MISSING_CONF_TOKEN\n"
+        )
+
+        with self.assertRaisesRegex(ValueError, "GRAFCONFLUX_TEST_MISSING_CONF_TOKEN") as context:
+            self.parse_args(
+                [
+                    "prog",
+                    "--config",
+                    config_path,
+                    "--wiki_url",
+                    "https://cli.example",
+                    "--confluence_page_id",
+                    "1",
+                    "--timestamps",
+                    "tag__&from=1700000000&to=1700003600",
+                ],
+            )
+
+        self.assertNotIn("secret", str(context.exception).lower())
+
+    def test_confluence_token_satisfies_auth_requirement(self):
+        config_path = self.create_config("settings:\n  confluence_token: yaml-token\n")
+
+        args = self.parse_args(
+            [
+                "prog",
+                "--config",
+                config_path,
+                "--wiki_url",
+                "https://cli.example",
+                "--confluence_page_id",
+                "1",
+                "--timestamps",
+                "tag__&from=1700000000&to=1700003600",
+            ],
+        )
+
+        self.assertEqual(args.confluence_token, "yaml-token")
+
+    def test_accepts_dashboards_without_settings_when_cli_or_env_provide_required_fields(self):
+        config_path = self.create_config()
+
+        args = self.parse_args(
+            [
+                "prog",
+                "--config",
+                config_path,
+                "--wiki_url",
+                "https://cli.example",
+                "--confluence_page_id",
+                "1",
+                "--timestamps",
+                "tag__&from=1700000000&to=1700003600",
+            ],
+            env={"CONFLUENCE_LOGIN": "user", "CONFLUENCE_PASSWORD": "secret"},
+        )
+
+        self.assertEqual(args.wiki_url, "https://cli.example")
+
+    def test_rejects_missing_dashboards_when_only_settings_are_present(self):
+        config_path = self.create_config("settings:\n  wiki_url: https://yaml.example\n", raw=True)
+
+        with self.assertRaisesRegex(ValueError, "non-empty top-level 'dashboards' mapping"):
+            self.parse_args(
+                [
+                    "prog",
+                    "--config",
+                    config_path,
+                    "--confluence_page_id",
+                    "1",
+                    "--timestamps",
+                    "tag__&from=1700000000&to=1700003600",
+                ],
+                env={"CONFLUENCE_LOGIN": "user", "CONFLUENCE_PASSWORD": "secret"},
+            )
+
+    def test_rejects_legacy_yaml_without_settings(self):
+        config_path = self.create_config("dashboard:\n  host: https://grafana.example\n")
+
+        with self.assertRaisesRegex(ValueError, "Legacy top-level dashboard YAML format"):
+            self.parse_args(
+                [
+                    "prog",
+                    "--config",
+                    config_path,
+                    "--wiki_url",
+                    "https://cli.example",
+                    "--confluence_page_id",
+                    "1",
+                    "--timestamps",
+                    "tag__&from=1700000000&to=1700003600",
+                ],
+                env={"CONFLUENCE_LOGIN": "user", "CONFLUENCE_PASSWORD": "secret"},
+            )
 
     def test_yaml_settings_confluence_upload_threads_overwrites_default(self):
         config_path = self.create_config("settings:\n  confluence_upload_threads: 3\n")
@@ -135,6 +456,66 @@ class TestArgsParser(unittest.TestCase):
         self.assertEqual(args.confluence_retry_max_delay, 8)
         self.assertEqual(args.confluence_retry_jitter, 0.25)
 
+    def test_yaml_settings_apply_playwright_browser_options(self):
+        config_path = self.create_config(
+            "settings:\n"
+            "  playwright_browser: chromium\n"
+            "  playwright_browser_channel: chrome\n"
+            "  playwright_browser_executable_path: C:/Browsers/chrome.exe\n"
+        )
+
+        args = self.parse_args(
+            [
+                "prog",
+                "--config",
+                config_path,
+                "--wiki_url",
+                "https://cli.example",
+                "--confluence_page_id",
+                "1",
+                "--timestamps",
+                "tag__&from=1700000000&to=1700003600",
+            ],
+            env={"CONFLUENCE_LOGIN": "user", "CONFLUENCE_PASSWORD": "secret"},
+        )
+
+        self.assertEqual(args.playwright_browser, "chromium")
+        self.assertEqual(args.playwright_browser_channel, "chrome")
+        self.assertEqual(args.playwright_browser_executable_path, "C:/Browsers/chrome.exe")
+
+    def test_cli_playwright_browser_options_override_yaml_settings(self):
+        config_path = self.create_config(
+            "settings:\n"
+            "  playwright_browser: chromium\n"
+            "  playwright_browser_channel: chrome\n"
+            "  playwright_browser_executable_path: C:/Browsers/chrome.exe\n"
+        )
+
+        args = self.parse_args(
+            [
+                "prog",
+                "--config",
+                config_path,
+                "--wiki_url",
+                "https://cli.example",
+                "--confluence_page_id",
+                "1",
+                "--timestamps",
+                "tag__&from=1700000000&to=1700003600",
+                "--playwright_browser",
+                "firefox",
+                "--playwright_browser_channel",
+                "firefox",
+                "--playwright_browser_executable_path",
+                "C:/Browsers/firefox.exe",
+            ],
+            env={"CONFLUENCE_LOGIN": "user", "CONFLUENCE_PASSWORD": "secret"},
+        )
+
+        self.assertEqual(args.playwright_browser, "firefox")
+        self.assertEqual(args.playwright_browser_channel, "firefox")
+        self.assertEqual(args.playwright_browser_executable_path, "C:/Browsers/firefox.exe")
+
     def test_yaml_settings_apply_all_cli_defaults(self):
         config_path = self.create_config(
             "settings:\n"
@@ -182,6 +563,92 @@ class TestArgsParser(unittest.TestCase):
         self.assertTrue(args.confluence_continue_on_error)
         self.assertFalse(args.confluence_verify_ssl)
 
+    def test_cli_confluence_verify_ssl_false_disables_ssl_verification(self):
+        config_path = self.create_config()
+
+        args = self.parse_args(
+            [
+                "prog",
+                "--config",
+                config_path,
+                "--wiki_url",
+                "https://cli.example",
+                "--confluence_page_id",
+                "1",
+                "--timestamps",
+                "tag__&from=1700000000&to=1700003600",
+                "--confluence_verify_ssl",
+                "false",
+            ],
+            env={"CONFLUENCE_LOGIN": "user", "CONFLUENCE_PASSWORD": "secret"},
+        )
+
+        self.assertFalse(args.confluence_verify_ssl)
+
+    def test_legacy_confluence_ignore_verify_ssl_cli_option_is_rejected(self):
+        config_path = self.create_config()
+
+        with self.assertRaises(SystemExit):
+            self.parse_args(
+                [
+                    "prog",
+                    "--config",
+                    config_path,
+                    "--wiki_url",
+                    "https://cli.example",
+                    "--confluence_page_id",
+                    "1",
+                    "--timestamps",
+                    "tag__&from=1700000000&to=1700003600",
+                    "--confluence_ignore_verify_ssl",
+                ],
+                env={"CONFLUENCE_LOGIN": "user", "CONFLUENCE_PASSWORD": "secret"},
+            )
+
+    def test_yaml_confluence_verify_ssl_false_disables_ssl_verification(self):
+        config_path = self.create_config("settings:\n  confluence_verify_ssl: false\n")
+
+        args = self.parse_args(
+            [
+                "prog",
+                "--config",
+                config_path,
+                "--wiki_url",
+                "https://cli.example",
+                "--confluence_page_id",
+                "1",
+                "--timestamps",
+                "tag__&from=1700000000&to=1700003600",
+            ],
+            env={"CONFLUENCE_LOGIN": "user", "CONFLUENCE_PASSWORD": "secret"},
+        )
+
+        self.assertFalse(args.confluence_verify_ssl)
+
+    def test_yaml_confluence_verify_ssl_takes_precedence_over_yaml_ignore_alias(self):
+        config_path = self.create_config(
+            "settings:\n"
+            "  confluence_verify_ssl: true\n"
+            "  confluence_ignore_verify_ssl: true\n"
+        )
+
+        args = self.parse_args(
+            [
+                "prog",
+                "--config",
+                config_path,
+                "--wiki_url",
+                "https://cli.example",
+                "--confluence_page_id",
+                "1",
+                "--timestamps",
+                "tag__&from=1700000000&to=1700003600",
+            ],
+            env={"CONFLUENCE_LOGIN": "user", "CONFLUENCE_PASSWORD": "secret"},
+        )
+
+        self.assertTrue(args.confluence_verify_ssl)
+
     def test_explicit_non_default_cli_args_are_not_overwritten_by_yaml_settings(self):
         config_path = self.create_config(
             "settings:\n"
@@ -197,7 +664,7 @@ class TestArgsParser(unittest.TestCase):
             "  confluence_retry_max_delay: 7\n"
             "  confluence_retry_jitter: 0.4\n"
             "  confluence_continue_on_error: false\n"
-            "  confluence_ignore_verify_ssl: false\n"
+            "  confluence_verify_ssl: true\n"
         )
 
         args = self.parse_args(
@@ -233,7 +700,8 @@ class TestArgsParser(unittest.TestCase):
                 "--confluence_retry_jitter",
                 "0.75",
                 "--confluence_continue_on_error",
-                "--confluence_ignore_verify_ssl",
+                "--confluence_verify_ssl",
+                "false",
             ],
             env={"CONFLUENCE_LOGIN": "user", "CONFLUENCE_PASSWORD": "secret"},
         )
@@ -358,6 +826,27 @@ class TestArgsParser(unittest.TestCase):
         )
 
         self.assertFalse(args.confluence_retry)
+
+    def test_invalid_confluence_verify_ssl_value_raises_clear_error(self):
+        config_path = self.create_config()
+
+        with self.assertRaises(SystemExit):
+            self.parse_args(
+                [
+                    "prog",
+                    "--config",
+                    config_path,
+                    "--wiki_url",
+                    "https://cli.example",
+                    "--confluence_page_id",
+                    "1",
+                    "--timestamps",
+                    "tag__&from=1700000000&to=1700003600",
+                    "--confluence_verify_ssl",
+                    "maybe",
+                ],
+                env={"CONFLUENCE_LOGIN": "user", "CONFLUENCE_PASSWORD": "secret"},
+            )
 
     def test_explicit_argv_does_not_read_sys_argv(self):
         config_path = self.create_config()

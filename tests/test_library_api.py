@@ -23,11 +23,25 @@ class TestLibraryApi(unittest.TestCase):
             ):
                 sys.modules.pop(module_name, None)
 
-    def create_config(self, content: str = "settings: {}\n") -> str:
+    def create_config(
+        self,
+        content: str = "dashboards:\n  demo:\n    dash_title: Demo\n    host: https://grafana.example\n",
+        *,
+        raw: bool = False,
+    ) -> str:
         temp_dir = tempfile.TemporaryDirectory()
         config_path = os.path.join(temp_dir.name, "config.yaml")
+        config_text = content
+        if not raw and "dashboards:" not in content and not content.lstrip().startswith("dashboard:"):
+            config_text = (
+                f"{content.rstrip()}\n"
+                "dashboards:\n"
+                "  demo:\n"
+                "    dash_title: Demo\n"
+                "    host: https://grafana.example\n"
+            )
         with open(config_path, "w", encoding="utf-8") as config_file:
-            config_file.write(content)
+            config_file.write(config_text)
         self.addCleanup(temp_dir.cleanup)
         return config_path
 
@@ -37,6 +51,7 @@ class TestLibraryApi(unittest.TestCase):
             "confluence_page_id": 1,
             "confluence_login": "user",
             "confluence_password": "secret",
+            "confluence_token": None,
             "timestamps": ["tag__&from=1700000000&to=1700003600"],
         }
 
@@ -102,6 +117,61 @@ class TestLibraryApi(unittest.TestCase):
 
         self.assertEqual(options.wiki_url, "https://yaml.example")
 
+    def test_yaml_settings_wiki_url_satisfies_library_validation(self) -> None:
+        api = importlib.import_module("grafconflux.api")
+        config_path = self.create_config("settings:\n  wiki_url: https://yaml.example\n")
+        options_kwargs = self.required_options()
+        options_kwargs.pop("wiki_url")
+
+        options = api.options_from_config_file(config_path, **options_kwargs)
+
+        self.assertEqual(options.wiki_url, "https://yaml.example")
+
+    def test_library_requires_wiki_url_when_yaml_settings_omit_it(self) -> None:
+        api = importlib.import_module("grafconflux.api")
+        config_path = self.create_config()
+        options_kwargs = self.required_options()
+        options_kwargs.pop("wiki_url")
+
+        with self.assertRaisesRegex(ValueError, "wiki_url"):
+            api.options_from_config_file(config_path, **options_kwargs)
+
+    def test_yaml_settings_apply_playwright_browser_options(self) -> None:
+        api = importlib.import_module("grafconflux.api")
+        config_path = self.create_config(
+            "settings:\n"
+            "  playwright_browser: chromium\n"
+            "  playwright_browser_channel: chrome\n"
+            "  playwright_browser_executable_path: C:/Browsers/chrome.exe\n"
+        )
+
+        options = api.options_from_config_file(config_path, **self.required_options())
+
+        self.assertEqual(options.playwright_browser, "chromium")
+        self.assertEqual(options.playwright_browser_channel, "chrome")
+        self.assertEqual(options.playwright_browser_executable_path, "C:/Browsers/chrome.exe")
+
+    def test_library_playwright_browser_args_override_yaml_settings(self) -> None:
+        api = importlib.import_module("grafconflux.api")
+        config_path = self.create_config(
+            "settings:\n"
+            "  playwright_browser: chromium\n"
+            "  playwright_browser_channel: chrome\n"
+            "  playwright_browser_executable_path: C:/Browsers/chrome.exe\n"
+        )
+
+        options = api.options_from_config_file(
+            config_path,
+            **self.required_options(),
+            playwright_browser="firefox",
+            playwright_browser_channel="firefox",
+            playwright_browser_executable_path="C:/Browsers/firefox.exe",
+        )
+
+        self.assertEqual(options.playwright_browser, "firefox")
+        self.assertEqual(options.playwright_browser_channel, "firefox")
+        self.assertEqual(options.playwright_browser_executable_path, "C:/Browsers/firefox.exe")
+
     def test_yaml_settings_apply_when_defaults_are_used(self) -> None:
         api = importlib.import_module("grafconflux.api")
         config_path = self.create_config(
@@ -136,6 +206,38 @@ class TestLibraryApi(unittest.TestCase):
         self.assertEqual(options.confluence_retry_jitter, 0.4)
         self.assertTrue(options.confluence_continue_on_error)
         self.assertFalse(options.confluence_verify_ssl)
+
+    def test_yaml_confluence_verify_ssl_false_disables_ssl_verification(self) -> None:
+        api = importlib.import_module("grafconflux.api")
+        config_path = self.create_config("settings:\n  confluence_verify_ssl: false\n")
+
+        options = api.options_from_config_file(config_path, **self.required_options())
+
+        self.assertFalse(options.confluence_verify_ssl)
+
+    def test_library_confluence_verify_ssl_true_overrides_yaml_false(self) -> None:
+        api = importlib.import_module("grafconflux.api")
+        config_path = self.create_config("settings:\n  confluence_verify_ssl: false\n")
+
+        options = api.options_from_config_file(
+            config_path,
+            **self.required_options(),
+            confluence_verify_ssl=True,
+        )
+
+        self.assertTrue(options.confluence_verify_ssl)
+
+    def test_yaml_confluence_verify_ssl_takes_precedence_over_ignore_alias(self) -> None:
+        api = importlib.import_module("grafconflux.api")
+        config_path = self.create_config(
+            "settings:\n"
+            "  confluence_verify_ssl: true\n"
+            "  confluence_ignore_verify_ssl: true\n"
+        )
+
+        options = api.options_from_config_file(config_path, **self.required_options())
+
+        self.assertTrue(options.confluence_verify_ssl)
 
     def test_explicit_non_default_args_are_not_overwritten_by_yaml_settings(self) -> None:
         api = importlib.import_module("grafconflux.api")
@@ -188,6 +290,20 @@ class TestLibraryApi(unittest.TestCase):
         self.assertTrue(options.confluence_continue_on_error)
         self.assertFalse(options.confluence_verify_ssl)
 
+    def test_library_rejects_test_upload_folders_in_child_page_mode(self) -> None:
+        api = importlib.import_module("grafconflux.api")
+        config_path = self.create_config()
+
+        with self.assertRaisesRegex(ValueError, 'test_upload_folders'):
+            api.options_from_config_file(
+                config_path,
+                wiki_url="https://library.example",
+                confluence_parent_page_id=2,
+                confluence_login="user",
+                confluence_password="secret",
+                test_upload_folders=["graphs/run-a"],
+            )
+
     def test_invalid_new_library_options_raise_clear_errors(self) -> None:
         api = importlib.import_module("grafconflux.api")
         config_path = self.create_config()
@@ -197,6 +313,7 @@ class TestLibraryApi(unittest.TestCase):
             ({"confluence_retry_backoff_multiplier": 0.5}, "confluence_retry_backoff_multiplier"),
             ({"confluence_retry_max_delay": -1}, "confluence_retry_max_delay"),
             ({"confluence_retry_jitter": -0.1}, "confluence_retry_jitter"),
+            ({"playwright_browser": "opera"}, "playwright_browser"),
         ]
 
         for kwargs, expected_error in cases:
@@ -224,6 +341,69 @@ class TestLibraryApi(unittest.TestCase):
 
         self.assertEqual(options.confluence_login, "env-user")
         self.assertEqual(options.confluence_password, "env-pass")
+
+    def test_yaml_credentials_are_used_before_environment(self) -> None:
+        api = importlib.import_module("grafconflux.api")
+        config_path = self.create_config(
+            "settings:\n"
+            "  confluence_login: yaml-user\n"
+            "  confluence_password: yaml-pass\n"
+            "  confluence_token: yaml-token\n"
+        )
+        kwargs = self.required_options()
+        kwargs["confluence_login"] = None
+        kwargs["confluence_password"] = None
+
+        with patch.dict(os.environ, {"CONFLUENCE_LOGIN": "env-user", "CONFLUENCE_PASSWORD": "env-pass"}):
+            options = api.options_from_config_file(config_path, **kwargs)
+
+        self.assertEqual(options.confluence_login, "yaml-user")
+        self.assertEqual(options.confluence_password, "yaml-pass")
+        self.assertEqual(options.confluence_token, "yaml-token")
+
+    def test_library_args_override_yaml_credentials(self) -> None:
+        api = importlib.import_module("grafconflux.api")
+        config_path = self.create_config(
+            "settings:\n"
+            "  confluence_login: yaml-user\n"
+            "  confluence_password: yaml-pass\n"
+            "  confluence_token: yaml-token\n"
+        )
+        options = api.options_from_config_file(
+            config_path,
+            **{**self.required_options(), "confluence_token": "library-token"},
+        )
+
+        self.assertEqual(options.confluence_login, "user")
+        self.assertEqual(options.confluence_password, "secret")
+        self.assertEqual(options.confluence_token, "library-token")
+
+    def test_yaml_env_referenced_token_satisfies_auth_requirement(self) -> None:
+        api = importlib.import_module("grafconflux.api")
+        config_path = self.create_config("settings:\n  confluence_token: env:TEST_CONF_TOKEN\n")
+        kwargs = self.required_options()
+        kwargs["confluence_login"] = None
+        kwargs["confluence_password"] = None
+
+        with patch.dict(os.environ, {"TEST_CONF_TOKEN": "resolved-token"}):
+            options = api.options_from_config_file(config_path, **kwargs)
+
+        self.assertEqual(options.confluence_token, "resolved-token")
+
+    def test_library_accepts_dashboards_without_settings_when_required_inputs_come_from_args(self) -> None:
+        api = importlib.import_module("grafconflux.api")
+        config_path = self.create_config()
+
+        options = api.options_from_config_file(config_path, **self.required_options())
+
+        self.assertEqual(options.wiki_url, "https://library.example")
+
+    def test_library_rejects_missing_dashboards_even_when_settings_exist(self) -> None:
+        api = importlib.import_module("grafconflux.api")
+        config_path = self.create_config("settings:\n  wiki_url: https://yaml.example\n", raw=True)
+
+        with self.assertRaisesRegex(ValueError, "non-empty top-level 'dashboards' mapping"):
+            api.options_from_config_file(config_path, **self.required_options())
 
     def test_run_from_config_file_delegates_to_orchestration_with_built_options(self) -> None:
         api = importlib.import_module("grafconflux.api")

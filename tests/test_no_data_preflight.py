@@ -345,7 +345,7 @@ class TestNoDataPreflight(unittest.TestCase):
             {"timestamp_tag": "smoke", "render_status": "skipped_no_data", "png_file": None, "repeat_value": None},
             {"timestamp_tag": "smoke", "render_status": "rendered", "png_file": "demo__7__0.png", "link": "panel-link"},
         ])
-        config = Mock(name="demo", full_links=["dashboard-link"], snapshot_urls=None, panels=[panel])
+        config = Mock(name="demo", full_links=["dashboard-link"], snapshot_urls=None, panels=[panel], backup_dashboard_links=[])
         timestamp = Mock(id_time=0, time_tag="smoke", start_time_human="start", end_time_human="end")
 
         content = build_confluence_storage_content([config], [timestamp], 900)

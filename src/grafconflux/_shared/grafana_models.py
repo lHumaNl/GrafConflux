@@ -49,6 +49,11 @@ SNAPSHOT_ROW_SWEEP_STEP_LIMIT = 40
 SNAPSHOT_ROW_SWEEP_STEP_VIEWPORT_FRACTION = 0.75
 SNAPSHOT_ROW_SETTLE_SECONDS = 0.5
 SNAPSHOT_STABLE_SCROLL_LIMIT = 2
+SCREENSHOT_READINESS_KEY = 'screenshot_readiness'
+DEFAULT_SCREENSHOT_NETWORK_IDLE_MS = 750
+DEFAULT_SCREENSHOT_NO_NETWORK_GRACE_MS = 1000
+DEFAULT_SCREENSHOT_MIN_SETTLE_MS = 200
+DEFAULT_SCREENSHOT_POLL_INTERVAL_MS = 100
 
 
 class ConfigurationError(ValueError):
@@ -76,6 +81,34 @@ class NoDataPreflightConfig:
             store_skip_metadata=_validated_no_data_bool(
                 dashboard_name, raw_config.get('store_skip_metadata', True), 'store_skip_metadata'),
             min_non_empty_frames=_validated_min_non_empty_frames(dashboard_name, raw_config.get('min_non_empty_frames', 1)),
+        )
+
+
+@dataclass(frozen=True)
+class ScreenshotReadinessConfig:
+    network_idle_ms: int = DEFAULT_SCREENSHOT_NETWORK_IDLE_MS
+    no_network_grace_ms: int = DEFAULT_SCREENSHOT_NO_NETWORK_GRACE_MS
+    min_settle_ms: int = DEFAULT_SCREENSHOT_MIN_SETTLE_MS
+    poll_interval_ms: int = DEFAULT_SCREENSHOT_POLL_INTERVAL_MS
+    strict_datasource_fragments: bool = False
+
+    @classmethod
+    def from_config(cls, dashboard_name: str, raw_config: Optional[Dict]) -> 'ScreenshotReadinessConfig':
+        if raw_config is None:
+            raw_config = {}
+        if not isinstance(raw_config, dict):
+            _raise_screenshot_readiness_error(dashboard_name, '', raw_config, 'mapping')
+        return cls(
+            network_idle_ms=_validated_readiness_ms(
+                dashboard_name, raw_config, 'network_idle_ms', DEFAULT_SCREENSHOT_NETWORK_IDLE_MS),
+            no_network_grace_ms=_validated_readiness_ms(
+                dashboard_name, raw_config, 'no_network_grace_ms', DEFAULT_SCREENSHOT_NO_NETWORK_GRACE_MS),
+            min_settle_ms=_validated_readiness_ms(
+                dashboard_name, raw_config, 'min_settle_ms', DEFAULT_SCREENSHOT_MIN_SETTLE_MS),
+            poll_interval_ms=_validated_readiness_ms(
+                dashboard_name, raw_config, 'poll_interval_ms', DEFAULT_SCREENSHOT_POLL_INTERVAL_MS, minimum=1),
+            strict_datasource_fragments=_validated_readiness_bool(
+                dashboard_name, raw_config.get('strict_datasource_fragments', False), 'strict_datasource_fragments'),
         )
 
 
@@ -311,10 +344,15 @@ class GrafanaConfigDownloader(GrafanaConfigBase):
         self.firefox_driver_preload_time: float = config.get('firefox_driver_preload_time', 2.5)
         self.timeout: int = config.get('timeout', 30); self.tz: Optional[str] = config.get('tz', None)
         self.threads: int = config.get('threads', 4); self.vars: Optional[Dict[str, str]] = config.get('vars', None)
+        self.playwright_browser: Optional[str] = config.get('playwright_browser', None)
+        self.playwright_browser_channel: Optional[str] = config.get('playwright_browser_channel', None)
+        self.playwright_browser_executable_path: Optional[str] = config.get('playwright_browser_executable_path', None)
         self.enable_repeating_panels: bool = _validated_bool_config(self.name, config, ENABLE_REPEATING_PANELS_KEY, False)
         self.repeating_panels: List[Dict] = _validated_repeating_panels(self.name, config)
         self.collect_no_data_panels: bool = _validated_bool_config(self.name, config, COLLECT_NO_DATA_PANELS_KEY, True)
         self.no_data_preflight: NoDataPreflightConfig = NoDataPreflightConfig.from_config(self.name, config.get(NO_DATA_PREFLIGHT_KEY))
+        self.screenshot_readiness: ScreenshotReadinessConfig = ScreenshotReadinessConfig.from_config(
+            self.name, config.get(SCREENSHOT_READINESS_KEY))
         self.white_theme: bool = config.get('white_theme', False); self.orgId: int = config.get('orgId', 1)
         self.login: Optional[str] = config.get('login', None); self.password: Optional[str] = config.get('password', None)
         self.token: Optional[str] = config.get('token', None); self.auth: bool = config.get('auth', True)
@@ -551,6 +589,20 @@ def _validated_no_data_timeout(dashboard_name: str, value: Any) -> int:
     _raise_no_data_config_error(dashboard_name, '.timeout', value, 'positive integer')
 
 
+def _validated_readiness_ms(dashboard_name: str, raw_config: Dict, key: str, default: int,
+                            minimum: int = 0) -> int:
+    value = raw_config.get(key, default)
+    if isinstance(value, int) and not isinstance(value, bool) and value >= minimum:
+        return value
+    _raise_screenshot_readiness_error(dashboard_name, f'.{key}', value, f'integer >= {minimum}')
+
+
+def _validated_readiness_bool(dashboard_name: str, value: Any, key: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    _raise_screenshot_readiness_error(dashboard_name, f'.{key}', value, 'bool')
+
+
 def _validated_no_data_bool(dashboard_name: str, value: Any, key: str) -> bool:
     if isinstance(value, bool):
         return value
@@ -565,3 +617,9 @@ def _validated_min_non_empty_frames(dashboard_name: str, value: Any) -> int:
 
 def _raise_no_data_config_error(dashboard_name: str, path: str, value: Any, expected: str) -> None:
     raise ConfigurationError(f'dashboards.{dashboard_name}.{NO_DATA_PREFLIGHT_KEY}{path}: invalid value="{value}", expected {expected}, suggested fix: remove the key or use {expected}')
+
+
+def _raise_screenshot_readiness_error(dashboard_name: str, path: str, value: Any, expected: str) -> None:
+    raise ConfigurationError(
+        f'dashboards.{dashboard_name}.{SCREENSHOT_READINESS_KEY}{path}: invalid value="{value}", '
+        f'expected {expected}, suggested fix: remove the key or use documented screenshot readiness fields')

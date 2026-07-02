@@ -593,7 +593,6 @@ GRAFANA_MANAGER_MANGLED_METHODS = [
     "_GrafanaManager__get_panel_data_sources",
     "_GrafanaManager__save_params_to_file",
     "_GrafanaManager__take_screenshot",
-    "_GrafanaManager__wait_for_network_request",
 ]
 FORBIDDEN_INTERNAL_IMPORTS = [
     "grafconflux.args_parser",

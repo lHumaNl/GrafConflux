@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from typing import Any
 
 from grafconflux._config.args_parser import ArgsParser
+from grafconflux._config.args_parser import SUPPORTED_PLAYWRIGHT_BROWSERS
 from grafconflux._config.options import GrafConfluxRunOptions
 from grafconflux._config.yaml_settings import (
     DEFAULT_CONFLUENCE_UPLOAD_THREADS,
@@ -42,8 +43,13 @@ def options_from_config_file(
     *,
     wiki_url: str | None = None,
     confluence_page_id: int | None = None,
+    confluence_parent_page_id: int | None = None,
+    confluence_child_title: str | None = None,
+    confluence_child_title_prefix: str = "GrafConflux: ",
+    confluence_child_title_from_test_id: bool = False,
     confluence_login: str | None = None,
     confluence_password: str | None = None,
+    confluence_token: str | None = None,
     timestamps: Iterable[str] | None = None,
     test_root_folder: str = "graphs",
     test_upload_folders: Iterable[str] | None = None,
@@ -52,7 +58,7 @@ def options_from_config_file(
     threads: int = DEFAULT_THREADS,
     only_graphs: bool = False,
     tz: str = "UTC",
-    confluence_verify_ssl: bool = True,
+    confluence_verify_ssl: bool | None = None,
     confluence_upload_threads: int = DEFAULT_CONFLUENCE_UPLOAD_THREADS,
     confluence_upload_delay: float = DEFAULT_UPLOAD_DELAY,
     confluence_upload_rate_per_second: float | None = DEFAULT_UPLOAD_RATE_PER_SECOND,
@@ -63,6 +69,9 @@ def options_from_config_file(
     confluence_retry_max_delay: float | None = DEFAULT_RETRY_MAX_DELAY,
     confluence_retry_jitter: float = DEFAULT_RETRY_JITTER,
     confluence_continue_on_error: bool = DEFAULT_CONTINUE_ON_ERROR,
+    playwright_browser: str | None = None,
+    playwright_browser_channel: str | None = None,
+    playwright_browser_executable_path: str | None = None,
 ) -> GrafConfluxRunOptions:
     """Build library run options from a YAML config without parsing CLI args."""
     config_path = os.fspath(config_file)
@@ -82,8 +91,19 @@ def _build_options(
     return GrafConfluxRunOptions(
         wiki_url=wiki_url_or_current(settings, values["wiki_url"]),
         confluence_page_id=values["confluence_page_id"],
-        confluence_login=_value_or_env(values["confluence_login"], "CONFLUENCE_LOGIN"),
-        confluence_password=_value_or_env(values["confluence_password"], "CONFLUENCE_PASSWORD"),
+        confluence_parent_page_id=values["confluence_parent_page_id"],
+        confluence_child_title=values["confluence_child_title"],
+        confluence_child_title_prefix=default_values["confluence_child_title_prefix"],
+        confluence_child_title_from_test_id=default_values["confluence_child_title_from_test_id"],
+        confluence_login=_credential_or_env(
+            values["confluence_login"], settings.confluence_login, "CONFLUENCE_LOGIN"
+        ),
+        confluence_password=_credential_or_env(
+            values["confluence_password"], settings.confluence_password, "CONFLUENCE_PASSWORD"
+        ),
+        confluence_token=_credential_or_env(
+            values["confluence_token"], settings.confluence_token, "CONFLUENCE_TOKEN"
+        ),
         timestamps=parse_timestamps(values["timestamps"] or [], values["tz"]),
         config_file=config_file,
         test_root_folder=values["test_root_folder"],
@@ -104,12 +124,23 @@ def _build_options(
         confluence_retry_max_delay=default_values["confluence_retry_max_delay"],
         confluence_retry_jitter=default_values["confluence_retry_jitter"],
         confluence_continue_on_error=default_values["confluence_continue_on_error"],
+        playwright_browser=default_values["playwright_browser"],
+        playwright_browser_channel=default_values["playwright_browser_channel"],
+        playwright_browser_executable_path=default_values["playwright_browser_executable_path"],
     )
 
 
 def _value_or_env(value: str | None, env_name: str) -> str | None:
     if value is not None:
         return value
+    return os.getenv(env_name, None)
+
+
+def _credential_or_env(explicit_value: str | None, yaml_value: str | None, env_name: str) -> str | None:
+    if explicit_value not in (None, ""):
+        return explicit_value
+    if yaml_value is not None:
+        return yaml_value
     return os.getenv(env_name, None)
 
 
@@ -125,12 +156,17 @@ def _ensure_config_file_exists(config_file: str) -> None:
 
 
 def _validate_options(options: GrafConfluxRunOptions) -> None:
-    if options.confluence_page_id is None:
-        raise ValueError('Library arg "confluence_page_id" is NULL')
-    if options.confluence_login is None or options.confluence_login == "":
-        raise ValueError('CLI arg "--confluence_login" is NULL')
-    if options.confluence_password is None or options.confluence_password == "":
-        raise ValueError('CLI arg "--confluence_password" is NULL')
+    if options.confluence_page_id is None and options.confluence_parent_page_id is None:
+        raise ValueError('Library arg "confluence_page_id" or "confluence_parent_page_id" is required')
+    if options.confluence_page_id is not None and options.confluence_parent_page_id is not None:
+        raise ValueError('Library args "confluence_page_id" and "confluence_parent_page_id" are mutually exclusive')
+    if options.wiki_url is None or options.wiki_url == "":
+        raise ValueError('Library arg "wiki_url" is NULL')
+    if not _has_confluence_auth(options):
+        raise ValueError(
+            'Confluence auth requires either "confluence_token" or both '
+            '"confluence_login" and "confluence_password"'
+        )
     if options.confluence_upload_threads < 1:
         raise ValueError('Library arg "confluence_upload_threads" must be greater than 0')
     if _is_non_positive_optional(options.confluence_upload_rate_per_second):
@@ -141,6 +177,10 @@ def _validate_options(options: GrafConfluxRunOptions) -> None:
         raise ValueError('Library arg "confluence_retry_max_delay" must be greater than or equal to 0')
     if options.confluence_retry_jitter < 0:
         raise ValueError('Library arg "confluence_retry_jitter" must be greater than or equal to 0')
+    if options.playwright_browser is not None and options.playwright_browser not in SUPPORTED_PLAYWRIGHT_BROWSERS:
+        raise ValueError('Library arg "playwright_browser" must be one of: chromium, firefox, webkit')
+    if options.confluence_parent_page_id is not None and options.test_upload_folders:
+        raise ValueError('Library arg "test_upload_folders" cannot be used with child page mode')
     if not options.timestamps and not options.test_upload_folders:
         raise ValueError("At least one timestamp must be provided.")
 
@@ -151,3 +191,10 @@ def _is_negative_optional(value: float | None) -> bool:
 
 def _is_non_positive_optional(value: float | None) -> bool:
     return value is not None and value <= 0
+
+
+def _has_confluence_auth(options: GrafConfluxRunOptions) -> bool:
+    has_token = options.confluence_token not in (None, "")
+    has_login = options.confluence_login not in (None, "")
+    has_password = options.confluence_password not in (None, "")
+    return has_token or (has_login and has_password)

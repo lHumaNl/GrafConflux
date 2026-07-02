@@ -13,8 +13,13 @@ class GrafConfluxRunOptions:
 
     wiki_url: str | None = None
     confluence_page_id: int | None = None
+    confluence_parent_page_id: int | None = None
+    confluence_child_title: str | None = None
+    confluence_child_title_prefix: str = "GrafConflux: "
+    confluence_child_title_from_test_id: bool = False
     confluence_login: str | None = None
     confluence_password: str | None = None
+    confluence_token: str | None = None
     timestamps: list[GrafanaTimeDownloader] = field(default_factory=list)
     config_file: str = "config.yaml"
     test_root_folder: str = "graphs"
@@ -35,3 +40,6 @@ class GrafConfluxRunOptions:
     confluence_retry_max_delay: float | None = None
     confluence_retry_jitter: float = 0
     confluence_continue_on_error: bool = False
+    playwright_browser: str | None = None
+    playwright_browser_channel: str | None = None
+    playwright_browser_executable_path: str | None = None

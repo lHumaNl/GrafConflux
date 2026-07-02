@@ -1,21 +1,16 @@
 import json
 import logging
 import os
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
-
-from selenium.webdriver.common.by import By
-from selenium.webdriver.firefox.options import Options
-try:
-    from seleniumwire.utils import decode as seleniumwire_decode
-except ImportError:  # pragma: no cover - selenium-wire always provides this in supported installs.
-    seleniumwire_decode = None
 
 from grafconflux._shared.time import GrafanaTimeDownloader
 from grafconflux._grafana.browser_session import GrafanaBrowserSession
 from grafconflux._shared.grafana_models import SNAPSHOT_DELETE_FIELDS
 
 logger = logging.getLogger('grafconflux.grafana')
+CSS_SELECTOR = 'css'
+XPATH = 'xpath'
 
 
 def snapshot_api_url(host: str, nginx_prefix: str, path: str) -> str:
@@ -68,17 +63,20 @@ def snapshot_response_payload(response: Any) -> Dict[str, Any]:
 
 
 def snapshot_response_text(response: Any) -> str:
-    body = getattr(response, 'body', b'') or b''
+    body = _response_body(response)
     if isinstance(body, str):
         return body
-    headers = getattr(response, 'headers', {}) or {}
-    encoding = headers.get('Content-Encoding') if hasattr(headers, 'get') else None
-    if seleniumwire_decode is not None and encoding:
-        try:
-            body = seleniumwire_decode(body, encoding)
-        except Exception:
-            pass
     return body.decode('utf-8', errors='replace')
+
+
+def _response_body(response: Any) -> bytes | str:
+    body = getattr(response, 'body', b'')
+    if callable(body):
+        try:
+            return body()
+        except Exception:
+            return b''
+    return body or b''
 
 
 def snapshot_url_from_payload(payload: Dict[str, Any], host: str) -> Optional[str]:
@@ -128,12 +126,10 @@ def snapshot_url_from_lookup_response(response: Any, snapshot_name_value: str, h
 
 
 class SnapshotUiRunner:
-    """Run the Selenium UI snapshot flow for a Grafana manager."""
+    """Run the Playwright UI snapshot flow for a Grafana manager."""
 
-    def __init__(self, manager, browser_factory: Callable, options_factory: Type[Options]) -> None:
+    def __init__(self, manager) -> None:
         self.manager = manager
-        self.browser_factory = browser_factory
-        self.options_factory = options_factory
 
     def take_snapshots(self, timestamps: List[GrafanaTimeDownloader], test_folder: str) -> None:
         browser = self._create_browser()
@@ -147,19 +143,7 @@ class SnapshotUiRunner:
         return self._browser_session().create_browser()
 
     def _browser_session(self) -> GrafanaBrowserSession:
-        return GrafanaBrowserSession(
-            self.manager.config,
-            self.manager.session,
-            self.browser_factory,
-            self.options_factory,
-        )
-
-    def _firefox_options(self) -> Options:
-        return self._browser_session().firefox_options()
-
-    @staticmethod
-    def _selenium_wire_options() -> dict:
-        return GrafanaBrowserSession.selenium_wire_options()
+        return GrafanaBrowserSession(self.manager.config, self.manager.session)
 
     def _authenticate_browser(self, browser) -> None:
         self._browser_session().authenticate_browser(browser)
@@ -226,10 +210,10 @@ class SnapshotUiRunner:
         self._sleep(1)
 
     def _click_first_css(self, browser, selectors: List[str]) -> bool:
-        return self._click_first(browser, [(By.CSS_SELECTOR, selector) for selector in selectors])
+        return self._click_first(browser, [(CSS_SELECTOR, selector) for selector in selectors])
 
     def _click_first_xpath(self, browser, xpaths: List[str]) -> bool:
-        return self._click_first(browser, [(By.XPATH, xpath) for xpath in xpaths])
+        return self._click_first(browser, [(XPATH, xpath) for xpath in xpaths])
 
     def _click_first(self, browser, locators: List[Tuple[str, str]]) -> bool:
         for by, value in locators:
@@ -249,14 +233,92 @@ class SnapshotUiRunner:
             raise ValueError(f'Required snapshot control not found xpath={xpath}')
 
     def _find_css(self, browser, selector: str):
-        return self._find_element(browser, By.CSS_SELECTOR, selector)
+        return self._find_element(browser, CSS_SELECTOR, selector)
 
     @staticmethod
     def _find_element(browser, by: str, value: str):
         try:
-            return browser.find_element(by, value)
+            selector = value if by == CSS_SELECTOR else f'xpath={value}'
+            locator = browser.page.locator(selector).first
+            locator.wait_for(timeout=1000)
+            return PlaywrightElement(locator)
         except Exception:
             return None
 
+    def _submit_snapshot_form(self, browser, timestamp: GrafanaTimeDownloader, modern_dialog: bool) -> None:
+        self.manager._fill_optional_snapshot_field(browser, 'input[id="snapshot-name-input"]', self.manager._snapshot_name(timestamp))
+        timeout_ms = (self.manager.config.snapshot_timeout + 5) * 1000
+        if modern_dialog:
+            self._click_with_optional_snapshot_wait(browser, '[data-testid="data-testid share snapshot publish button"]', timeout_ms)
+        else:
+            self.manager._fill_optional_snapshot_field(browser, 'input[id="timeout-input"]', f'{self.manager.config.snapshot_timeout}')
+            self._click_xpath_with_optional_snapshot_wait(browser, "//button[.//span[text()='Local Snapshot']]", timeout_ms)
+        self._sleep(self.manager.config.snapshot_timeout + 2)
+
+    def _click_with_optional_snapshot_wait(self, browser, selector: str, timeout_ms: int) -> None:
+        self._click_control_with_optional_snapshot_wait(browser, CSS_SELECTOR, selector, timeout_ms)
+
+    def _click_xpath_with_optional_snapshot_wait(self, browser, xpath: str, timeout_ms: int) -> None:
+        self._click_control_with_optional_snapshot_wait(browser, XPATH, xpath, timeout_ms)
+
+    def _click_control_with_optional_snapshot_wait(self, browser, by: str, value: str, timeout_ms: int) -> None:
+        control = self._find_element(browser, by, value)
+        if control is None:
+            raise ValueError(f'Required snapshot control not found selector={value}')
+        clicked = False
+        try:
+            with browser.page.expect_response(self._is_snapshot_response, timeout=timeout_ms) as response_info:
+                control.click()
+                clicked = True
+            self._record_snapshot_payload(browser, response_info.value)
+        except Exception:
+            if not clicked:
+                control.click()
+
+    @staticmethod
+    def _is_snapshot_response(response: Any) -> bool:
+        try:
+            return response.request.method.upper() == 'POST' and urlparse(response.url).path.rstrip('/').endswith('/api/snapshots')
+        except Exception:
+            return False
+
+    @staticmethod
+    def _record_snapshot_payload(browser: Any, response: Any) -> None:
+        try:
+            payload = response.json()
+        except Exception:
+            payload = snapshot_response_payload(response)
+        if isinstance(payload, dict):
+            if not hasattr(browser, 'snapshot_payloads'):
+                browser.snapshot_payloads = []
+            browser.snapshot_payloads.append(payload)
+
     def _sleep(self, seconds: int) -> None:
         self.manager._snapshot_sleep(seconds)
+
+
+class PlaywrightElement:
+    """Small compatibility wrapper for manager snapshot helper methods."""
+
+    def __init__(self, locator: Any) -> None:
+        self.locator = locator
+        self.target = getattr(locator, 'target', None)
+
+    def click(self) -> None:
+        self.locator.click(timeout=3000)
+
+    def clear(self) -> None:
+        self.locator.fill('')
+
+    def send_keys(self, *args: Any) -> None:
+        for value in args:
+            if value == 'PageDown':
+                self.locator.press('PageDown')
+            else:
+                self.locator.fill(str(value))
+
+    def evaluate(self, expression: str) -> Any:
+        return self.locator.evaluate(expression)
+
+    def get_attribute(self, name: str) -> Optional[str]:
+        return self.locator.get_attribute(name)

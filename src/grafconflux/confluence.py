@@ -9,6 +9,7 @@ from atlassian import Confluence
 
 from grafconflux._shared.time import GrafanaTimeBase
 from grafconflux._confluence.content import (
+    ChildPageInclude,
     GRAPHS_PLACEHOLDER,
     _artifact_has_rendered_png,
     _artifact_title,
@@ -24,7 +25,10 @@ from grafconflux._confluence.content import (
     _render_snapshot_backup_section,
     _render_test_times_section,
     apply_graphs_placeholder,
+    apply_graphs_placeholder_if_present,
+    build_child_page_title,
     build_confluence_storage_content,
+    build_parent_include_content,
 )
 # Keep helper imports from grafconflux.confluence stable after extraction.
 from grafconflux._confluence.uploads import (
@@ -49,6 +53,7 @@ from grafconflux._shared.grafana_models import GrafanaConfigBase
 logger = logging.getLogger(__name__)
 
 DEFAULT_CONTENT_TYPE = 'image/png'
+CHILD_PAGE_LOOKUP_LIMIT = 100
 
 
 class ConfluenceManager:
@@ -58,13 +63,16 @@ class ConfluenceManager:
 
     _upload_rate_limiter = _ConfluenceUploadRateLimiter()
 
-    def __init__(self, login: str, password: str, page_id: int, upload_threads: int, wiki_url: str, verify_ssl: bool,
-                 upload_delay: float = 0, upload_rate_per_second: Optional[float] = None,
-                 retry_enabled: bool = True, retry_count: int = 3, retry_delay: float = 5,
-                 retry_backoff_multiplier: float = 1.0, retry_max_delay: Optional[float] = None,
-                 retry_jitter: float = 0, continue_on_error: bool = False) -> None:
+    def __init__(self, login: Optional[str], password: Optional[str], page_id: int, upload_threads: int,
+                  wiki_url: str, verify_ssl: bool,
+                  upload_delay: float = 0, upload_rate_per_second: Optional[float] = None,
+                  retry_enabled: bool = True, retry_count: int = 3, retry_delay: float = 5,
+                  retry_backoff_multiplier: float = 1.0, retry_max_delay: Optional[float] = None,
+                  retry_jitter: float = 0, continue_on_error: bool = False,
+                  token: Optional[str] = None) -> None:
         self.login = login
         self.password = password
+        self.token = token
         self.page_id = page_id
         self.upload_threads = max(1, int(upload_threads))
         self.wiki_url = wiki_url
@@ -81,12 +89,7 @@ class ConfluenceManager:
         self._validate_retry_and_rate_options()
         self.upload_interval = _effective_upload_interval(upload_delay, upload_rate_per_second)
         self._upload_clients = threading.local()
-        self.confluence = Confluence(
-            url=wiki_url,
-            username=login,
-            password=password,
-            verify_ssl=verify_ssl
-        )
+        self.confluence = Confluence(**self._client_kwargs())
         self._upload_clients.client = self.confluence
 
     def _validate_retry_and_rate_options(self) -> None:
@@ -104,12 +107,16 @@ class ConfluenceManager:
         cls._upload_rate_limiter.reset()
 
     def _create_confluence_client(self) -> Confluence:
-        return Confluence(
-            url=self.wiki_url,
-            username=self.login,
-            password=self.password,
-            verify_ssl=self.verify_ssl,
-        )
+        return Confluence(**self._client_kwargs())
+
+    def _client_kwargs(self) -> dict:
+        kwargs = {"url": self.wiki_url, "verify_ssl": self.verify_ssl}
+        if self.token not in (None, ''):
+            kwargs["token"] = self.token
+            return kwargs
+        kwargs["username"] = self.login
+        kwargs["password"] = self.password
+        return kwargs
 
     def _get_upload_client(self) -> Confluence:
         """Use one Confluence client per thread to avoid sharing sessions."""
@@ -267,3 +274,70 @@ class ConfluenceManager:
         )
 
         logger.info('Confluence page content updated.')
+
+    def get_parent_page(self, parent_page_id: int) -> dict:
+        """Return a parent page with storage body and space metadata."""
+        return self.confluence.get_page_by_id(parent_page_id, expand='body.storage,space')
+
+    def create_or_get_child_page(self, parent_page_id: int, args) -> ChildPageInclude:
+        """Create a child page when missing and return its include reference."""
+        parent_page = self.get_parent_page(parent_page_id)
+        space_key = self._space_key(parent_page)
+        title = build_child_page_title(parent_page['title'], args)
+        child_page = self.find_child_page(parent_page_id, title)
+        if child_page is None:
+            child_page = self._create_child_page(parent_page_id, space_key, title)
+        args.confluence_page_id = int(child_page['id'])
+        return ChildPageInclude(title=title, space_key=space_key)
+
+    def find_child_page(self, parent_page_id: int, title: str) -> dict | None:
+        """Find a direct child page by title."""
+        for child_page in self._child_pages(parent_page_id):
+            if child_page.get('title') == title:
+                return child_page
+        return None
+
+    def update_parent_include_block(self, parent_page_id: int, child_pages: list[ChildPageInclude]) -> bool:
+        """Replace the parent marker with child include macros when present."""
+        parent_page = self.get_parent_page(parent_page_id)
+        body = parent_page['body']['storage']['value']
+        content = build_parent_include_content(child_pages)
+        new_body = apply_graphs_placeholder_if_present(body, content)
+        if new_body is None:
+            logger.info('Parent page marker not found; parent page was not updated.')
+            return False
+        self.confluence.update_page(page_id=parent_page_id, title=parent_page['title'], body=new_body)
+        logger.info('Parent Confluence page include block updated.')
+        return True
+
+    def _child_pages(self, parent_page_id: int) -> list[dict]:
+        start = 0
+        child_pages = []
+        while True:
+            children = self._child_page_batch(parent_page_id, start)
+            child_pages.extend(children)
+            if len(children) < CHILD_PAGE_LOOKUP_LIMIT:
+                return child_pages
+            start += CHILD_PAGE_LOOKUP_LIMIT
+
+    def _child_page_batch(self, parent_page_id: int, start: int) -> list[dict]:
+        children = self.confluence.get_page_child_by_type(
+            parent_page_id, type='page', start=start, limit=CHILD_PAGE_LOOKUP_LIMIT, expand='version'
+        )
+        return children.get('results', children) if isinstance(children, dict) else children
+
+    def _create_child_page(self, parent_page_id: int, space_key: str, title: str) -> dict:
+        return self.confluence.create_page(
+            space=space_key,
+            title=title,
+            body=GRAPHS_PLACEHOLDER,
+            parent_id=parent_page_id,
+            representation='storage',
+        )
+
+    @staticmethod
+    def _space_key(page: dict) -> str:
+        space = page.get('space') or {}
+        if not space.get('key'):
+            raise ValueError('Confluence parent page response does not include a space key.')
+        return space['key']

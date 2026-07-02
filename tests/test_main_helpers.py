@@ -31,6 +31,7 @@ class TestMainHelpers(unittest.TestCase):
             confluence_login=None,
             confluence_page_id=123,
             confluence_password=None,
+            confluence_token=None,
             confluence_verify_ssl=True,
             graph_width=1000,
             only_graphs=only_graphs,
@@ -309,11 +310,33 @@ class TestMainHelpers(unittest.TestCase):
             [grafana_config], args.timestamps, args.graph_width, test_folder,
         )
 
+    def test_run_applies_global_playwright_options_to_grafana_configs(self):
+        args = self.make_run_args()
+        args.playwright_browser = "chromium"
+        args.playwright_browser_channel = "chrome"
+        args.playwright_browser_executable_path = "C:/Browsers/chrome.exe"
+        grafana_config = SimpleNamespace(dash_title="Demo dashboard")
+        grafana_manager_class = Mock()
+        grafana_manager_class.load_grafana_config.return_value = [grafana_config]
+        process_dashboard = Mock()
+
+        with patch.dict(main.run.__globals__, {
+            "ConfluenceManager": Mock(),
+            "GrafanaManager": grafana_manager_class,
+            "process_grafana_dashboard": process_dashboard,
+        }):
+            main.run(args)
+
+        self.assertEqual(grafana_config.playwright_browser, "chromium")
+        self.assertEqual(grafana_config.playwright_browser_channel, "chrome")
+        self.assertEqual(grafana_config.playwright_browser_executable_path, "C:/Browsers/chrome.exe")
+
     def test_create_confluence_manager_propagates_all_confluence_options(self):
         manager_class = Mock()
         args = SimpleNamespace(
             confluence_login="user",
             confluence_password="secret",
+            confluence_token="token",
             confluence_page_id=123,
             confluence_upload_threads=4,
             wiki_url="https://wiki.example.test",
@@ -336,6 +359,7 @@ class TestMainHelpers(unittest.TestCase):
         manager_class.assert_called_once_with(
             login="user",
             password="secret",
+            token="token",
             page_id=123,
             upload_threads=4,
             wiki_url="https://wiki.example.test",

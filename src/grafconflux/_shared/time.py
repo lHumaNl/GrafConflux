@@ -1,9 +1,16 @@
 import re
 from abc import ABC
-from datetime import datetime
+from datetime import datetime, timezone, tzinfo
 from typing import Dict, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-import pytz
+
+HUMAN_TIME_FORMAT = "%Y/%m/%d %H:%M:%S"
+MILLISECONDS_PER_SECOND = 1000
+TIMESTAMP_SECONDS_LENGTH = 10
+ISO_TIME_RANGE_PATTERN = re.compile(r'&from=([\d\-T:.Z]+).*?&to=([\d\-T:.Z]+)')
+START_EPOCH_PATTERN = re.compile(r'&from=(\d+)')
+END_EPOCH_PATTERN = re.compile(r'&to=(\d+)')
 
 
 class GrafanaTimeBase(ABC):
@@ -30,55 +37,60 @@ class GrafanaTimeUploader(GrafanaTimeBase):
 class GrafanaTimeDownloader(GrafanaTimeBase):
     def __init__(self, timestamp_str: str, id_time: int, tz: str):
         super().__init__()
-        self.time_tag: Optional[str] = timestamp_str.split('__')[0]
-        if self.time_tag == timestamp_str:
-            self.time_tag = None
-
+        self.time_tag = self._extract_time_tag(timestamp_str)
         self.id_time: int = id_time
-
-        human_time_format = "%Y/%m/%d %H:%M:%S"
-        tz_zone = pytz.timezone(tz)
-
-        # Try to extract ISO 8601 format (new Grafana format)
-        iso_match = re.findall(r'&from=([\d\-T:.Z]+).*?&to=([\d\-T:.Z]+)', timestamp_str)
-
+        tz_zone = _load_timezone(tz)
+        iso_match = ISO_TIME_RANGE_PATTERN.findall(timestamp_str)
         if iso_match and 'T' in iso_match[0][0]:
-            # New format: ISO 8601 (e.g., 2025-11-16T14:24:49.073Z)
-            start_time_str = iso_match[0][0].replace('Z', '+00:00')
-            end_time_str = iso_match[0][1].replace('Z', '+00:00')
+            self._set_iso_range(iso_match[0], tz_zone)
+            return
 
-            start_time_dt = datetime.fromisoformat(start_time_str)
-            end_time_dt = datetime.fromisoformat(end_time_str)
+        self._set_epoch_range(timestamp_str, tz_zone)
 
-            self.start_time_timestamp: int = int(start_time_dt.timestamp()) * 1000
-            self.end_time_timestamp: int = int(end_time_dt.timestamp()) * 1000
+    @staticmethod
+    def _extract_time_tag(timestamp_str: str) -> Optional[str]:
+        time_tag = timestamp_str.split('__')[0]
+        return None if time_tag == timestamp_str else time_tag
 
-            # Convert to human readable format in target timezone
-            self.start_time_human: str = start_time_dt.astimezone(tz_zone).strftime(human_time_format)
-            self.end_time_human: str = end_time_dt.astimezone(tz_zone).strftime(human_time_format)
-        else:
-            # Old format: timestamp in milliseconds or seconds
-            self.start_time_timestamp: int = int(re.findall(r'&from=(\d+)', timestamp_str)[0])
-            self.end_time_timestamp: int = int(re.findall(r'&to=(\d+)', timestamp_str)[0])
+    def _set_iso_range(self, iso_range: tuple[str, str], tz_zone: tzinfo) -> None:
+        start_time_dt = _parse_iso_datetime(iso_range[0])
+        end_time_dt = _parse_iso_datetime(iso_range[1])
+        self.start_time_timestamp = int(start_time_dt.timestamp()) * MILLISECONDS_PER_SECOND
+        self.end_time_timestamp = int(end_time_dt.timestamp()) * MILLISECONDS_PER_SECOND
+        self.start_time_human = _human_time(start_time_dt, tz_zone)
+        self.end_time_human = _human_time(end_time_dt, tz_zone)
 
-            # Convert milliseconds to seconds if needed
-            if len(str(self.start_time_timestamp)) > 10:
-                final_time_start = self.start_time_timestamp / 1000
-            else:
-                final_time_start = self.start_time_timestamp
-                self.start_time_timestamp = self.start_time_timestamp * 1000
+    def _set_epoch_range(self, timestamp_str: str, tz_zone: tzinfo) -> None:
+        start_timestamp = int(START_EPOCH_PATTERN.findall(timestamp_str)[0])
+        end_timestamp = int(END_EPOCH_PATTERN.findall(timestamp_str)[0])
+        self.start_time_timestamp, start_seconds = _normalize_epoch_timestamp(start_timestamp)
+        self.end_time_timestamp, end_seconds = _normalize_epoch_timestamp(end_timestamp)
+        self.start_time_human = _human_time(_utc_from_timestamp(start_seconds), tz_zone)
+        self.end_time_human = _human_time(_utc_from_timestamp(end_seconds), tz_zone)
 
-            if len(str(self.end_time_timestamp)) > 10:
-                final_time_end = self.end_time_timestamp / 1000
-            else:
-                final_time_end = self.end_time_timestamp
-                self.end_time_timestamp = self.end_time_timestamp * 1000
 
-            self.start_time_human: str = (datetime
-                                          .fromtimestamp(final_time_start)
-                                          .astimezone(tz_zone)
-                                          .strftime(human_time_format))
-            self.end_time_human: str = (datetime
-                                        .fromtimestamp(final_time_end)
-                                        .astimezone(tz_zone)
-                                        .strftime(human_time_format))
+def _load_timezone(tz: str) -> tzinfo:
+    if tz == "UTC":
+        return timezone.utc
+    try:
+        return ZoneInfo(tz)
+    except ZoneInfoNotFoundError as error:
+        raise ValueError(f"Invalid or unavailable timezone: {tz}") from error
+
+
+def _parse_iso_datetime(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace('Z', '+00:00'))
+
+
+def _normalize_epoch_timestamp(timestamp: int) -> tuple[int, float]:
+    if len(str(timestamp)) > TIMESTAMP_SECONDS_LENGTH:
+        return timestamp, timestamp / MILLISECONDS_PER_SECOND
+    return timestamp * MILLISECONDS_PER_SECOND, float(timestamp)
+
+
+def _utc_from_timestamp(timestamp_seconds: float) -> datetime:
+    return datetime.fromtimestamp(timestamp_seconds, timezone.utc)
+
+
+def _human_time(value: datetime, tz_zone: tzinfo) -> str:
+    return value.astimezone(tz_zone).strftime(HUMAN_TIME_FORMAT)

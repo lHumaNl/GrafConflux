@@ -1,42 +1,11 @@
 import unittest
+from http.cookiejar import Cookie
 from unittest.mock import Mock
+
+import requests
 
 from grafconflux.browser_session import GrafanaBrowserSession
 from grafconflux.grafana import GrafanaConfigDownloader
-
-
-class FakeOptions:
-    def __init__(self) -> None:
-        self.arguments: list[str] = []
-        self.accept_insecure_certs = False
-
-    def add_argument(self, argument: str) -> None:
-        self.arguments.append(argument)
-
-
-class RecordingBrowser:
-    def __init__(self, failing_step: str | None = None) -> None:
-        self.failing_step = failing_step
-        self.get_calls: list[str] = []
-        self.cookies: list[dict] = []
-        self.timeouts: list[int] = []
-        self.quit_calls = 0
-
-    def get(self, url: str) -> None:
-        self.get_calls.append(url)
-        if self.failing_step == "get":
-            raise RuntimeError("get")
-
-    def add_cookie(self, cookie: dict) -> None:
-        self.cookies.append(cookie)
-        if self.failing_step == "add_cookie":
-            raise RuntimeError("add_cookie")
-
-    def set_page_load_timeout(self, timeout: int) -> None:
-        self.timeouts.append(timeout)
-
-    def quit(self) -> None:
-        self.quit_calls += 1
 
 
 class TestGrafanaBrowserSession(unittest.TestCase):
@@ -52,105 +21,147 @@ class TestGrafanaBrowserSession(unittest.TestCase):
         config.update(overrides)
         return GrafanaConfigDownloader("demo", config)
 
-    def test_browser_session_configures_firefox_wire_cookies_and_timeout(self):
-        browser = RecordingBrowser()
-        browser_factory = Mock(return_value=browser)
+    def test_context_options_include_viewport_ssl_and_authorization_header(self):
         session = Mock()
+        session.headers = {"Authorization": "Bearer token"}
         session.cookies = self.cookie_jar()
 
-        result = GrafanaBrowserSession(
-            self.create_config(),
-            session,
-            browser_factory,
-            FakeOptions,
-        ).create_browser()
+        browser_session = GrafanaBrowserSession(self.create_config(), session)
 
-        self.assertIs(result, browser)
-        options = browser_factory.call_args.kwargs["options"]
-        self.assertEqual(options.arguments, ["--headless", "--disable-gpu", "--width=1234", "--height=567"])
-        self.assertTrue(options.accept_insecure_certs)
-        self.assertEqual(
-            browser_factory.call_args.kwargs["seleniumwire_options"],
-            {
-                "network.stricttransportsecurity.preloadlist": False,
-                "network.stricttransportsecurity.enabled": False,
-            },
+        self.assertEqual(browser_session.context_options(), {
+            "viewport": {"width": 1234, "height": 567},
+            "ignore_https_errors": True,
+            "extra_http_headers": {"Authorization": "Bearer token"},
+        })
+
+    def test_context_options_omit_authorization_header_when_absent(self):
+        session = Mock()
+        session.headers = {}
+        session.cookies = self.cookie_jar()
+
+        browser_session = GrafanaBrowserSession(self.create_config(), session)
+
+        self.assertNotIn("extra_http_headers", browser_session.context_options())
+
+    def test_launch_options_include_configured_browser_channel_and_path(self):
+        session = Mock()
+        session.headers = {}
+        session.cookies = self.cookie_jar()
+        config = self.create_config(
+            playwright_browser_channel="chrome",
+            playwright_browser_executable_path="C:/Browsers/chrome.exe",
         )
-        self.assertEqual(browser.get_calls, ["https://grafana.example"])
-        self.assertEqual([cookie["name"] for cookie in browser.cookies], ["grafana_session"])
-        self.assertEqual(browser.timeouts, [42])
 
-    def test_browser_session_quits_browser_when_authentication_fails(self):
-        browser = RecordingBrowser(failing_step="add_cookie")
-        browser_factory = Mock(return_value=browser)
+        browser_session = GrafanaBrowserSession(config, session)
+
+        self.assertEqual(browser_session.launch_options(), {
+            "headless": True,
+            "channel": "chrome",
+            "executable_path": "C:/Browsers/chrome.exe",
+        })
+
+    def test_configured_browser_name_selects_launcher(self):
         session = Mock()
+        session.headers = {}
+        session.cookies = self.cookie_jar()
+        config = self.create_config(playwright_browser="firefox")
+        browser_session = GrafanaBrowserSession(config, session)
+        browser_session.playwright = Mock()
+
+        launcher = browser_session._browser_launcher()
+
+        self.assertIs(launcher, browser_session.playwright.firefox)
+
+    def test_invalid_configured_browser_name_raises_clear_error(self):
+        session = Mock()
+        session.headers = {}
+        session.cookies = self.cookie_jar()
+        config = self.create_config(playwright_browser="opera")
+        browser_session = GrafanaBrowserSession(config, session)
+
+        with self.assertRaisesRegex(ValueError, "playwright_browser"):
+            browser_session._effective_browser_name()
+
+    def test_playwright_cookies_convert_domain_host_only_and_flags(self):
+        session = Mock()
+        session.headers = {}
         session.cookies = self.cookie_jar()
 
-        with self.assertRaisesRegex(RuntimeError, "add_cookie"):
-            GrafanaBrowserSession(
-                self.create_config(),
-                session,
-                browser_factory,
-                FakeOptions,
-            ).create_browser()
+        cookies = GrafanaBrowserSession(self.create_config(), session).playwright_cookies()
 
-        self.assertEqual(browser.quit_calls, 1)
+        self.assertEqual({cookie["name"] for cookie in cookies}, {"grafana_session", "host_only"})
+        cookies_by_name = {cookie["name"]: cookie for cookie in cookies}
+        domain_cookie = cookies_by_name["grafana_session"]
+        self.assertEqual(domain_cookie["domain"], ".grafana.example")
+        self.assertEqual(domain_cookie["path"], "/")
+        self.assertTrue(domain_cookie["secure"])
+        self.assertTrue(domain_cookie["httpOnly"])
+        self.assertEqual(domain_cookie["sameSite"], "Lax")
+        host_only_cookie = cookies_by_name["host_only"]
+        self.assertEqual(host_only_cookie["url"], "https://grafana.example/monitoring")
+        self.assertNotIn("domain", host_only_cookie)
+        self.assertNotIn("path", host_only_cookie)
 
-    def test_browser_session_suppresses_browser_factory_failure(self):
-        browser_factory = Mock(side_effect=RuntimeError("factory"))
+    def test_host_only_cookie_url_uses_nginx_prefix_when_cookie_path_is_missing(self):
         session = Mock()
-        session.cookies = self.cookie_jar()
+        session.headers = {}
+        session.cookies = requests.cookies.RequestsCookieJar()
+        session.cookies.set_cookie(self.host_only_cookie(path=""))
 
-        with self.assertLogs("grafconflux.grafana", level="ERROR"):
-            result = GrafanaBrowserSession(
-                self.create_config(),
-                session,
-                browser_factory,
-                FakeOptions,
-                suppress_setup_errors=True,
-            ).create_browser()
+        cookies = GrafanaBrowserSession(
+            self.create_config(nginx_prefix="/monitoring"),
+            session,
+        ).playwright_cookies()
 
-        self.assertIsNone(result)
+        self.assertEqual(cookies[0]["url"], "https://grafana.example/monitoring")
 
-    def test_snapshot_style_browser_session_raises_factory_failure(self):
-        browser_factory = Mock(side_effect=RuntimeError("factory"))
+    def test_secure_cookie_on_http_origin_logs_warning(self):
         session = Mock()
-        session.cookies = self.cookie_jar()
+        session.headers = {}
+        session.cookies = self.cookie_jar(include_host_only=False)
 
-        with self.assertRaisesRegex(RuntimeError, "factory"):
-            GrafanaBrowserSession(
-                self.create_config(),
-                session,
-                browser_factory,
-                FakeOptions,
-            ).create_browser()
+        with self.assertLogs("grafconflux.grafana", level="WARNING") as logs:
+            GrafanaBrowserSession(self.create_config(host="http://grafana.example"), session).playwright_cookies()
 
-    def test_browser_session_suppresses_missing_required_cookie_domain(self):
-        browser_factory = Mock()
+        self.assertIn("Secure Grafana cookies", "\n".join(logs.output))
+
+    def test_required_cookie_domain_logs_warning_without_failing_conversion(self):
         session = Mock()
-        session.cookies = self.cookie_jar(domain="other.example")
+        session.headers = {}
+        session.cookies = self.cookie_jar(domain="other.example", include_host_only=False)
 
-        with self.assertLogs("grafconflux.grafana", level="ERROR"):
-            result = GrafanaBrowserSession(
+        with self.assertLogs("grafconflux.grafana", level="WARNING") as logs:
+            cookies = GrafanaBrowserSession(
                 self.create_config(),
                 session,
-                browser_factory,
-                FakeOptions,
-                suppress_setup_errors=True,
                 require_cookie_domain=True,
-            ).create_browser()
+            ).playwright_cookies()
 
-        self.assertIsNone(result)
-        browser_factory.assert_not_called()
+        self.assertEqual(cookies, [])
+        self.assertIn("No Grafana cookies found", "\n".join(logs.output))
 
     @staticmethod
-    def cookie_jar(domain="grafana.example"):
-        import requests
-
+    def cookie_jar(domain=".grafana.example", include_host_only=True):
         jar = requests.cookies.RequestsCookieJar()
-        jar.set("grafana_session", "cookie", domain=domain, path="/")
+        jar.set(
+            "grafana_session",
+            "cookie",
+            domain=domain,
+            path="/",
+            secure=True,
+            rest={"SameSite": "Lax", "HttpOnly": None},
+        )
         jar.set("other_session", "ignored", domain="other.example", path="/")
+        if include_host_only:
+            jar.set("host_only", "cookie", path="/monitoring")
         return jar
+
+    @staticmethod
+    def host_only_cookie(path):
+        return Cookie(
+            0, "host_only", "cookie", None, False, "", False, False,
+            path, bool(path), False, None, True, None, None, {}, False,
+        )
 
 
 if __name__ == "__main__":
