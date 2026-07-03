@@ -50,10 +50,9 @@ def build_render_api_params(panel_params: Dict[str, Any], width: int, height: in
     return render_params
 
 
-def build_render_api_url(host: str, nginx_prefix: Optional[str], dashboard_url: str) -> str:
+def build_render_api_url(grafana_base_url: str, dashboard_url: str) -> str:
     """Build the Grafana render API URL for a dashboard panel."""
-    prefix = nginx_prefix if nginx_prefix else ''
-    return f'{host}{prefix}/render/d-solo{dashboard_url[2:]}'
+    return f'{grafana_base_url}/render/d-solo{dashboard_url[2:]}'
 
 
 def build_render_file_path(

@@ -12,7 +12,7 @@ from grafconflux.grafana import SNAPSHOT_HYDRATION_SCROLL_LIMIT, ConfigurationEr
 
 class TestGrafanaSnapshotConfig(unittest.TestCase):
     def create_config(self, **overrides):
-        config = {"dash_title": "Dashboard", "host": "https://grafana.example"}
+        config = {"dash_title": "Dashboard", "grafana_url": "https://grafana.example"}
         config.update(overrides)
         return GrafanaConfigDownloader("demo", config)
 
@@ -49,7 +49,7 @@ class TestGrafanaSnapshotUi(unittest.TestCase):
     def create_manager(self, browser: "RecordingSnapshotBrowser", **overrides):
         config = {
             "dash_title": "Dashboard",
-            "host": "https://grafana.example",
+            "grafana_url": "https://grafana.example",
             "snapshot": True,
         }
         config.update(overrides)
@@ -313,7 +313,7 @@ class TestGrafanaSnapshotUi(unittest.TestCase):
         self.assertNotIn("deleteUrl", metadata)
 
     def test_snapshot_helper_facade_preserves_url_payload_and_file_behavior(self):
-        manager = self.create_manager(ModernSnapshotBrowser(), nginx_prefix="/grafana")
+        manager = self.create_manager(ModernSnapshotBrowser(), grafana_url="https://grafana.example/grafana")
         timestamp = self.timestamp("nightly")
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -327,19 +327,23 @@ class TestGrafanaSnapshotUi(unittest.TestCase):
             manager._snapshot_api_url("/api/snapshots/key"),
             "https://grafana.example/grafana/api/snapshots/key",
         )
-        self.assertEqual(manager._snapshot_url_from_key("key"), "https://grafana.example/dashboard/snapshot/key")
+        self.assertEqual(manager._snapshot_url_from_key("key"), "https://grafana.example/grafana/dashboard/snapshot/key")
         self.assertEqual(
             manager._normalize_snapshot_url("/dashboard/snapshot/key"),
-            "https://grafana.example/dashboard/snapshot/key",
+            "https://grafana.example/grafana/dashboard/snapshot/key",
+        )
+        self.assertEqual(
+            manager._normalize_snapshot_url("/grafana/dashboard/snapshot/key"),
+            "https://grafana.example/grafana/dashboard/snapshot/key",
         )
         self.assertIsNone(manager._normalize_snapshot_url("/not-a-snapshot/key"))
         self.assertEqual(
             manager._snapshot_url_from_payload({"externalUrl": "/dashboard/snapshot/ext"}),
-            "https://grafana.example/dashboard/snapshot/ext",
+            "https://grafana.example/grafana/dashboard/snapshot/ext",
         )
         self.assertEqual(
             manager._snapshot_url_from_payload({"key": "payload-key"}),
-            "https://grafana.example/dashboard/snapshot/payload-key",
+            "https://grafana.example/grafana/dashboard/snapshot/payload-key",
         )
         self.assertEqual(manager._snapshot_key_from_url("https://snapshots.local/dashboard/snapshot/key/"), "key")
         with self.assertRaisesRegex(ValueError, "Snapshot URL has no key"):

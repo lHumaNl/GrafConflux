@@ -25,7 +25,7 @@ class TestLibraryApi(unittest.TestCase):
 
     def create_config(
         self,
-        content: str = "dashboards:\n  demo:\n    dash_title: Demo\n    host: https://grafana.example\n",
+        content: str = "dashboards:\n  demo:\n    dash_title: Demo\n    grafana_url: https://grafana.example\n",
         *,
         raw: bool = False,
     ) -> str:
@@ -38,7 +38,7 @@ class TestLibraryApi(unittest.TestCase):
                 "dashboards:\n"
                 "  demo:\n"
                 "    dash_title: Demo\n"
-                "    host: https://grafana.example\n"
+                "    grafana_url: https://grafana.example\n"
             )
         with open(config_path, "w", encoding="utf-8") as config_file:
             config_file.write(config_text)

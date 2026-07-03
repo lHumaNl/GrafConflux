@@ -67,6 +67,7 @@ from grafconflux._shared.grafana_models import (
     PanelFilteringConfig,
     PanelRenderTask,
     _SelectorConfig,
+    normalize_grafana_dashboard_route,
 )
 from grafconflux._shared.display import normalize_grafana_display_value
 from grafconflux._grafana.panel_selection import (
@@ -164,17 +165,17 @@ class GrafanaManager:
                 raise ValueError('Confluence login/password are required for Grafana domain authentication.')
             login = confluence_login.split('@')[0]
             password = confluence_password
-        elif (self.config.login and self.config.password) and not self.config.login_url:
+        elif (self.config.login and self.config.password) and not self.config.auth_url:
             login = self.config.login
             password = self.config.password
         elif self.config.token:
             self.session.headers.update({'Authorization': f'Bearer {self.config.token}'})
             return
-        elif self.config.login_url and (self.config.login and self.config.password):
+        elif self.config.auth_url and (self.config.login and self.config.password):
             auth_string = base64.b64encode(f'{self.config.login}:{self.config.password}'.encode()).decode()
             self.session.headers.update({'Authorization': f"Basic {auth_string}"})
 
-            response = self.session.get(self.config.login_url, timeout=self.config.timeout)
+            response = self.session.get(self.config.auth_url, timeout=self.config.timeout)
 
             if response.status_code != 200:
                 raise ConnectionError('Failed to authenticate with Grafana.')
@@ -202,8 +203,7 @@ class GrafanaManager:
         logger.info('Successfully authenticated with Grafana.')
 
     def _grafana_login_url(self) -> str:
-        prefix = (self.config.nginx_prefix or '').rstrip('/')
-        return f'{self.config.host}{prefix}/login'
+        return self._grafana_url('/login')
 
     def _reauthenticate_grafana(self, browser: Optional[Any] = None) -> bool:
         if not self.config.auth:
@@ -321,7 +321,7 @@ class GrafanaManager:
         logger.info(f'Snapshot backup for {self.config.name} saved in {output_file}')
 
     def _snapshot_api_url(self, path: str) -> str:
-        return snapshot_api_url(self.config.host, self.config.nginx_prefix, path)
+        return snapshot_api_url(self.config.grafana_base_url, path)
 
     def _snapshot_name(self, timestamp: GrafanaTimeDownloader) -> str:
         return snapshot_name(self.config.name, timestamp)
@@ -360,7 +360,7 @@ class GrafanaManager:
         modern_dialog = self._open_snapshot_dialog(browser)
         self._submit_snapshot_form(browser, timestamp, modern_dialog)
         snapshot_key = self._read_snapshot_key(browser, timestamp)
-        self._record_snapshot_url(f'{self.config.host}/dashboard/snapshot/{snapshot_key}')
+        self._record_snapshot_url(f'{self.config.grafana_base_url}/dashboard/snapshot/{snapshot_key}')
         self._save_snapshot_backup(snapshot_key, timestamp, test_folder)
 
     def _open_dashboard_for_snapshot(self, browser: Any, dashboard_link: str) -> None:
@@ -369,7 +369,7 @@ class GrafanaManager:
         if self._dashboard_loaded_for_snapshot(browser):
             return
         logger.warning(f'Dashboard route fallback via browser UI navigation dashboard={self.config.name}')
-        browser.get(self.config.host)
+        browser.get(self.config.grafana_base_url)
         time.sleep(2)
         browser.execute_script('window.location.href = arguments[0]; return window.location.href;', dashboard_link)
         time.sleep(5)
@@ -904,13 +904,13 @@ class GrafanaManager:
         return snapshot_response_text(response)
 
     def _snapshot_url_from_payload(self, payload: Dict[str, Any]) -> Optional[str]:
-        return snapshot_url_from_payload(payload, self.config.host)
+        return snapshot_url_from_payload(payload, self.config.grafana_base_url)
 
     def _normalize_snapshot_url(self, snapshot_link: str) -> Optional[str]:
-        return normalize_snapshot_url(snapshot_link, self.config.host)
+        return normalize_snapshot_url(snapshot_link, self.config.grafana_base_url)
 
     def _snapshot_url_from_key(self, snapshot_key: str) -> str:
-        return snapshot_url_from_key(snapshot_key, self.config.host)
+        return snapshot_url_from_key(snapshot_key, self.config.grafana_base_url)
 
     def _lookup_snapshot_url_by_name(self, timestamp: GrafanaTimeDownloader) -> Optional[str]:
         snapshot_name = self._snapshot_name(timestamp)
@@ -926,7 +926,7 @@ class GrafanaManager:
         return self._snapshot_url_from_lookup_response(response, snapshot_name)
 
     def _snapshot_url_from_lookup_response(self, response: Any, snapshot_name: str) -> Optional[str]:
-        return snapshot_url_from_lookup_response(response, snapshot_name, self.config.host, self.config.name)
+        return snapshot_url_from_lookup_response(response, snapshot_name, self.config.grafana_base_url, self.config.name)
 
     def _snapshot_url_from_element(self, browser: Any, selector: str) -> Optional[str]:
         element = self._find_css(browser, selector)
@@ -1049,7 +1049,7 @@ class GrafanaManager:
         return identity
 
     def __get_full_links(self, timestamps: List[GrafanaTimeDownloader]):
-        url = f'{self.config.host}{self.dashboard_url}'
+        url = self._dashboard_public_url()
         links = []
 
         for timestamp in timestamps:
@@ -1065,7 +1065,7 @@ class GrafanaManager:
         request = self.__build_lookup_request()
         log_lookup_mode(request)
         response = self.session.get(
-            f'{self.config.host}{self.config.nginx_prefix if self.config.nginx_prefix else ""}/api/search',
+            self._grafana_url('/api/search'),
             params=search_params(request),
             timeout=self.config.timeout,
         )
@@ -1075,7 +1075,7 @@ class GrafanaManager:
         result = select_dashboard(request, response.json())
         self.__record_dashboard_identity(result)
         logger.debug(f'Found dashboard UID: {result.dashboard_uid}')
-        return result.dashboard_uid, result.url
+        return result.dashboard_uid, self._normalize_dashboard_route(result.url)
 
     def __record_dashboard_identity(self, result: DashboardLookupResult) -> None:
         self.dashboard_identity = result
@@ -1093,8 +1093,7 @@ class GrafanaManager:
         Retrieve panel information from the dashboard.
         """
         response = self.session.get(
-            f'{self.config.host}{self.config.nginx_prefix if self.config.nginx_prefix else ""}'
-            f'/api/dashboards/uid/{self.dashboard_uid}',
+            self._grafana_url(f'/api/dashboards/uid/{self.dashboard_uid}'),
             timeout=self.config.timeout,
         )
         if response.status_code != 200:
@@ -1236,7 +1235,7 @@ class GrafanaManager:
             if self.config.render:
                 # Use Grafana rendering API
                 render_params = build_render_api_params(params, self.config.width, self.config.height, self.config.timeout)
-                render_url = build_render_api_url(self.config.host, self.config.nginx_prefix, self.dashboard_url)
+                render_url = build_render_api_url(self.config.grafana_base_url, self.dashboard_url)
                 try:
                     response = self.session.get(render_url, params=render_params, timeout=self.config.timeout)
                     response.raise_for_status()
@@ -1291,7 +1290,7 @@ class GrafanaManager:
         """
         Build the URL for a panel in view mode.
         """
-        url = f'{self.config.host}{self.dashboard_url}'
+        url = self._dashboard_public_url()
         variables = self.config.vars if variables is None else variables
         params = build_panel_url_params(
             panel.panel_id,
@@ -1302,6 +1301,20 @@ class GrafanaManager:
             variables,
         )
         return url, params
+
+    def _dashboard_public_url(self) -> str:
+        return self._grafana_url(self.dashboard_url)
+
+    def _grafana_url(self, path: str) -> str:
+        return f'{self.config.grafana_base_url}{path}'
+
+    def _normalize_dashboard_route(self, dashboard_url: str) -> str:
+        return normalize_grafana_dashboard_route(
+            self.config.name,
+            dashboard_url,
+            self.config.grafana_origin,
+            self.config.grafana_app_path,
+        )
 
     def __init_browser(self):
         return GrafanaBrowserSession(

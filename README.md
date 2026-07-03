@@ -47,7 +47,7 @@ settings:
 dashboards:
   operations:
     dash_title: Operations Overview
-    host: https://grafana.example.com
+    grafana_url: https://grafana.example.com
     token: env:GRAFANA_TOKEN
     render: true
 ```
@@ -58,9 +58,14 @@ Dashboards-only config is also valid when Confluence settings come from CLI or e
 dashboards:
   operations:
     dash_title: Operations Overview
-    host: https://grafana.example.com
+    grafana_url: https://grafana.example.com
     token: env:GRAFANA_TOKEN
 ```
+
+`grafana_url` is the public Grafana base URL. Include any reverse-proxy app path directly in this value, for example
+`https://grafana.example.com/grafana` or `https://grafana.example.com/monitoring`. Use optional `auth_url` only for an
+external authentication/bootstrap endpoint; GrafConflux still builds Grafana API, render, and browser URLs from
+`grafana_url`.
 
 ## Confluence credentials and SSL
 
@@ -121,7 +126,7 @@ settings:
 dashboards:
   operations:
     dash_title: Operations Overview
-    host: https://grafana.example.com
+    grafana_url: https://grafana.example.com
     token: env:GRAFANA_TOKEN
     render: false
     playwright_browser_executable_path: C:/Browsers/chrome.exe

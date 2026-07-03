@@ -118,7 +118,7 @@ class TestPlaywrightScreenshotReadiness(unittest.TestCase):
         readiness.update(readiness_overrides)
         return GrafanaConfigDownloader("demo", {
             "dash_title": "Dashboard",
-            "host": "https://grafana.example",
+            "grafana_url": "https://grafana.example",
             "timeout": timeout,
             "screenshot_readiness": readiness,
         })

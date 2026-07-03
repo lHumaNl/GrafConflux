@@ -323,7 +323,7 @@ class TestPrivatePackageDependencyGuard(unittest.TestCase):
         )
 
 
-GRAFANA_CONFIG = {"dash_title": "Dashboard", "host": "https://grafana.example"}
+GRAFANA_CONFIG = {"dash_title": "Dashboard", "grafana_url": "https://grafana.example"}
 
 GRAFANA_MODEL_SYMBOLS = [
     "ConfigurationError",

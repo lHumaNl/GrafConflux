@@ -20,7 +20,7 @@ from grafconflux.grafana import (
 
 class TestNoDataPreflight(unittest.TestCase):
     def create_config(self, **overrides):
-        config = {"dash_title": "Dashboard", "host": "https://grafana.example"}
+        config = {"dash_title": "Dashboard", "grafana_url": "https://grafana.example"}
         config.update(overrides)
         return GrafanaConfigDownloader("demo", config)
 
@@ -30,6 +30,11 @@ class TestNoDataPreflight(unittest.TestCase):
         manager.dashboard_url = "/d/dashboard-uid/dashboard"
         manager.get_dashboard_uid = Mock(return_value=("dashboard-uid", "/d/dashboard-uid/dashboard"))
         return manager
+
+    def test_ds_query_url_uses_grafana_base_url(self):
+        manager = self.create_manager(grafana_url="https://grafana.example/grafana")
+
+        self.assertEqual(manager._ds_query_url(), "https://grafana.example/grafana/api/ds/query")
 
     def create_timestamps(self, count=1):
         return [

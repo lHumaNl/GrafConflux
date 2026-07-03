@@ -13,7 +13,7 @@ from grafconflux.options import GrafConfluxRunOptions
 
 class TestPhase2Diagnostics(unittest.TestCase):
     def create_manager(self, **overrides: object) -> GrafanaManager:
-        config = {"dash_title": "Dashboard", "host": "https://grafana.example"}
+        config = {"dash_title": "Dashboard", "grafana_url": "https://grafana.example"}
         config.update(overrides)
         return GrafanaManager(GrafanaConfigDownloader("demo", config))
 
@@ -159,7 +159,7 @@ class TestPhase2Diagnostics(unittest.TestCase):
         with self.assertLogs("grafconflux.grafana", level="WARNING") as logs:
             GrafanaConfigDownloader("demo", {
                 "dash_title": "Dashboard",
-                "host": "https://grafana.example",
+                "grafana_url": "https://grafana.example",
                 "download_collapsed_rows": False,
                 "download_collapse_panels": True,
             })
@@ -214,7 +214,7 @@ class TestPhase2PipelineOrdering(unittest.TestCase):
         calls = []
         manager = GrafanaManager(GrafanaConfigDownloader("demo", {
             "dash_title": "Dashboard",
-            "host": "https://grafana.example",
+            "grafana_url": "https://grafana.example",
             "snapshot": True,
         }))
         task_panel = Mock(panel_id=7, links=[None], artifacts=[])
@@ -240,7 +240,7 @@ class TestPhase2PipelineOrdering(unittest.TestCase):
         calls = []
         manager = GrafanaManager(GrafanaConfigDownloader("demo", {
             "dash_title": "Dashboard",
-            "host": "https://grafana.example",
+            "grafana_url": "https://grafana.example",
             "snapshot": True,
         }))
         task_panel = Mock(panel_id=7, links=[None], artifacts=[])
@@ -270,7 +270,7 @@ class TestPhase2PipelineOrdering(unittest.TestCase):
         calls = []
         manager = GrafanaManager(GrafanaConfigDownloader("demo", {
             "dash_title": "Dashboard",
-            "host": "https://grafana.example",
+            "grafana_url": "https://grafana.example",
             "download_collapsed_rows": True,
             "panel_filtering": {"mode": "include_only_selected", "include_rows": {"titles": ["Production"]}},
             "enable_repeating_panels": True,

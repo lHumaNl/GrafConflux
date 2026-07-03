@@ -27,7 +27,7 @@ class TestGrafanaPanels(unittest.TestCase):
     def create_manager(self, **overrides):
         config = {
             "dash_title": "Dashboard",
-            "host": "https://grafana.example",
+            "grafana_url": "https://grafana.example",
         }
         config.update(overrides)
         return GrafanaManager(GrafanaConfigDownloader("demo", config))
@@ -169,6 +169,20 @@ class TestGrafanaPanels(unittest.TestCase):
             self.assertEqual(len(panel.links), 3)
             self.assertEqual(panel.links, [None, None, None])
         self.assertEqual(manager.session.get.call_args.kwargs["timeout"], manager.config.timeout)
+
+    def test_get_panels_uses_grafana_base_url_for_dashboard_api(self):
+        manager = self.create_manager(grafana_url="https://grafana.example/monitoring")
+        manager.dashboard_uid = "dashboard-uid"
+        manager.session.get = Mock(return_value=Mock(status_code=200, json=Mock(return_value={
+            "dashboard": {"panels": []}
+        })))
+
+        manager.get_panels(self.create_timestamps(count=1))
+
+        self.assertEqual(
+            manager.session.get.call_args.args[0],
+            "https://grafana.example/monitoring/api/dashboards/uid/dashboard-uid",
+        )
 
     def test_include_only_selected_by_panel_ids(self):
         panel_ids = self.get_panel_ids(
@@ -506,16 +520,17 @@ class TestGrafanaPanels(unittest.TestCase):
         self.assertEqual(panels[0].row_title, "Collapsed Row")
         self.assertTrue(panels[0].from_collapsed_row)
 
-    def test_authenticate_with_login_url_uses_timeout(self):
-        manager = self.create_manager(login="user", password="secret", login_url="https://grafana.example/login")
+    def test_authenticate_with_auth_url_uses_timeout(self):
+        manager = self.create_manager(login="user", password="secret", auth_url="https://auth.example/bootstrap")
         manager.session.get = Mock(return_value=Mock(status_code=200))
 
         manager.authenticate("ignored", "ignored")
 
+        self.assertEqual(manager.session.get.call_args.args[0], "https://auth.example/bootstrap")
         self.assertEqual(manager.session.get.call_args.kwargs["timeout"], manager.config.timeout)
 
-    def test_authenticate_with_password_uses_nginx_prefix_login_url(self):
-        manager = self.create_manager(login="user", password="secret", nginx_prefix="/monitoring")
+    def test_authenticate_with_password_uses_grafana_base_login_url(self):
+        manager = self.create_manager(login="user", password="secret", grafana_url="https://grafana.example/monitoring")
         manager.session.post = Mock(return_value=Mock(status_code=200))
 
         manager.authenticate("ignored", "ignored")
@@ -823,7 +838,14 @@ class TestGrafanaPanels(unittest.TestCase):
         self.assertEqual(task_file_names, [artifact["png_file"] for artifact in first_artifacts])
 
     def test_download_chart_render_mode_uses_render_api_params_and_records_fullscreen_link(self):
-        manager = self.create_manager(width=800, height=600, timeout=45, tz="UTC", vars={"env": "prod"})
+        manager = self.create_manager(
+            width=800,
+            height=600,
+            timeout=45,
+            tz="UTC",
+            vars={"env": "prod"},
+            grafana_url="https://grafana.example/grafana",
+        )
         manager.dashboard_url = "/d/dashboard-uid/dashboard"
         timestamp = self.create_timestamps(count=1)[0]
         artifact = {}
@@ -854,7 +876,7 @@ class TestGrafanaPanels(unittest.TestCase):
         render_url, render_kwargs = calls[0]
         link_probe_url, link_probe_kwargs = calls[1]
 
-        self.assertEqual(render_url, "https://grafana.example/render/d-solo/dashboard-uid/dashboard")
+        self.assertEqual(render_url, "https://grafana.example/grafana/render/d-solo/dashboard-uid/dashboard")
         self.assertEqual(render_kwargs["timeout"], 45)
         self.assertNotIn("viewPanel", render_kwargs["params"])
         self.assertEqual(render_kwargs["params"]["panelId"], 17)
@@ -868,6 +890,7 @@ class TestGrafanaPanels(unittest.TestCase):
         self.assertEqual(task.panel.links[0], link_probe_url)
         self.assertEqual(artifact["link"], link_probe_url)
         self.assertEqual(image_bytes, b"png-bytes")
+        self.assertNotIn("/grafana/grafana/", link_probe_url)
 
     def test_download_chart_render_mode_falls_back_to_non_fullscreen_link_probe(self):
         manager = self.create_manager(timeout=45)

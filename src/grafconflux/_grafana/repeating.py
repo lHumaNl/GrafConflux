@@ -292,10 +292,9 @@ class RepeatingPlanner:
             return []
     def _prometheus_label_values_url(self, variable: Dict[str, Any], label: str) -> str:
         datasource_uid = _datasource_type_uid(variable.get('datasource'))[1]
-        prefix = self.config.nginx_prefix if self.config.nginx_prefix else ''
         uid_path = quote(str(datasource_uid), safe='')
         label_path = quote(label, safe='')
-        return f'{self.config.host}{prefix}/api/datasources/proxy/uid/{uid_path}/api/v1/label/{label_path}/values'
+        return f'{self.config.grafana_base_url}/api/datasources/proxy/uid/{uid_path}/api/v1/label/{label_path}/values'
     @staticmethod
     def _prometheus_label_values_params(metric: Optional[str],
                                         timestamp: Optional[GrafanaTimeDownloader]) -> Dict[str, str]:

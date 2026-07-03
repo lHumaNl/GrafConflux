@@ -93,8 +93,7 @@ class NoDataPreflightRunner:
         self._record_task_link(task, f"{url}?{urlencode(params, doseq=True)}")
 
     def ds_query_url(self) -> str:
-        prefix = self.config.nginx_prefix if self.config.nginx_prefix else ''
-        return f'{self.config.host}{prefix}/api/ds/query'
+        return f'{self.config.grafana_base_url}/api/ds/query'
 
 
 class _GenericNoDataDetector:

@@ -12,7 +12,7 @@ class TestGrafanaBrowserSession(unittest.TestCase):
     def create_config(self, **overrides):
         config = {
             "dash_title": "Dashboard",
-            "host": "https://grafana.example",
+            "grafana_url": "https://grafana.example",
             "width": 1234,
             "height": 567,
             "timeout": 42,
@@ -102,18 +102,30 @@ class TestGrafanaBrowserSession(unittest.TestCase):
         self.assertNotIn("domain", host_only_cookie)
         self.assertNotIn("path", host_only_cookie)
 
-    def test_host_only_cookie_url_uses_nginx_prefix_when_cookie_path_is_missing(self):
+    def test_host_only_cookie_url_uses_grafana_app_path_when_cookie_path_is_missing(self):
         session = Mock()
         session.headers = {}
         session.cookies = requests.cookies.RequestsCookieJar()
         session.cookies.set_cookie(self.host_only_cookie(path=""))
 
         cookies = GrafanaBrowserSession(
-            self.create_config(nginx_prefix="/monitoring"),
+            self.create_config(grafana_url="https://grafana.example/monitoring"),
             session,
         ).playwright_cookies()
 
         self.assertEqual(cookies[0]["url"], "https://grafana.example/monitoring")
+
+    def test_cookie_paths_are_scoped_to_grafana_app_path(self):
+        session = Mock()
+        session.headers = {}
+        session.cookies = self.cookie_jar(include_host_only=False)
+
+        cookies = GrafanaBrowserSession(
+            self.create_config(grafana_url="https://grafana.example/grafana"),
+            session,
+        ).playwright_cookies()
+
+        self.assertEqual(cookies[0]["path"], "/grafana")
 
     def test_secure_cookie_on_http_origin_logs_warning(self):
         session = Mock()
@@ -121,7 +133,7 @@ class TestGrafanaBrowserSession(unittest.TestCase):
         session.cookies = self.cookie_jar(include_host_only=False)
 
         with self.assertLogs("grafconflux.grafana", level="WARNING") as logs:
-            GrafanaBrowserSession(self.create_config(host="http://grafana.example"), session).playwright_cookies()
+            GrafanaBrowserSession(self.create_config(grafana_url="http://grafana.example"), session).playwright_cookies()
 
         self.assertIn("Secure Grafana cookies", "\n".join(logs.output))
 

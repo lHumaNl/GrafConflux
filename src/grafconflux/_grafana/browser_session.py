@@ -138,7 +138,7 @@ class GrafanaBrowserSession:
         return {'Authorization': authorization} if authorization else {}
 
     def playwright_cookies(self) -> List[Dict[str, Any]]:
-        parsed_host = urlparse(self.config.host)
+        parsed_host = urlparse(self.config.grafana_base_url)
         host = parsed_host.hostname
         matching_cookies = [
             cookie for cookie in self.session.cookies
@@ -146,7 +146,7 @@ class GrafanaBrowserSession:
         ]
         self._warn_secure_cookies_on_http(parsed_host, matching_cookies)
         cookies = [
-            self._playwright_cookie(cookie, self.config.host, self.config.nginx_prefix)
+            self._playwright_cookie(cookie, self.config.grafana_base_url, self.config.grafana_app_path)
             for cookie in matching_cookies
         ]
         if self.require_cookie_domain and not cookies:
@@ -157,8 +157,8 @@ class GrafanaBrowserSession:
     def _playwright_cookie(
         cls,
         cookie: Cookie,
-        host_url: str,
-        nginx_prefix: Optional[str] = None,
+        grafana_base_url: str,
+        grafana_app_path: str = '',
     ) -> Dict[str, Any]:
         result: Dict[str, Any] = {
             'name': cookie.name,
@@ -166,9 +166,9 @@ class GrafanaBrowserSession:
         }
         if cookie.domain_specified:
             result['domain'] = cookie.domain
-            result['path'] = cookie.path or '/'
+            result['path'] = cls._cookie_path(cookie.path, grafana_app_path)
         else:
-            result['url'] = cls._host_only_cookie_url(host_url, cookie.path, nginx_prefix)
+            result['url'] = cls._host_only_cookie_url(grafana_base_url, cookie.path, grafana_app_path)
         if cookie.expires is not None:
             result['expires'] = int(cookie.expires)
         cls._append_cookie_flags(cookie, result)
@@ -183,13 +183,18 @@ class GrafanaBrowserSession:
         )
 
     @staticmethod
-    def _host_only_cookie_url(host_url: str, cookie_path: str, nginx_prefix: Optional[str]) -> str:
-        path = cookie_path if cookie_path not in (None, '') else nginx_prefix
-        normalized_path = path if path not in (None, '') else '/'
+    def _host_only_cookie_url(grafana_base_url: str, cookie_path: str, grafana_app_path: str) -> str:
+        normalized_path = GrafanaBrowserSession._cookie_path(cookie_path, grafana_app_path)
         if not normalized_path.startswith('/'):
             normalized_path = f'/{normalized_path}'
-        parsed = urlparse(host_url)
+        parsed = urlparse(grafana_base_url)
         return urlunparse((parsed.scheme, parsed.netloc, normalized_path, '', '', ''))
+
+    @staticmethod
+    def _cookie_path(cookie_path: Optional[str], grafana_app_path: str) -> str:
+        if grafana_app_path and cookie_path in (None, '', '/'):
+            return grafana_app_path
+        return cookie_path or '/'
 
     @staticmethod
     def _append_cookie_flags(cookie: Cookie, result: Dict[str, Any]) -> None:
@@ -213,7 +218,7 @@ class GrafanaBrowserSession:
         if browser is None or browser is self:
             self.refresh_authentication()
             return
-        browser.get(self.config.host)
+        browser.get(self.config.grafana_base_url)
         for cookie in self.grafana_cookies().values() if cookies is None else cookies.values():
             browser.add_cookie(cookie)
         browser.set_page_load_timeout(self.config.timeout)

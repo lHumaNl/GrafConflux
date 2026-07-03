@@ -3,6 +3,7 @@ import re
 from abc import ABC
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Pattern, Tuple
+from urllib.parse import urlparse, urlunparse
 from grafconflux._shared.time import GrafanaTimeDownloader, GrafanaTimeUploader
 
 logger = logging.getLogger('grafconflux.grafana')
@@ -50,6 +51,9 @@ SNAPSHOT_ROW_SWEEP_STEP_VIEWPORT_FRACTION = 0.75
 SNAPSHOT_ROW_SETTLE_SECONDS = 0.5
 SNAPSHOT_STABLE_SCROLL_LIMIT = 2
 SCREENSHOT_READINESS_KEY = 'screenshot_readiness'
+GRAFANA_URL_KEY = 'grafana_url'
+AUTH_URL_KEY = 'auth_url'
+REMOVED_GRAFANA_URL_KEYS = ('host', 'nginx_prefix', 'login_url')
 DEFAULT_SCREENSHOT_NETWORK_IDLE_MS = 750
 DEFAULT_SCREENSHOT_NO_NETWORK_GRACE_MS = 1000
 DEFAULT_SCREENSHOT_MIN_SETTLE_MS = 200
@@ -144,6 +148,13 @@ class DashboardLookupResult:
     def from_search_result(cls, dashboard: Dict) -> 'DashboardLookupResult':
         return cls(dashboard['uid'], dashboard.get('title'), dashboard.get('folderUid'),
                    dashboard.get('folderTitle'), dashboard['url'])
+
+
+@dataclass(frozen=True)
+class GrafanaUrlParts:
+    origin: str
+    app_path: str
+    base_url: str
 
 
 @dataclass(frozen=True)
@@ -333,8 +344,12 @@ class GrafanaConfigUploader(GrafanaConfigBase):
 class GrafanaConfigDownloader(GrafanaConfigBase):
     def __init__(self, name: str, config: Dict):
         super().__init__(name)
+        _reject_removed_grafana_url_keys(name, config)
+        grafana_url = _validated_grafana_url(name, config)
         self.dash_title: Optional[str] = config.get('dash_title'); self.dashboard_uid: Optional[str] = config.get('dashboard_uid')
-        self.host: str = config['host']; self.login_url: str = config.get('login_url'); self.nginx_prefix: str = config.get('nginx_prefix')
+        self.grafana_url: str = grafana_url.base_url; self.grafana_origin: str = grafana_url.origin
+        self.grafana_app_path: str = grafana_url.app_path; self.grafana_base_url: str = grafana_url.base_url
+        self.auth_url: Optional[str] = _validated_auth_url(name, config.get(AUTH_URL_KEY))
         self.width: int = config.get('width', 1920); self.height: int = config.get('height', 1080)
         self.render: bool = config.get('render', True); self.snapshot: bool = config.get('snapshot', False)
         self.snapshot_timeout: int = config.get('snapshot_timeout', 30); self.snapshot_mode: str = _validated_snapshot_mode(self.name, config)
@@ -364,6 +379,100 @@ class GrafanaConfigDownloader(GrafanaConfigBase):
         self.panel_filtering: PanelFilteringConfig = PanelFilteringConfig.from_config(self.name, config.get(PANEL_FILTERING_KEY))
         self.rename_panels: List[Dict[str, Any]] = _validated_rename_panels(self.name, config)
         _validate_dashboard_lookup(self.name, self.dashboard_uid, self.dash_title, self.folder, self.folder_uid)
+
+
+def _reject_removed_grafana_url_keys(dashboard_name: str, config: Dict) -> None:
+    removed_keys = [key for key in REMOVED_GRAFANA_URL_KEYS if key in config]
+    if removed_keys:
+        keys = ', '.join(removed_keys)
+        raise ConfigurationError(
+            f'dashboards.{dashboard_name}: removed Grafana URL key(s): {keys}; '
+            f'expected {GRAFANA_URL_KEY} and optional {AUTH_URL_KEY}'
+        )
+
+
+def _validated_grafana_url(dashboard_name: str, config: Dict) -> GrafanaUrlParts:
+    value = config.get(GRAFANA_URL_KEY)
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigurationError(
+            f'dashboards.{dashboard_name}.{GRAFANA_URL_KEY}: invalid value="{value}", '
+            'expected full Grafana base URL with http(s) scheme'
+        )
+    parsed = urlparse(value.strip())
+    if parsed.scheme not in ('http', 'https') or not parsed.netloc:
+        raise ConfigurationError(
+            f'dashboards.{dashboard_name}.{GRAFANA_URL_KEY}: invalid value="{value}", '
+            'expected absolute URL with http(s) scheme'
+        )
+    if parsed.query or parsed.fragment:
+        raise ConfigurationError(
+            f'dashboards.{dashboard_name}.{GRAFANA_URL_KEY}: invalid value="{value}", '
+            'expected Grafana base URL without query or fragment'
+        )
+    app_path = _normalized_app_path(parsed.path)
+    origin = urlunparse((parsed.scheme, parsed.netloc, '', '', '', ''))
+    return GrafanaUrlParts(origin, app_path, f'{origin}{app_path}')
+
+
+def _validated_auth_url(dashboard_name: str, value: Any) -> Optional[str]:
+    if value in (None, ''):
+        return None
+    if not isinstance(value, str):
+        raise ConfigurationError(
+            f'dashboards.{dashboard_name}.{AUTH_URL_KEY}: invalid value="{value}", expected absolute URL'
+        )
+    parsed = urlparse(value)
+    if parsed.scheme not in ('http', 'https') or not parsed.netloc:
+        raise ConfigurationError(
+            f'dashboards.{dashboard_name}.{AUTH_URL_KEY}: invalid value="{value}", '
+            'expected absolute URL with http(s) scheme'
+        )
+    return value
+
+
+def _normalized_app_path(path: str) -> str:
+    normalized_path = (path or '').rstrip('/')
+    if normalized_path in ('', '/'):
+        return ''
+    return normalized_path if normalized_path.startswith('/') else f'/{normalized_path}'
+
+
+def normalize_grafana_dashboard_route(dashboard_name: str, raw_url: str,
+                                      grafana_origin: str, grafana_app_path: str) -> str:
+    return _normalize_grafana_app_route(dashboard_name, raw_url, grafana_origin, grafana_app_path, '/d/')
+
+
+def _normalize_grafana_app_route(dashboard_name: str, raw_url: str, grafana_origin: str,
+                                 grafana_app_path: str, route_prefix: str) -> str:
+    if not isinstance(raw_url, str) or not raw_url:
+        raise ConfigurationError(f'dashboards.{dashboard_name}: Grafana API returned empty dashboard url')
+    parsed = urlparse(raw_url)
+    if parsed.scheme or parsed.netloc:
+        _validate_same_grafana_origin(dashboard_name, raw_url, parsed, grafana_origin)
+    path = parsed.path or raw_url
+    path = path if path.startswith('/') else f'/{path}'
+    route = _strip_grafana_app_path(path, grafana_app_path)
+    if not route.startswith(route_prefix):
+        raise ConfigurationError(
+            f'dashboards.{dashboard_name}: Grafana API returned unsupported dashboard url="{raw_url}", '
+            f'expected route starting with {route_prefix}'
+        )
+    return route
+
+
+def _validate_same_grafana_origin(dashboard_name: str, raw_url: str, parsed, grafana_origin: str) -> None:
+    origin = urlunparse((parsed.scheme, parsed.netloc, '', '', '', ''))
+    if origin != grafana_origin:
+        raise ConfigurationError(
+            f'dashboards.{dashboard_name}: Grafana API returned cross-origin dashboard url="{raw_url}"'
+        )
+
+
+def _strip_grafana_app_path(path: str, grafana_app_path: str) -> str:
+    if grafana_app_path and (path == grafana_app_path or path.startswith(f'{grafana_app_path}/')):
+        stripped = path[len(grafana_app_path):]
+        return stripped or '/'
+    return path
 
 
 def _validated_collapsed_rows(dashboard_name: str, config: Dict) -> bool:

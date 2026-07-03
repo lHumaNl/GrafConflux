@@ -25,7 +25,7 @@ class TestGrafanaConfigLoading(unittest.TestCase):
         config_path = self.write_config(
             "legacy_dashboard:\n"
             "  dash_title: Legacy\n"
-            "  host: https://grafana.example\n",
+            "  grafana_url: https://grafana.example\n",
             raw=True,
         )
 
@@ -39,7 +39,7 @@ class TestGrafanaConfigLoading(unittest.TestCase):
             "dashboards:\n"
             "  new_dashboard:\n"
             "    dash_title: New\n"
-            "    host: https://grafana.example\n"
+            "    grafana_url: https://grafana.example\n"
         )
 
         configs = GrafanaManager.load_grafana_config(config_path)
@@ -53,7 +53,7 @@ class TestGrafanaConfigLoading(unittest.TestCase):
             "dashboards:\n"
             "  new_dashboard:\n"
             "    dash_title: New\n"
-            "    host: https://grafana.example\n",
+            "    grafana_url: https://grafana.example\n",
             raw=True,
         )
 
@@ -61,6 +61,46 @@ class TestGrafanaConfigLoading(unittest.TestCase):
 
         self.assertEqual(len(configs), 1)
         self.assertEqual(configs[0].name, "new_dashboard")
+
+    def test_grafana_url_with_subpath_is_normalized(self):
+        config = GrafanaConfigDownloader(
+            "demo",
+            {"dash_title": "Dashboard", "grafana_url": "https://grafana.example/grafana/"},
+        )
+
+        self.assertEqual(config.grafana_origin, "https://grafana.example")
+        self.assertEqual(config.grafana_app_path, "/grafana")
+        self.assertEqual(config.grafana_base_url, "https://grafana.example/grafana")
+
+    def test_auth_url_loads_without_changing_grafana_base_url(self):
+        config = GrafanaConfigDownloader(
+            "demo",
+            {
+                "dash_title": "Dashboard",
+                "grafana_url": "https://grafana.example/grafana",
+                "auth_url": "https://auth.example/bootstrap?target=grafana",
+            },
+        )
+
+        self.assertEqual(config.auth_url, "https://auth.example/bootstrap?target=grafana")
+        self.assertEqual(config.grafana_base_url, "https://grafana.example/grafana")
+
+    def test_missing_grafana_url_is_rejected(self):
+        with self.assertRaisesRegex(ConfigurationError, "grafana_url"):
+            GrafanaConfigDownloader("demo", {"dash_title": "Dashboard"})
+
+    def test_removed_grafana_url_keys_are_rejected(self):
+        for removed_key in ("host", "nginx_prefix", "login_url"):
+            with self.subTest(removed_key=removed_key):
+                config = {"dash_title": "Dashboard", "grafana_url": "https://grafana.example", removed_key: "legacy"}
+                with self.assertRaisesRegex(ConfigurationError, removed_key):
+                    GrafanaConfigDownloader("demo", config)
+
+    def test_invalid_grafana_url_shape_is_rejected(self):
+        for value in ("grafana.example", "https://grafana.example/grafana?orgId=1", "https://grafana.example/#/d/x"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ConfigurationError, "grafana_url"):
+                    GrafanaConfigDownloader("demo", {"dash_title": "Dashboard", "grafana_url": value})
 
     def test_rejects_settings_without_dashboards(self):
         config_path = self.write_config(
@@ -76,7 +116,7 @@ class TestGrafanaConfigLoading(unittest.TestCase):
         config_path = self.write_config(
             "dashboard:\n"
             "  dash_title: Dashboard\n"
-            "  host: https://grafana.example\n"
+            "  grafana_url: https://grafana.example\n"
         )
 
         config = GrafanaManager.load_grafana_config(config_path)[0]
@@ -102,7 +142,7 @@ class TestGrafanaConfigLoading(unittest.TestCase):
         config_path = self.write_config(
             "dashboard:\n"
             "  dash_title: Dashboard\n"
-            "  host: https://grafana.example\n"
+            "  grafana_url: https://grafana.example\n"
             "  playwright_browser: chromium\n"
             "  playwright_browser_channel: chrome\n"
             "  playwright_browser_executable_path: C:/Browsers/chrome.exe\n"
@@ -118,7 +158,7 @@ class TestGrafanaConfigLoading(unittest.TestCase):
         config_path = self.write_config(
             "dashboard:\n"
             "  dash_title: Dashboard\n"
-            "  host: https://grafana.example\n"
+            "  grafana_url: https://grafana.example\n"
             "  screenshot_readiness:\n"
             "    network_idle_ms: 500\n"
             "    no_network_grace_ms: 250\n"
@@ -139,7 +179,7 @@ class TestGrafanaConfigLoading(unittest.TestCase):
         config_path = self.write_config(
             "dashboard:\n"
             "  dash_title: Dashboard\n"
-            "  host: https://grafana.example\n"
+            "  grafana_url: https://grafana.example\n"
             "  download_collapsed_rows: true\n"
         )
 
@@ -152,7 +192,7 @@ class TestGrafanaConfigLoading(unittest.TestCase):
         config_path = self.write_config(
             "dashboard:\n"
             "  dash_title: Dashboard\n"
-            "  host: https://grafana.example\n"
+            "  grafana_url: https://grafana.example\n"
             "  download_collapse_panels: true\n"
         )
 
@@ -165,7 +205,7 @@ class TestGrafanaConfigLoading(unittest.TestCase):
         config_path = self.write_config(
             "dashboard:\n"
             "  dash_title: Dashboard\n"
-            "  host: https://grafana.example\n"
+            "  grafana_url: https://grafana.example\n"
             "  download_collapsed_rows: false\n"
             "  download_collapse_panels: true\n"
         )
@@ -180,7 +220,7 @@ class TestGrafanaConfigLoading(unittest.TestCase):
         config_path = self.write_config(
             "dashboard:\n"
             "  dash_title: Dashboard\n"
-            "  host: https://grafana.example\n"
+            "  grafana_url: https://grafana.example\n"
             "  download_collapsed_rows: true\n"
             "  download_collapse_panels: false\n"
         )
@@ -194,7 +234,7 @@ class TestGrafanaConfigLoading(unittest.TestCase):
         config_path = self.write_config(
             "dashboard:\n"
             "  dash_title: Dashboard\n"
-            "  host: https://grafana.example\n"
+            "  grafana_url: https://grafana.example\n"
             "  download_hidden_panels: true\n"
         )
 
@@ -202,7 +242,7 @@ class TestGrafanaConfigLoading(unittest.TestCase):
             GrafanaManager.load_grafana_config(config_path)
 
     def test_collapsed_row_validation_preserves_attributes_messages_and_logs(self):
-        hidden_config = {"dash_title": "Dashboard", "host": "https://grafana.example", "download_hidden_panels": True}
+        hidden_config = {"dash_title": "Dashboard", "grafana_url": "https://grafana.example", "download_hidden_panels": True}
 
         with self.assertRaises(ConfigurationError) as context:
             GrafanaConfigDownloader("demo", hidden_config)
@@ -213,7 +253,7 @@ class TestGrafanaConfigLoading(unittest.TestCase):
             "suggested fix: remove this key and use download_collapsed_rows",
         )
 
-        alias_config = {"dash_title": "Dashboard", "host": "https://grafana.example", "download_collapse_panels": True}
+        alias_config = {"dash_title": "Dashboard", "grafana_url": "https://grafana.example", "download_collapse_panels": True}
         with self.assertLogs("grafconflux.grafana", level="INFO") as logs:
             config = GrafanaConfigDownloader("demo", alias_config)
 
@@ -222,7 +262,7 @@ class TestGrafanaConfigLoading(unittest.TestCase):
         self.assertIn("Using legacy config key download_collapse_panels=True", "\n".join(logs.output))
 
     def test_config_validation_groups_preserve_constructor_visible_defaults(self):
-        config = GrafanaConfigDownloader("demo", {"dash_title": "Dashboard", "host": "https://grafana.example"})
+        config = GrafanaConfigDownloader("demo", {"dash_title": "Dashboard", "grafana_url": "https://grafana.example"})
 
         self.assertFalse(config.download_collapsed_rows)
         self.assertFalse(config.download_collapse_panels)
@@ -239,7 +279,7 @@ class TestGrafanaConfigLoading(unittest.TestCase):
         config_path = self.write_config(
             "dashboard:\n"
             "  dash_title: Dashboard\n"
-            "  host: https://grafana.example\n"
+            "  grafana_url: https://grafana.example\n"
             "  panel_filtering:\n"
             "    mode: selected_only\n"
         )
@@ -251,7 +291,7 @@ class TestGrafanaConfigLoading(unittest.TestCase):
         config_path = self.write_config(
             "dashboard:\n"
             "  dash_title: Dashboard\n"
-            "  host: https://grafana.example\n"
+            "  grafana_url: https://grafana.example\n"
             "  panel_filtering:\n"
             "    exclude_panels:\n"
             "      title_regex:\n"
@@ -265,7 +305,7 @@ class TestGrafanaConfigLoading(unittest.TestCase):
         config_path = self.write_config(
             "dashboard:\n"
             "  dash_title: Dashboard\n"
-            "  host: https://grafana.example\n"
+            "  grafana_url: https://grafana.example\n"
             "  panel_filtering:\n"
             "    include_panels:\n"
             "      titles:\n"
@@ -280,7 +320,7 @@ class TestGrafanaConfigLoading(unittest.TestCase):
         config_path = self.write_config(
             "dashboard:\n"
             "  dash_title: Dashboard\n"
-            "  host: https://grafana.example\n"
+            "  grafana_url: https://grafana.example\n"
             "  panel_filtering:\n"
             "    mode: include_only_selected\n"
             "    exclude_panels:\n"
@@ -294,7 +334,7 @@ class TestGrafanaConfigLoading(unittest.TestCase):
         config_path = self.write_config(
             "dashboard:\n"
             "  dash_title: Dashboard\n"
-            "  host: https://grafana.example\n"
+            "  grafana_url: https://grafana.example\n"
             "  panel_filtering:\n"
             "    mode: include_only_selected\n"
             "    include_rows:\n"
@@ -309,7 +349,7 @@ class TestGrafanaConfigLoading(unittest.TestCase):
         config_path = self.write_config(
             "dashboard:\n"
             "  dash_title: Dashboard\n"
-            "  host: https://grafana.example\n"
+            "  grafana_url: https://grafana.example\n"
             "  panel_filtering:\n"
             "    mode: include_only_selected\n"
             "    include_panels:\n"
@@ -330,7 +370,7 @@ class TestGrafanaConfigLoading(unittest.TestCase):
         config_path = self.write_config(
             "dashboard:\n"
             "  dash_title: Dashboard\n"
-            "  host: https://grafana.example\n"
+            "  grafana_url: https://grafana.example\n"
             "  panel_filtering:\n"
             "    exclude_panels:\n"
             "      titles:\n"
@@ -345,7 +385,7 @@ class TestGrafanaConfigLoading(unittest.TestCase):
         config_path = self.write_config(
             "dashboard:\n"
             "  dash_title: Dashboard\n"
-            "  host: https://grafana.example\n"
+            "  grafana_url: https://grafana.example\n"
             "  rename_panels:\n"
             "    - id: 20\n"
             "      rename: X\n"
@@ -371,7 +411,7 @@ class TestGrafanaConfigLoading(unittest.TestCase):
                 config_path = self.write_config(
                     "dashboard:\n"
                     "  dash_title: Dashboard\n"
-                    "  host: https://grafana.example\n"
+                    "  grafana_url: https://grafana.example\n"
                     f"{body}"
                 )
 
@@ -382,7 +422,7 @@ class TestGrafanaConfigLoading(unittest.TestCase):
         config_path = self.write_config(
             "dashboard:\n"
             "  dash_title: Dashboard\n"
-            "  host: https://grafana.example\n"
+            "  grafana_url: https://grafana.example\n"
             "  snapshot_store_dashboard_json: false\n"
             "  snapshot_expires: 0\n"
         )
@@ -398,7 +438,7 @@ class TestGrafanaConfigLoading(unittest.TestCase):
         config_path = self.write_config(
             "dashboard:\n"
             "  dash_title: Dashboard\n"
-            "  host: https://grafana.example\n"
+            "  grafana_url: https://grafana.example\n"
             "  backup_dashboard_links:\n"
             "    - https://backup.example/d/demo?orgId=1\n"
             "    - https://backup2.example/d/demo\n"
@@ -418,7 +458,7 @@ class TestGrafanaConfigLoading(unittest.TestCase):
         config_path = self.write_config(
             "dashboard:\n"
             "  dash_title: Dashboard\n"
-            "  host: https://grafana.example\n"
+            "  grafana_url: https://grafana.example\n"
             "  backup_dashboard_links:\n"
             "    - https://backup.example/d/demo\n"
             "    - 17\n"
@@ -431,7 +471,7 @@ class TestGrafanaConfigLoading(unittest.TestCase):
         config_path = self.write_config(
             "dashboard:\n"
             "  dash_title: Dashboard\n"
-            "  host: https://grafana.example\n"
+            "  grafana_url: https://grafana.example\n"
             "  backup_dashboard_links: https://backup.example/d/demo\n"
         )
 

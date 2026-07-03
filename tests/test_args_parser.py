@@ -11,7 +11,7 @@ from grafconflux.args_parser import ArgsParser
 class TestArgsParser(unittest.TestCase):
     def create_config(
         self,
-        content: str = "dashboards:\n  demo:\n    dash_title: Demo\n    host: https://grafana.example\n",
+        content: str = "dashboards:\n  demo:\n    dash_title: Demo\n    grafana_url: https://grafana.example\n",
         *,
         raw: bool = False,
     ):
@@ -24,7 +24,7 @@ class TestArgsParser(unittest.TestCase):
                 "dashboards:\n"
                 "  demo:\n"
                 "    dash_title: Demo\n"
-                "    host: https://grafana.example\n"
+                "    grafana_url: https://grafana.example\n"
             )
         with open(config_path, "w", encoding="utf-8") as config_file:
             config_file.write(config_text)
@@ -389,7 +389,7 @@ class TestArgsParser(unittest.TestCase):
             )
 
     def test_rejects_legacy_yaml_without_settings(self):
-        config_path = self.create_config("dashboard:\n  host: https://grafana.example\n")
+        config_path = self.create_config("dashboard:\n  grafana_url: https://grafana.example\n")
 
         with self.assertRaisesRegex(ValueError, "Legacy top-level dashboard YAML format"):
             self.parse_args(

@@ -16,7 +16,7 @@ class TestTimeInputFiles(unittest.TestCase):
                 "dashboards:\n"
                 "  demo:\n"
                 "    dash_title: Demo\n"
-                "    host: https://grafana.example\n"
+                "    grafana_url: https://grafana.example\n"
             )
         return config_path
 

@@ -27,7 +27,7 @@ class TestGrafanaDashboardLookupConfig(unittest.TestCase):
     def test_config_loading_accepts_dashboard_uid(self) -> None:
         config_path = self.write_config(
             "dash_by_uid:\n"
-            "  host: https://grafana.example\n"
+            "  grafana_url: https://grafana.example\n"
             "  dashboard_uid: uid-123\n"
         )
 
@@ -39,7 +39,7 @@ class TestGrafanaDashboardLookupConfig(unittest.TestCase):
     def test_config_loading_accepts_folder_uid(self) -> None:
         config_path = self.write_config(
             "dash_by_title:\n"
-            "  host: https://grafana.example\n"
+            "  grafana_url: https://grafana.example\n"
             "  dash_title: Payments\n"
             "  folder_uid: folder-123\n"
         )
@@ -52,7 +52,7 @@ class TestGrafanaDashboardLookupConfig(unittest.TestCase):
     def test_title_only_dashboard_config_remains_valid(self) -> None:
         config_path = self.write_config(
             "legacy_dashboard:\n"
-            "  host: https://grafana.example\n"
+            "  grafana_url: https://grafana.example\n"
             "  dash_title: Legacy\n"
         )
 
@@ -64,7 +64,7 @@ class TestGrafanaDashboardLookupConfig(unittest.TestCase):
     def test_dashboard_uid_and_title_are_configuration_error(self) -> None:
         config_path = self.write_config(
             "bad_dashboard:\n"
-            "  host: https://grafana.example\n"
+            "  grafana_url: https://grafana.example\n"
             "  dashboard_uid: uid-123\n"
             "  dash_title: Payments\n"
         )
@@ -82,7 +82,7 @@ class TestGrafanaDashboardLookupConfig(unittest.TestCase):
             with self.subTest(config_body=config_body):
                 config_path = self.write_config(
                     "bad_dashboard:\n"
-                    "  host: https://grafana.example\n"
+                    "  grafana_url: https://grafana.example\n"
                     f"{config_body}"
                 )
                 with self.assertRaisesRegex(ValueError, "folder.*dash_title"):
@@ -92,7 +92,7 @@ class TestGrafanaDashboardLookupConfig(unittest.TestCase):
 class TestGrafanaDashboardLookup(unittest.TestCase):
     def create_manager(self, **overrides) -> GrafanaManager:
         config = {
-            "host": "https://grafana.example",
+            "grafana_url": "https://grafana.example",
             "dash_title": "Payments",
         }
         config.update(overrides)
@@ -122,6 +122,25 @@ class TestGrafanaDashboardLookup(unittest.TestCase):
         uid, url = manager.get_dashboard_uid()
 
         self.assertEqual((uid, url), ("uid-123", "/d/uid-123/payments"))
+
+    def test_dashboard_url_from_api_is_normalized_to_app_route(self) -> None:
+        cases = [
+            "/d/uid-123/payments",
+            "/grafana/d/uid-123/payments",
+            "https://grafana.example/grafana/d/uid-123/payments",
+        ]
+        for api_url in cases:
+            with self.subTest(api_url=api_url):
+                manager = self.create_manager(
+                    grafana_url="https://grafana.example/grafana",
+                    dashboard_uid="uid-123",
+                    dash_title=None,
+                )
+                self.mock_search(manager, 200, [{"uid": "uid-123", "title": "Payments", "url": api_url}])
+
+                _, url = manager.get_dashboard_uid()
+
+                self.assertEqual(url, "/d/uid-123/payments")
 
     def test_uid_lookup_raises_when_not_found(self) -> None:
         manager = self.create_manager(dashboard_uid="uid-123", dash_title=None)
@@ -233,7 +252,7 @@ class TestGrafanaDashboardLookup(unittest.TestCase):
 
 class TestGrafanaLookupIntegration(unittest.TestCase):
     def create_manager(self, **overrides) -> GrafanaManager:
-        config = {"host": "https://grafana.example", "dash_title": "Payments"}
+        config = {"grafana_url": "https://grafana.example", "dash_title": "Payments"}
         config.update(overrides)
         return GrafanaManager(GrafanaConfigDownloader("demo", config))
 
@@ -262,8 +281,8 @@ class TestGrafanaLookupIntegration(unittest.TestCase):
 
         manager.get_panels.assert_not_called()
 
-    def test_successful_lookup_sets_dashboard_identity_and_links_use_search_url(self) -> None:
-        manager = self.create_manager()
+    def test_successful_lookup_links_use_grafana_base_url_without_double_subpath(self) -> None:
+        manager = self.create_manager(grafana_url="https://grafana.example/grafana")
         manager.get_dashboard_uid = Mock(return_value=("uid-1", "/d/uid-1/payments-from-search"))
         manager.get_panels = Mock(return_value=[])
 
@@ -272,17 +291,19 @@ class TestGrafanaLookupIntegration(unittest.TestCase):
 
         self.assertEqual(manager.dashboard_uid, "uid-1")
         self.assertEqual(manager.dashboard_url, "/d/uid-1/payments-from-search")
-        self.assertTrue(manager.config.full_links[0].startswith("https://grafana.example/d/uid-1/payments-from-search"))
+        self.assertTrue(manager.config.full_links[0].startswith("https://grafana.example/grafana/d/uid-1/payments-from-search"))
+        self.assertNotIn("/grafana/grafana/", manager.config.full_links[0])
 
-    def test_nginx_prefix_applies_to_search_endpoint(self) -> None:
-        manager = self.create_manager(nginx_prefix="/grafana")
+    def test_grafana_url_subpath_applies_to_search_endpoint(self) -> None:
+        manager = self.create_manager(grafana_url="https://grafana.example/grafana")
         response = Mock(status_code=200)
-        response.json = Mock(return_value=[{"uid": "uid-1", "title": "Payments", "url": "/d/uid-1"}])
+        response.json = Mock(return_value=[{"uid": "uid-1", "title": "Payments", "url": "/grafana/d/uid-1"}])
         manager.session.get = Mock(return_value=response)
 
-        manager.get_dashboard_uid()
+        _, dashboard_url = manager.get_dashboard_uid()
 
         self.assertEqual(manager.session.get.call_args.args[0], "https://grafana.example/grafana/api/search")
+        self.assertEqual(dashboard_url, "/d/uid-1")
 
     def test_upload_only_run_does_not_load_grafana_config_or_lookup(self) -> None:
         args = SimpleNamespace(
@@ -361,7 +382,7 @@ class TestGrafanaLookupCliApiSmoke(unittest.TestCase):
             "dashboards:\n"
             "  demo:\n"
             "    dash_title: Demo\n"
-            "    host: https://grafana.example\n"
+            "    grafana_url: https://grafana.example\n"
         )
 
         from grafconflux.args_parser import ArgsParser
@@ -383,7 +404,7 @@ class TestGrafanaLookupCliApiSmoke(unittest.TestCase):
             "settings: {}\n"
             "dashboards:\n"
             "  uid_dashboard:\n"
-            "    host: https://grafana.example\n"
+            "    grafana_url: https://grafana.example\n"
             "    dashboard_uid: uid-123\n"
         )
 

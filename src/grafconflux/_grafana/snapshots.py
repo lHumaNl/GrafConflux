@@ -13,9 +13,8 @@ CSS_SELECTOR = 'css'
 XPATH = 'xpath'
 
 
-def snapshot_api_url(host: str, nginx_prefix: str, path: str) -> str:
-    prefix = nginx_prefix if nginx_prefix else ''
-    return f'{host}{prefix}{path}'
+def snapshot_api_url(grafana_base_url: str, path: str) -> str:
+    return f'{grafana_base_url}{path}'
 
 
 def snapshot_name(dashboard_name: str, timestamp: GrafanaTimeDownloader) -> str:
@@ -79,29 +78,31 @@ def _response_body(response: Any) -> bytes | str:
     return body or b''
 
 
-def snapshot_url_from_payload(payload: Dict[str, Any], host: str) -> Optional[str]:
+def snapshot_url_from_payload(payload: Dict[str, Any], grafana_base_url: str) -> Optional[str]:
     for key in ('url', 'externalUrl', 'snapshotUrl'):
-        snapshot_link = normalize_snapshot_url(str(payload.get(key) or ''), host)
+        snapshot_link = normalize_snapshot_url(str(payload.get(key) or ''), grafana_base_url)
         if snapshot_link:
             return snapshot_link
     snapshot_key = payload.get('key')
-    return snapshot_url_from_key(str(snapshot_key), host) if snapshot_key else None
+    return snapshot_url_from_key(str(snapshot_key), grafana_base_url) if snapshot_key else None
 
 
-def normalize_snapshot_url(snapshot_link: str, host: str) -> Optional[str]:
+def normalize_snapshot_url(snapshot_link: str, grafana_base_url: str) -> Optional[str]:
     if '/dashboard/snapshot/' not in snapshot_link:
         return None
     if snapshot_link.startswith('http'):
-        return snapshot_link
-    return f'{host}{snapshot_link}' if snapshot_link.startswith('/') else None
+        return _normalize_absolute_snapshot_url(snapshot_link, grafana_base_url)
+    if not snapshot_link.startswith('/'):
+        return None
+    return f'{grafana_base_url}{_snapshot_app_route(snapshot_link, grafana_base_url)}'
 
 
-def snapshot_url_from_key(snapshot_key: str, host: str) -> str:
-    return f'{host}/dashboard/snapshot/{snapshot_key}'
+def snapshot_url_from_key(snapshot_key: str, grafana_base_url: str) -> str:
+    return f'{grafana_base_url}/dashboard/snapshot/{snapshot_key}'
 
 
-def snapshot_url_from_lookup_response(response: Any, snapshot_name_value: str, host: str,
-                                      dashboard_name: str) -> Optional[str]:
+def snapshot_url_from_lookup_response(response: Any, snapshot_name_value: str, grafana_base_url: str,
+                                       dashboard_name: str) -> Optional[str]:
     if response.status_code != 200:
         logger.warning(f'Snapshot lookup failed dashboard={dashboard_name} status={response.status_code}')
         return None
@@ -122,7 +123,22 @@ def snapshot_url_from_lookup_response(response: Any, snapshot_name_value: str, h
             f'Snapshot lookup did not find unique match dashboard={dashboard_name} matches={len(matches)}'
         )
         return None
-    return snapshot_url_from_payload(matches[0], host)
+    return snapshot_url_from_payload(matches[0], grafana_base_url)
+
+
+def _normalize_absolute_snapshot_url(snapshot_link: str, grafana_base_url: str) -> Optional[str]:
+    parsed = urlparse(snapshot_link)
+    base = urlparse(grafana_base_url)
+    if (parsed.scheme, parsed.netloc) != (base.scheme, base.netloc):
+        return snapshot_link
+    return f'{grafana_base_url}{_snapshot_app_route(parsed.path, grafana_base_url)}'
+
+
+def _snapshot_app_route(path: str, grafana_base_url: str) -> str:
+    app_path = urlparse(grafana_base_url).path.rstrip('/')
+    if app_path and (path == app_path or path.startswith(f'{app_path}/')):
+        return path[len(app_path):] or '/'
+    return path
 
 
 class SnapshotUiRunner:
