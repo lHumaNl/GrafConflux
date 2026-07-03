@@ -146,7 +146,7 @@ class GrafanaBrowserSession:
         ]
         self._warn_secure_cookies_on_http(parsed_host, matching_cookies)
         cookies = [
-            self._playwright_cookie(cookie, self.config.grafana_base_url, self.config.grafana_app_path)
+            self._playwright_cookie(cookie, self.config.grafana_base_url, self.config.grafana_app_path, host)
             for cookie in matching_cookies
         ]
         if self.require_cookie_domain and not cookies:
@@ -159,12 +159,15 @@ class GrafanaBrowserSession:
         cookie: Cookie,
         grafana_base_url: str,
         grafana_app_path: str = '',
+        host: Optional[str] = None,
     ) -> Dict[str, Any]:
         result: Dict[str, Any] = {
             'name': cookie.name,
             'value': cookie.value,
         }
-        if cookie.domain_specified:
+        if cls._should_use_url_scoped_cookie(cookie, host):
+            result['url'] = cls._host_only_cookie_url(grafana_base_url, cookie.path, grafana_app_path)
+        elif cookie.domain_specified:
             result['domain'] = cookie.domain
             result['path'] = cls._cookie_path(cookie.path, grafana_app_path)
         else:
@@ -212,7 +215,25 @@ class GrafanaBrowserSession:
         if not domain:
             return True
         normalized_domain = domain.lstrip('.')
+        if GrafanaBrowserSession._single_label_host_local_match(normalized_domain, host):
+            return True
         return host == normalized_domain or host.endswith(f'.{normalized_domain}')
+
+    @staticmethod
+    def _should_use_url_scoped_cookie(cookie: Cookie, host: Optional[str]) -> bool:
+        if not cookie.domain_specified:
+            return True
+        if host is None or '.' in host:
+            return False
+        normalized_domain = cookie.domain.lstrip('.')
+        return (
+            normalized_domain == host
+            or GrafanaBrowserSession._single_label_host_local_match(normalized_domain, host)
+        )
+
+    @staticmethod
+    def _single_label_host_local_match(domain: str, host: str) -> bool:
+        return '.' not in host and domain == f'{host}.local'
 
     def authenticate_browser(self, browser=None, cookies: Optional[dict] = None) -> None:
         if browser is None or browser is self:

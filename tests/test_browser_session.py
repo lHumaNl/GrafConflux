@@ -127,6 +127,49 @@ class TestGrafanaBrowserSession(unittest.TestCase):
 
         self.assertEqual(cookies[0]["path"], "/grafana")
 
+    def test_single_label_host_local_cookies_are_exported_as_url_scoped(self):
+        session = Mock()
+        session.headers = {}
+        session.cookies = self.single_label_cookie_jar()
+
+        cookies = GrafanaBrowserSession(
+            self.create_config(grafana_url="https://lt-ekpmon1/grafana"),
+            session,
+        ).playwright_cookies()
+
+        self.assertEqual(
+            {cookie["name"] for cookie in cookies},
+            {"grafana_session", "grafana_session_expiry"},
+        )
+        for cookie in cookies:
+            self.assertEqual(cookie["url"], "https://lt-ekpmon1/grafana")
+            self.assertNotIn("domain", cookie)
+            self.assertNotIn("path", cookie)
+            self.assertEqual(cookie["sameSite"], "Lax")
+            self.assertTrue(cookie["httpOnly"])
+
+    def test_single_label_domain_cookie_is_url_scoped_when_host_matches(self):
+        session = Mock()
+        session.headers = {}
+        session.cookies = requests.cookies.RequestsCookieJar()
+        session.cookies.set(
+            "grafana_session",
+            "cookie",
+            domain="lt-ekpmon1",
+            path="/grafana",
+            secure=True,
+            rest={"SameSite": "Lax", "HttpOnly": None},
+        )
+
+        cookies = GrafanaBrowserSession(
+            self.create_config(grafana_url="https://lt-ekpmon1/grafana"),
+            session,
+        ).playwright_cookies()
+
+        self.assertEqual(cookies[0]["url"], "https://lt-ekpmon1/grafana")
+        self.assertNotIn("domain", cookies[0])
+        self.assertNotIn("path", cookies[0])
+
     def test_secure_cookie_on_http_origin_logs_warning(self):
         session = Mock()
         session.headers = {}
@@ -174,6 +217,19 @@ class TestGrafanaBrowserSession(unittest.TestCase):
             0, "host_only", "cookie", None, False, "", False, False,
             path, bool(path), False, None, True, None, None, {}, False,
         )
+
+    @staticmethod
+    def single_label_cookie_jar():
+        jar = requests.cookies.RequestsCookieJar()
+        cookie_args = {
+            "domain": "lt-ekpmon1.local",
+            "path": "/grafana",
+            "secure": True,
+            "rest": {"SameSite": "Lax", "HttpOnly": None},
+        }
+        jar.set("grafana_session", "cookie", **cookie_args)
+        jar.set("grafana_session_expiry", "cookie", **cookie_args)
+        return jar
 
 
 if __name__ == "__main__":
