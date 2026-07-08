@@ -30,6 +30,7 @@ from grafconflux._confluence.content import (
     build_confluence_storage_content,
     build_parent_include_content,
 )
+from grafconflux._confluence.links import build_confluence_page_url
 # Keep helper imports from grafconflux.confluence stable after extraction.
 from grafconflux._confluence.uploads import (
     RETRY_AFTER_HEADER,
@@ -86,6 +87,7 @@ class ConfluenceManager:
         self.retry_max_delay = retry_max_delay
         self.retry_jitter = retry_jitter
         self.continue_on_error = continue_on_error
+        self.last_parent_page_url = None
         self._validate_retry_and_rate_options()
         self.upload_interval = _effective_upload_interval(upload_delay, upload_rate_per_second)
         self._upload_clients = threading.local()
@@ -274,6 +276,11 @@ class ConfluenceManager:
         )
 
         logger.info('Confluence page content updated.')
+        return self.page_url(self.page_id, page)
+
+    def page_url(self, page_id: int, page: dict | None = None) -> str:
+        """Return a stable URL for a Confluence page."""
+        return build_confluence_page_url(self.wiki_url, page_id, page)
 
     def get_parent_page(self, parent_page_id: int) -> dict:
         """Return a parent page with storage body and space metadata."""
@@ -287,8 +294,14 @@ class ConfluenceManager:
         child_page = self.find_child_page(parent_page_id, title)
         if child_page is None:
             child_page = self._create_child_page(parent_page_id, space_key, title)
-        args.confluence_page_id = int(child_page['id'])
-        return ChildPageInclude(title=title, space_key=space_key)
+        page_id = int(child_page['id'])
+        args.confluence_page_id = page_id
+        return ChildPageInclude(
+            title=title,
+            space_key=space_key,
+            page_id=page_id,
+            page_url=self.page_url(page_id, child_page),
+        )
 
     def find_child_page(self, parent_page_id: int, title: str) -> dict | None:
         """Find a direct child page by title."""
@@ -304,9 +317,11 @@ class ConfluenceManager:
         content = build_parent_include_content(child_pages)
         new_body = apply_graphs_placeholder_if_present(body, content)
         if new_body is None:
+            self.last_parent_page_url = None
             logger.info('Parent page marker not found; parent page was not updated.')
             return False
         self.confluence.update_page(page_id=parent_page_id, title=parent_page['title'], body=new_body)
+        self.last_parent_page_url = self.page_url(parent_page_id, parent_page)
         logger.info('Parent Confluence page include block updated.')
         return True
 

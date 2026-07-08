@@ -16,11 +16,13 @@ _ensure_local_src_on_path()
 
 from grafconflux.runner import logger, main, run_cli  # noqa: E402
 from grafconflux.orchestration import (  # noqa: E402
+    ConfluencePageLink,
     ConfluenceManager,
     GrafanaConfigDownloader,
     GrafanaConfigUploader,
     GrafanaManager,
     RunArgs,
+    RunResult,
     get_yaml_files,
     process_grafana_dashboard,
     run,
@@ -31,11 +33,13 @@ from grafconflux.args_parser import ArgsParser  # noqa: E402
 
 __all__ = [
     "ArgsParser",
+    "ConfluencePageLink",
     "ConfluenceManager",
     "GrafanaConfigDownloader",
     "GrafanaConfigUploader",
     "GrafanaManager",
     "RunArgs",
+    "RunResult",
     "get_yaml_files",
     "logger",
     "main",

@@ -1,9 +1,21 @@
 import logging
+import re
 import time
 from typing import Any, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, urlparse
 
+from grafconflux._shared.grafana_models import sanitize_url_for_log
+
 logger = logging.getLogger('grafconflux.grafana')
+URL_IN_TEXT_RE = re.compile(r'https?://\S+')
+
+
+def _safe_exception_message(error: Exception) -> str:
+    message = str(error)
+    if not message:
+        return ''
+    return URL_IN_TEXT_RE.sub(lambda match: sanitize_url_for_log(match.group(0).rstrip('.,;:')),
+                              message)
 
 UNAUTHORIZED_STATUSES = {401, 403}
 RELEVANT_GRAFANA_API_FRAGMENTS: Tuple[str, ...] = (
@@ -142,7 +154,7 @@ class PlaywrightPanelScreenshotRunner:
         data_sources = self.manager._GrafanaManager__get_panel_data_sources(final_url)
         fullscreen_state = self._fullscreen_state()
         if fullscreen_state is False:
-            self._try_route(browser, task, final_url, file_path, data_sources, True, False)
+            self._take_required_route(browser, task, final_url, file_path, data_sources, False)
             return
         if self._try_route(
             browser,
@@ -155,7 +167,13 @@ class PlaywrightPanelScreenshotRunner:
         ):
             return
         self._recover_browser_for_fallback(browser, task)
-        self._try_route(browser, task, final_url, file_path, data_sources, True, False)
+        self._take_required_route(browser, task, final_url, file_path, data_sources, False)
+
+    def _take_required_route(self, browser: Any, task: Any, route_url: str, file_path: str,
+                             data_sources: List[str], fullscreen_state: Optional[bool]) -> None:
+        if self._try_route(browser, task, route_url, file_path, data_sources, True, fullscreen_state):
+            return
+        raise RuntimeError(f'Failed to take screenshot for panel_id={task.panel.panel_id}')
 
     def _try_route(self, browser: Any, task: Any, route_url: str, file_path: str,
                    data_sources: List[str], log_errors: bool, fullscreen_state: Optional[bool]) -> bool:
@@ -174,7 +192,10 @@ class PlaywrightPanelScreenshotRunner:
             return True
         except Exception as error:
             if log_errors:
-                logger.error(f'Failed to take screenshot: {error}')
+                logger.error(
+                    f'Failed to take screenshot panel_id={task.panel.panel_id} '
+                    f'error_type={type(error).__name__} error={_safe_exception_message(error)}'
+                )
             return False
 
     def _open_validate_and_settle(self, browser: Any, task: Any, route_url: str, data_sources: List[str]) -> Optional[int]:
@@ -187,22 +208,32 @@ class PlaywrightPanelScreenshotRunner:
                 return status_code
             if not self._loaded_expected_panel(browser, task.panel.panel_id):
                 raise RuntimeError(
-                    f'Browser did not load expected panel_id={task.panel.panel_id}; current_url={browser.current_url}'
+                    f'Browser did not load expected panel_id={task.panel.panel_id}; '
+                    f'current_url={sanitize_url_for_log(browser.current_url)}'
                 )
             settle_status = self._wait_for_network_settle(browser, collector, data_sources)
             return settle_status or status_code
 
     def _open_route(self, browser: Any, task: Any, route_url: str) -> Optional[int]:
-        logger.info(f'Opening panel for screenshot panel_id={task.panel.panel_id} url={route_url}')
+        logger.info(f'Opening panel for screenshot panel_id={task.panel.panel_id} url={sanitize_url_for_log(route_url)}')
         try:
             response = browser.get(route_url)
         except Exception as error:
-            logger.warning(f'Panel navigation failed panel_id={task.panel.panel_id}: {error}')
+            logger.warning(
+                f'Panel navigation failed panel_id={task.panel.panel_id} '
+                f'url={sanitize_url_for_log(route_url)} error_type={type(error).__name__} '
+                f'error={_safe_exception_message(error)}'
+            )
             raise RuntimeError(
-                f'Panel navigation failed panel_id={task.panel.panel_id} url={route_url}: {error}'
+                f'Panel navigation failed panel_id={task.panel.panel_id} '
+                f'url={sanitize_url_for_log(route_url)} error_type={type(error).__name__} '
+                f'error={_safe_exception_message(error)}'
             ) from error
         status_code = response_status(response)
-        logger.info(f'Panel navigation response panel_id={task.panel.panel_id} status={status_code} url={route_url}')
+        logger.info(
+            f'Panel navigation response panel_id={task.panel.panel_id} '
+            f'status={status_code} url={sanitize_url_for_log(route_url)}'
+        )
         return status_code
 
     @staticmethod
@@ -215,7 +246,11 @@ class PlaywrightPanelScreenshotRunner:
             logger.warning(f'Resetting browser context before panel fallback panel_id={task.panel.panel_id}')
             refresh()
         except Exception as error:
-            logger.warning(f'Browser context reset before panel fallback failed panel_id={task.panel.panel_id}: {error}')
+            logger.warning(
+                f'Browser context reset before panel fallback failed '
+                f'panel_id={task.panel.panel_id} error_type={type(error).__name__} '
+                f'error={_safe_exception_message(error)}'
+            )
 
     def _wait_for_network_settle(self, browser: Any, collector: PlaywrightResponseCollector,
                                  fragments: List[str]) -> Optional[int]:
@@ -305,9 +340,10 @@ class PlaywrightPanelScreenshotRunner:
 
     @staticmethod
     def _route_error_message(route_url: str, status_code: Optional[int]) -> str:
+        safe_url = sanitize_url_for_log(route_url)
         if status_code is None:
-            return f'Request to {route_url} completed without an HTTP response'
-        return f'Request to {route_url} returned HTTP {status_code}'
+            return f'Request to {safe_url} completed without an HTTP response'
+        return f'Request to {safe_url} returned HTTP {status_code}'
 
 
 def response_status(response: Any) -> Optional[int]:

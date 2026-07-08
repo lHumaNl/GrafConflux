@@ -7,7 +7,7 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from lxml import html
@@ -68,6 +68,7 @@ from grafconflux._shared.grafana_models import (
     PanelRenderTask,
     _SelectorConfig,
     normalize_grafana_dashboard_route,
+    sanitize_url_for_log,
 )
 from grafconflux._shared.display import normalize_grafana_display_value
 from grafconflux._grafana.panel_selection import (
@@ -98,6 +99,11 @@ from grafconflux._grafana.no_data import (
     interpret_no_data_response,
 )
 from grafconflux._grafana.repeating import RepeatingPlanner, is_unresolved_repeating_rule
+from grafconflux._grafana.composites import generate_composites
+from grafconflux._grafana.credentials import resolve_dashboard_configs
+from grafconflux._grafana.variants import append_variant_tasks
+from grafconflux._grafana.matrix import append_matrix_tasks, build_matrix_dashboard_links
+from grafconflux._orchestration.manifest import assign_artifact_order, dashboard_manifest_metadata
 from grafconflux._grafana.rendering import (
     _append_grafana_variables as _append_grafana_variables,
     build_dashboard_url_params as build_dashboard_url_params,
@@ -124,18 +130,31 @@ from grafconflux._grafana.snapshots import (
 )
 
 logger = logging.getLogger(__name__)
+URL_IN_TEXT_RE = re.compile(r'https?://\S+')
+
+
+def _exception_type(error: Exception) -> str:
+    return type(error).__name__
+
+
+def _safe_exception_message(error: Exception) -> str:
+    message = str(error)
+    if not message:
+        return ''
+    return URL_IN_TEXT_RE.sub(lambda match: sanitize_url_for_log(match.group(0).rstrip('.,;:')),
+                              message)
 
 class GrafanaManager:
     """
     Manages interactions with a Grafana instance.
     """
 
-    def __init__(self, config: GrafanaConfigDownloader):
+    def __init__(self, config: GrafanaConfigDownloader, session: Optional[requests.Session] = None):
         self.thread_local = threading.local()
         self.browser_list: Optional[List[Any]] = []
         self.dashboard_url = ''
         self.config = config
-        self.session = requests.Session()
+        self.session = session or requests.Session()
         self.session.verify = self.config.verify_ssl
         self.session.timeout = self.config.timeout
         self.charts_path = ''
@@ -219,7 +238,10 @@ class GrafanaManager:
                 self._refresh_browser_authentication(browser)
             return True
         except Exception as error:
-            logger.error(f'Grafana re-authentication failed: {error}')
+            logger.error(
+                f'Grafana re-authentication failed error_type={_exception_type(error)} '
+                f'error={_safe_exception_message(error)}'
+            )
             return False
 
     def _has_reauthentication_credentials(self) -> bool:
@@ -252,8 +274,13 @@ class GrafanaManager:
         self.config.panels = self.get_panels(timestamps)
 
         self.config.full_links = self.__get_full_links(timestamps)
+        self.config.matrix_dashboard_links = self.__get_matrix_full_links(timestamps)
 
         self._download_render_tasks()
+
+        assign_artifact_order(self.config)
+        generate_composites(self.config, self.charts_path, timestamps)
+        assign_artifact_order(self.config)
 
         if self.config.snapshot:
             self.take_snapshot(timestamps, test_folder)
@@ -263,7 +290,8 @@ class GrafanaManager:
     def _download_render_tasks(self) -> None:
         executor = ThreadPoolExecutor(max_workers=self.config.threads)
         try:
-            wait(self._submit_render_tasks(executor))
+            for future in self._submit_render_tasks(executor):
+                future.result()
         finally:
             executor.shutdown()
 
@@ -309,7 +337,10 @@ class GrafanaManager:
         try:
             self._write_snapshot_backup(snapshot_key, timestamp, test_folder)
         except Exception as error:
-            logger.warning(f'Snapshot backup not saved dashboard={self.config.name} error={error}')
+            logger.warning(
+                f'Snapshot backup not saved dashboard={self.config.name} '
+                f'error_type={_exception_type(error)} error={_safe_exception_message(error)}'
+            )
 
     def _write_snapshot_backup(self, snapshot_key: str, timestamp: GrafanaTimeDownloader, test_folder: str) -> None:
         response = self.session.get(self._snapshot_api_url(f'/api/snapshots/{snapshot_key}'),
@@ -921,7 +952,10 @@ class GrafanaManager:
                 timeout=self.config.timeout,
             )
         except Exception as error:
-            logger.warning(f'Snapshot lookup failed dashboard={self.config.name} error={error}')
+            logger.warning(
+                f'Snapshot lookup failed dashboard={self.config.name} '
+                f'error_type={_exception_type(error)} error={_safe_exception_message(error)}'
+            )
             return None
         return self._snapshot_url_from_lookup_response(response, snapshot_name)
 
@@ -1012,14 +1046,21 @@ class GrafanaManager:
         }
 
     def __save_params_to_file(self, timestamps: List[GrafanaTimeDownloader], test_folder: str):
+        assign_artifact_order(self.config)
         save_data = {
+            'schema_version': 2,
             'name': self.config.name,
             'charts_path': self.charts_path,
             'full_links': self.config.full_links,
             'backup_dashboard_links': self.config.backup_dashboard_links,
+            'matrix_dashboard_links': self.config.matrix_dashboard_links,
             'timestamps': self.convert_to_dict(timestamps),
-            'panels': self.convert_to_dict(self.config.panels)
+            'panels': self.convert_to_dict(self.config.panels),
+            'manifest': dashboard_manifest_metadata(self.config),
         }
+
+        if self.config.render_matrix:
+            save_data.update({'render_matrix': self.config.render_matrix})
 
         if self.config.snapshot_urls:
             save_data.update({'snapshot_urls': self.config.snapshot_urls})
@@ -1057,6 +1098,14 @@ class GrafanaManager:
             links.append(f"{url}?{urlencode(params, doseq=True)}")
 
         return links
+
+    def __get_matrix_full_links(self, timestamps: List[GrafanaTimeDownloader]) -> List[Dict[str, Any]]:
+        return build_matrix_dashboard_links(
+            self.config,
+            timestamps,
+            self._dashboard_public_url(),
+            build_dashboard_url_params,
+        )
 
     def get_dashboard_uid(self):
         """
@@ -1128,6 +1177,8 @@ class GrafanaManager:
             )
             panels.append(panel)
             planner.append_panel_tasks(self._render_tasks, panel, descriptor, timestamps, rule)
+        self._render_tasks = append_matrix_tasks(self.config, dashboard, descriptors, panels, self._render_tasks, timestamps, self.session)
+        self._render_tasks = append_variant_tasks(self.config, dashboard, descriptors, panels, self._render_tasks, timestamps)
         return panels
 
     def _panel_display_title(self, dashboard: Dict, descriptor: PanelDescriptor) -> str:
@@ -1223,7 +1274,7 @@ class GrafanaManager:
         if not self.config.render:
             browser = self.__init_screenshot_browser()
             if browser is None:
-                return
+                raise RuntimeError('Failed to initialize screenshot browser')
 
         try:
             panel = task.panel
@@ -1236,12 +1287,7 @@ class GrafanaManager:
                 # Use Grafana rendering API
                 render_params = build_render_api_params(params, self.config.width, self.config.height, self.config.timeout)
                 render_url = build_render_api_url(self.config.grafana_base_url, self.dashboard_url)
-                try:
-                    response = self.session.get(render_url, params=render_params, timeout=self.config.timeout)
-                    response.raise_for_status()
-                except Exception as e:
-                    logger.error(f'Failed to download chart for panel {panel.panel_id}: {e}')
-                    response = None
+                response = self._download_render_api_response(panel.panel_id, render_url, render_params)
 
                 try:
                     self.session.get(f"{final_url}&fullscreen", timeout=self.config.timeout)
@@ -1256,13 +1302,28 @@ class GrafanaManager:
 
                     logger.info(f'Downloaded chart to {file_path}')
                 else:
-                    logger.error(f'Failed to download chart for panel {panel.panel_id}')
+                    raise RuntimeError(f'Failed to download chart for panel {panel.panel_id}')
             else:
                 # Use headless browser
                 self.__take_screenshot(browser, task, final_url, file_path)
         finally:
             if not self.config.render:
                 self._close_worker_browser(browser)
+
+    def _download_render_api_response(self, panel_id: int, render_url: str, render_params: Dict[str, Any]):
+        try:
+            response = self.session.get(render_url, params=render_params, timeout=self.config.timeout)
+            response.raise_for_status()
+            if response.status_code != 200:
+                raise RuntimeError(f'HTTP {response.status_code}')
+            return response
+        except Exception as error:
+            safe_url = sanitize_url_for_log(render_url)
+            logger.error(
+                f'Failed to download chart for panel {panel_id} '
+                f'url={safe_url} error_type={_exception_type(error)} error={_safe_exception_message(error)}'
+            )
+            raise RuntimeError(f'Failed to download chart for panel {panel_id}') from error
 
     def __init_screenshot_browser(self):
         browser = self.__init_browser()
@@ -1333,10 +1394,10 @@ class GrafanaManager:
     def __get_panel_data_sources(self, final_url):
         response = self.session.get(final_url, verify=self.config.verify_ssl, timeout=self.config.timeout)
         if response.status_code in (401, 403) and self._reauthenticate_grafana():
-            logger.info(f'Retrying panel datasource discovery after re-authentication url={final_url}')
+            logger.info(f'Retrying panel datasource discovery after re-authentication url={sanitize_url_for_log(final_url)}')
             response = self.session.get(final_url, verify=self.config.verify_ssl, timeout=self.config.timeout)
         if response.status_code != 200:
-            logger.warning(f'Panel datasource discovery returned HTTP {response.status_code} url={final_url}')
+            logger.warning(f'Panel datasource discovery returned HTTP {response.status_code} url={sanitize_url_for_log(final_url)}')
         response = response.text
         panel_data_sources = []
         tree = html.fromstring(response)
@@ -1363,26 +1424,13 @@ class GrafanaManager:
             config = yaml.safe_load(file) or {}
 
         dashboards = GrafanaManager._dashboard_configs_from_yaml(config)
-        return [
-            GrafanaConfigDownloader(config_name, config_data)
-            for config_name, config_data in dashboards.items()
-        ]
+        configs = []
+        for order_index, (config_name, config_data) in enumerate(dashboards.items()):
+            config_data = dict(config_data)
+            config_data['order_index'] = order_index
+            configs.append(GrafanaConfigDownloader(config_name, config_data))
+        return configs
 
     @staticmethod
     def _dashboard_configs_from_yaml(config: Any) -> Dict[str, Any]:
-        if not isinstance(config, dict):
-            raise ConfigurationError("YAML config must be a mapping with top-level 'dashboards' and optional 'settings'.")
-        if 'dashboards' not in config and any(
-            key != 'settings' and isinstance(value, dict)
-            for key, value in config.items()
-        ):
-            raise ConfigurationError(
-                "Legacy top-level dashboard YAML format is not supported; "
-                "move dashboard entries under top-level 'dashboards'."
-            )
-        if 'settings' in config and not isinstance(config['settings'], dict):
-            raise ConfigurationError("YAML top-level 'settings' must be a mapping.")
-        dashboards = config.get('dashboards')
-        if not isinstance(dashboards, dict) or not dashboards:
-            raise ConfigurationError("YAML config must contain a non-empty top-level 'dashboards' mapping.")
-        return dashboards
+        return resolve_dashboard_configs(config)

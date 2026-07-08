@@ -67,6 +67,45 @@ dashboards:
 external authentication/bootstrap endpoint; GrafConflux still builds Grafana API, render, and browser URLs from
 `grafana_url`.
 
+## Shared Grafana credentials
+
+You can define reusable Grafana connection blocks at top level and reference them from dashboards.
+
+```yaml
+default_grafana_credentials:
+  grafana_url: https://grafana.example.com/grafana
+  token: env:GRAFANA_DEFAULT_TOKEN
+  render: false
+
+grafana_credentials:
+  prod:
+    grafana_url: https://grafana.example.com/grafana
+    token: env:GRAFANA_TOKEN
+    render: false
+    session_mode: shared
+
+dashboards:
+  overview:
+    credentials: prod
+    dash_title: Operations Overview
+
+  details:
+    credentials: prod
+    dash_title: Detailed Metrics
+    render: true
+    session_mode: isolated
+```
+
+Notes:
+
+- Named credentials are optional; inline per-dashboard Grafana settings still work.
+- `default_grafana_credentials` is optional sugar for dashboards that do not declare `credentials` and do not set inline Grafana identity fields such as `grafana_url`, `auth_url`, `login`, `password`, `token`, or `domain`.
+- `render` is supported in both `default_grafana_credentials` and named `grafana_credentials`, and is merged into dashboards unless that dashboard sets its own `render` value.
+- Precedence is: dashboard `credentials` reference, then inline Grafana identity fields, then `default_grafana_credentials`, then built-in defaults.
+- Shared sessions are reused only within one direct run or one child-page item.
+- Batch `--time_files` items are isolated from each other.
+- If a dashboard references named credentials in shared mode, do not override Grafana identity fields on that dashboard.
+
 ## Confluence credentials and SSL
 
 Supported sources, in practical order:
@@ -150,6 +189,289 @@ dashboards:
 
 Repeating panel and row titles normalize display-only `$__all` values to `All`.
 
+## Dashboard config DSL
+
+### Dashboard lookup
+
+Choose exactly one primary dashboard selector:
+
+- `dashboard_uid`: stable UID lookup
+- `dash_title`: title lookup
+
+Optional folder narrowing works with title lookup:
+
+- `folder`: exact folder title
+- `folder_uid`: exact folder UID
+
+```yaml
+dashboards:
+  ops_by_uid:
+    dashboard_uid: ops-main
+    grafana_url: https://grafana.example/grafana
+
+  ops_by_title:
+    dash_title: Operations Overview
+    folder_uid: prod
+    grafana_url: https://grafana.example/grafana
+```
+
+### Dashboard variables and panel titles
+
+Use `vars` to pass Grafana template variables to dashboard links, panel links, render requests, title substitution,
+panel variants, and render-matrix rows.
+
+```yaml
+dashboards:
+  operations:
+    dash_title: Operations Overview
+    grafana_url: https://grafana.example/grafana
+    vars:
+      region: us
+      iface: $__all
+```
+
+Configured `vars` override the dashboard's current variable values when GrafConflux renders panel display titles.
+
+### Panel filtering and renaming
+
+`panel_filtering` controls which panels or rows are kept before rendering.
+
+- Default mode: `include_all_except_excluded`
+- Strict mode: `include_only_selected`
+- Selectors support `ids`, `titles`, and `title_regex`
+- Row selectors support `ids`, `titles`, and `title_regex`
+- `disable_graph_types` still applies before panel filtering
+
+```yaml
+dashboards:
+  operations:
+    dash_title: Operations Overview
+    grafana_url: https://grafana.example/grafana
+    disable_graph_types: [stat]
+    panel_filtering:
+      mode: include_only_selected
+      include_rows:
+        titles: [Production]
+      include_panels:
+        ids: [17]
+        titles:
+          - Speed
+          - Packet Drops:
+              type: timeseries
+              rename: Packet loss
+      exclude_panels:
+        title_regex: [".*temporary.*"]
+```
+
+Notes:
+
+- `titles` can be plain strings or typed selectors like `{Packet Drops: timeseries}`.
+- Inline renames are supported only in `include_panels.titles`.
+- Top-level `rename_panels` applies even without filtering and supports selectors by `id`, `title`, and optional `type`.
+
+```yaml
+dashboards:
+  operations:
+    dash_title: Operations Overview
+    grafana_url: https://grafana.example/grafana
+    rename_panels:
+      - id: 20
+        rename: "Traffic $iface"
+      - title: Packet Drops
+        type: timeseries
+        rename: Packet loss
+```
+
+### Repeating panels and collapsed rows
+
+- `download_collapsed_rows: true` expands collapsed Grafana rows before extraction.
+- Legacy alias `download_collapse_panels` is still accepted.
+- `download_hidden_panels` is not supported.
+- `enable_repeating_panels: true` keeps Grafana repeating panels as separate artifacts.
+- `repeating_panels` lets you explicitly control repeat expansion for selected panels.
+
+```yaml
+dashboards:
+  operations:
+    dash_title: Operations Overview
+    grafana_url: https://grafana.example/grafana
+    download_collapsed_rows: true
+    enable_repeating_panels: true
+    repeating_panels:
+      - panel_id: 17
+        repeat_values:
+          mode: values
+          values: [api-1, api-2]
+```
+
+When present, Confluence groups repeating artifacts under the source panel title and labels each repeat like
+`CPU by host [host=prod-1]`.
+
+### No-data preflight
+
+By default, GrafConflux still renders panels even if they may be empty.
+
+- `collect_no_data_panels: true` keeps normal rendering behavior
+- `collect_no_data_panels: false` enables conservative datasource preflight for supported panels and skips confirmed
+  empty results
+
+```yaml
+dashboards:
+  operations:
+    dash_title: Operations Overview
+    grafana_url: https://grafana.example/grafana
+    collect_no_data_panels: false
+    no_data_preflight:
+      timeout: 10
+      store_skip_metadata: true
+```
+
+Current preflight behavior is intentionally conservative:
+
+- mode is fixed to `conservative`
+- `on_error` remains `render_anyway`
+- `min_non_empty_frames` remains `1`
+
+### Snapshots and backup links
+
+Set `snapshot: true` to publish Grafana snapshot links and optionally upload downloaded dashboard JSON backups.
+
+```yaml
+dashboards:
+  operations:
+    dash_title: Operations Overview
+    grafana_url: https://grafana.example/grafana
+    snapshot: true
+    snapshot_store_dashboard_json: true
+    backup_dashboard_links:
+      - https://backup-grafana.example/d/ops-main?orgId=1
+```
+
+Notes:
+
+- Snapshot creation always uses the UI flow now.
+- `snapshot_mode`, `snapshot_fallback_to_ui`, and `snapshot_expires` are deprecated compatibility keys.
+- `backup_dashboard_links` are rendered in Confluence with the active run time range substituted into each URL.
+
+## Panel variants and composites
+
+### Panel variants
+
+Use `panel_variants` to render selected panels multiple times with explicit values or values discovered from Grafana
+variables.
+
+```yaml
+dashboards:
+  operations:
+    grafana_url: https://grafana.example.com
+    dash_title: Operations Overview
+    panel_variants:
+      - name: by_service
+        selectors:
+          panel_id: 17
+        variables:
+          service:
+            values: [api, worker]
+        label_template: "Service: {service}"
+
+      - name: top_hosts
+        selectors:
+          title_regex: "^CPU .*"
+          allow_multiple: true
+        variables:
+          host:
+            match_values:
+              regex: "^(app-1|app-2)$"
+```
+
+- Selectors support `panel_id`, exact `title`, or `title_regex`, plus optional `type`.
+- Variant filenames use stable hashes instead of raw variable values; full values stay in metadata.
+- Upload-only replay preserves variant order from metadata and `manifest.yaml` when present.
+
+### Render matrix
+
+Use dashboard-level `render_matrix` to render every selected panel for multiple Grafana variable combinations.
+
+```yaml
+dashboards:
+  operations:
+    grafana_url: https://grafana.example.com/grafana
+    dash_title: Operations Overview
+    vars: {region: us}
+    render_matrix:
+      row_grouping: [environment]
+      label_template: "{Environment} / {Service}"
+      environment:
+        alias: Environment
+        grafana_variable: env
+        values: [prod, stage]
+      service:
+        alias: Service
+        depends_on: environment
+        values_by:
+          prod: [api, worker]
+          stage: [worker]
+```
+
+- `values`: explicit list.
+- `values_by`: map dependent values by previously resolved matrix variables. It requires `depends_on`; with multiple dependencies, keys are joined as `value1|value2`.
+- `values_from`: pull options from a dashboard variable, either as a string or as an object with `variable`, optional `regex`, and optional `max_values`.
+- `alias`: metadata and Confluence label name. Default is the matrix key.
+- `grafana_variable`: actual Grafana URL variable name. Default is the matrix key.
+- `label_template`: optional row label built from variable keys or aliases, for example `{environment} / {Service}`.
+- `combination_mode`: `product` (default) or `zip`.
+- `max_rows`: optional hard limit for resolved matrix rows. Default is 500.
+- Static dashboard `vars` are kept and merged with matrix variables in panel and dashboard links.
+- Matrix filenames use stable hashes, not raw variable values.
+
+`values_from` example:
+
+```yaml
+dashboards:
+  operations:
+    render_matrix:
+      service:
+        grafana_variable: service
+        values_from:
+          variable: service
+          regex: "^(api|worker|db)$"
+          max_values: 2
+```
+
+Behavior notes:
+
+- Default `combination_mode` is `product`; `zip` is also supported and requires equal-length value lists.
+- Grafana `All` options (`$__all`, `__all`, `all`) are excluded from `values_from` resolution.
+- `render_matrix.variables` remains accepted for compatibility, but the PRD shape is the ordered mapping shown above.
+- `row_grouping` (alias: `group_by`) groups matrix artifacts in Confluence expand sections using the grouped variable aliases, for example `Environment: prod`.
+- In child-page mode, grouped matrix sections are rendered on the child page; the parent page only gets include/expand content when its `%%%graphs%%%` marker exists.
+- Matrix runs also add a `Matrix dashboard links` section with one dashboard link per matrix row.
+- Upload-only replay preserves matrix labels, grouping, and order from saved metadata and `manifest.yaml` when present.
+
+### Composite images
+
+Use `composites` to stitch already rendered PNGs into one attachment.
+
+```yaml
+dashboards:
+  operations:
+    composites:
+      - name: service-overview
+        title: Service overview
+        layout: grid
+        columns: 2
+        include_sources: false
+        sources:
+          - panel_id: 17
+          - title: Memory
+```
+
+- Supported layouts: `vertical`, `horizontal`, `grid`, `dashboard_grid`.
+  `dashboard_grid` preserves selected panels' relative Grafana grid proportions while compacting empty grid bands left by unselected panels.
+- `dashboard_grid` also supports optional `three_panel_policy` for exactly three rendered sources: `preserve` (default), `top_wide` (one top row + two half-width panels below), and `bottom_half` (keep the first panel at its natural width with two half-width panels below). All policies preserve source aspect ratio with letterboxing.
+- `include_sources: false` hides source artifacts in Confluence while still using them for the composite.
+- Composite images require Pillow, which is already included in `requirements.txt`.
+
 CLI overrides:
 
 - `--playwright_browser`
@@ -221,6 +543,9 @@ Important behavior:
   --confluence_page_id 12345 `
   --test_upload_folders "graphs\run_a" "graphs\run_b"
 ```
+
+When present, upload-only mode uses `manifest.yaml` to preserve dashboard and artifact order. Without a manifest, it
+falls back to legacy metadata ordering.
 
 ## Time input files (`--time_files`)
 
@@ -355,6 +680,18 @@ graphs\<test_id>__<timestamp>\
 ```
 
 Artifacts may include PNGs, metadata YAML, and optional snapshot JSON backups.
+
+Each run folder also contains `manifest.yaml` with stable dashboard and artifact ordering metadata used by upload-only
+replay.
+
+At the end of a publishing run, GrafConflux logs final Confluence page links:
+
+- direct mode logs the target page,
+- direct batch mode logs each target page in input order,
+- child-page mode logs child pages and logs the parent page only when the parent `%%%graphs%%%` marker was replaced.
+
+When Confluence response metadata contains page links, those links are used. Otherwise GrafConflux falls back to
+`<wiki_url>/pages/viewpage.action?pageId=<page_id>`, preserving any subpath in `wiki_url`.
 
 ## Python API
 

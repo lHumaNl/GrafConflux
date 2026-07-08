@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import copy
 import os
 import re
 import shutil
@@ -12,14 +13,17 @@ from typing import List
 import yaml
 
 from grafconflux._shared.grafana_models import GrafanaConfigUploader, Panel
+from grafconflux._orchestration.manifest import assign_artifact_order, write_run_manifest
+from grafconflux._orchestration.paths import build_run_folder_name
 
 
 @dataclass
 class _UploadMergeState:
     timestamps_count: dict[str, int] = field(default_factory=dict)
-    config_names: set[str] = field(default_factory=set)
+    config_names: list[str] = field(default_factory=list)
     snapshot_urls: dict[str, list] = field(default_factory=dict)
     full_links: dict[str, list] = field(default_factory=dict)
+    matrix_dashboard_links: dict[str, list] = field(default_factory=dict)
     backup_dashboard_links: dict[str, list] = field(default_factory=dict)
     timestamps: dict[str, list] = field(default_factory=dict)
     panels: dict[str, list] = field(default_factory=dict)
@@ -30,6 +34,7 @@ class _UploadMergeState:
         self.timestamps_count[grafana_config.name] = 0
         self.snapshot_urls[grafana_config.name] = []
         self.full_links[grafana_config.name] = []
+        self.matrix_dashboard_links[grafana_config.name] = []
         self.backup_dashboard_links[grafana_config.name] = list(grafana_config.backup_dashboard_links)
         self.timestamps[grafana_config.name] = []
         self.panels[grafana_config.name] = []
@@ -37,7 +42,7 @@ class _UploadMergeState:
 
 def transform_grafana_configs(grafana_configs: List[GrafanaConfigUploader], args):
     current_time = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    new_folder_graphs = os.path.join(args.test_root_folder, f'{args.test_id}__{current_time}')
+    new_folder_graphs = os.path.join(args.test_root_folder, build_run_folder_name(args.test_id, current_time))
 
     os.makedirs(new_folder_graphs, exist_ok=True)
     merge_state = _UploadMergeState()
@@ -53,6 +58,7 @@ def transform_grafana_configs(grafana_configs: List[GrafanaConfigUploader], args
             merge_state.timestamps_count[grafana_config.name] += len(grafana_config.timestamps)
 
     new_configs = _write_merged_upload_configs(merge_state, new_folder_graphs)
+    write_run_manifest(new_folder_graphs, new_configs, getattr(args, 'config_file', None))
     _copy_snapshot_backups(args.test_upload_folders, new_folder_graphs)
 
     return new_configs, new_folder_graphs
@@ -74,15 +80,19 @@ def _merge_upload_config(
     folder_id: int,
     timestamp_offset: int,
 ) -> None:
-    merge_state.config_names.add(grafana_config.name)
+    _append_config_name_once(merge_state, grafana_config.name)
     merge_state.ensure_config(grafana_config)
     merge_state.snapshot_urls[grafana_config.name].extend(grafana_config.snapshot_urls)
     merge_state.full_links[grafana_config.name].extend(grafana_config.full_links)
-    if folder_id == 0:
-        merge_state.timestamps[grafana_config.name].extend(grafana_config.timestamps)
-        merge_state.panels[grafana_config.name].extend(grafana_config.panels)
-        return
+    merge_state.matrix_dashboard_links[grafana_config.name].extend(
+        _shift_matrix_dashboard_links(grafana_config.matrix_dashboard_links, timestamp_offset)
+    )
     _merge_upload_panel_data(merge_state, grafana_config, timestamp_offset)
+
+
+def _append_config_name_once(merge_state: _UploadMergeState, config_name: str) -> None:
+    if config_name not in merge_state.config_names:
+        merge_state.config_names.append(config_name)
 
 
 def _merge_upload_panel_data(
@@ -91,13 +101,30 @@ def _merge_upload_panel_data(
     timestamp_offset: int,
 ) -> None:
     for panel in grafana_config.panels:
-        for root_panel in merge_state.panels[grafana_config.name]:
-            if panel.panel_id == root_panel.panel_id:
-                _merge_upload_panel(root_panel, panel, timestamp_offset)
-                break
+        root_panel = _find_merged_panel(merge_state.panels[grafana_config.name], panel)
+        if root_panel is None:
+            merge_state.panels[grafana_config.name].append(_shift_panel(panel, timestamp_offset))
+            continue
+        _merge_upload_panel(root_panel, panel, timestamp_offset)
     for timestamp in grafana_config.timestamps:
-        timestamp.id_time += timestamp_offset
-        merge_state.timestamps[grafana_config.name].append(timestamp)
+        shifted_timestamp = copy.copy(timestamp)
+        shifted_timestamp.id_time += timestamp_offset
+        merge_state.timestamps[grafana_config.name].append(shifted_timestamp)
+
+
+def _find_merged_panel(panels: list[Panel], panel: Panel) -> Panel | None:
+    return next((root_panel for root_panel in panels if _same_upload_panel(root_panel, panel)), None)
+
+
+def _same_upload_panel(left: Panel, right: Panel) -> bool:
+    return (left.panel_id, left.type, left.title, left.display_title) == (right.panel_id, right.type, right.title, right.display_title)
+
+
+def _shift_panel(panel: Panel, timestamp_offset: int) -> Panel:
+    shifted_panel = copy.copy(panel)
+    shifted_panel.links = _shift_links(panel.links, timestamp_offset)
+    shifted_panel.artifacts = _shift_artifacts(getattr(panel, 'artifacts', []) or [], timestamp_offset)
+    return shifted_panel
 
 
 def _copy_upload_graph_files(
@@ -131,6 +158,8 @@ def _write_merged_upload_config(
 ) -> GrafanaConfigUploader:
     config_dict = _merged_upload_config_dict(merge_state, new_folder_graphs, config_name)
     merged_config = GrafanaConfigUploader(config_name, config_dict)
+    assign_artifact_order(merged_config, preserve_existing=False)
+    config_dict['panels'] = merged_config.panels
     _write_merged_upload_config_file(new_folder_graphs, config_name, config_dict)
     return merged_config
 
@@ -141,8 +170,10 @@ def _merged_upload_config_dict(
     config_name: str,
 ) -> dict:
     return {
+        'manifest': {'dashboard_order_index': merge_state.config_names.index(config_name)},
         'snapshot_urls': merge_state.snapshot_urls[config_name],
         'full_links': merge_state.full_links[config_name],
+        'matrix_dashboard_links': merge_state.matrix_dashboard_links[config_name],
         'backup_dashboard_links': merge_state.backup_dashboard_links[config_name],
         'timestamps': merge_state.timestamps[config_name],
         'panels': merge_state.panels[config_name],
@@ -171,20 +202,64 @@ def _copy_snapshot_backups(upload_folders: List[str], new_folder_graphs: str) ->
 
 
 def _merge_upload_panel(root_panel, panel, timestamp_offset: int) -> None:
-    root_panel.links.extend(panel.links)
+    root_panel.links = _merge_shifted_links(root_panel.links, panel.links, timestamp_offset)
     if getattr(panel, 'artifacts', None):
         root_panel.artifacts.extend(_shift_artifacts(panel.artifacts, timestamp_offset))
+
+
+def _shift_links(links: list, timestamp_offset: int) -> list:
+    if timestamp_offset <= 0:
+        return list(links)
+    return [None] * timestamp_offset + list(links)
+
+
+def _merge_shifted_links(root_links: list, panel_links: list, timestamp_offset: int) -> list:
+    merged_links = list(root_links)
+    shifted_links = _shift_links(panel_links, timestamp_offset)
+    if len(merged_links) < len(shifted_links):
+        merged_links.extend([None] * (len(shifted_links) - len(merged_links)))
+    for index, link in enumerate(shifted_links):
+        if link is not None:
+            merged_links[index] = link
+    return merged_links
 
 
 def _shift_artifacts(artifacts: List[dict], timestamp_offset: int) -> List[dict]:
     return [_shift_artifact(artifact, timestamp_offset) for artifact in artifacts]
 
 
+def _shift_matrix_dashboard_links(links: List[dict], timestamp_offset: int) -> List[dict]:
+    shifted_links = []
+    for link in links or []:
+        shifted_link = copy.deepcopy(link)
+        if shifted_link.get('timestamp_id') is not None:
+            shifted_link['timestamp_id'] = int(shifted_link['timestamp_id']) + timestamp_offset
+        shifted_links.append(shifted_link)
+    return shifted_links
+
+
 def _shift_artifact(artifact: dict, timestamp_offset: int) -> dict:
-    shifted_artifact = dict(artifact)
+    shifted_artifact = copy.deepcopy(artifact)
+    shifted_artifact.pop('artifact_id', None)
+    shifted_artifact.pop('order_index', None)
+    if shifted_artifact.get('timestamp_id') is not None:
+        shifted_artifact['timestamp_id'] = int(shifted_artifact['timestamp_id']) + timestamp_offset
+    if shifted_artifact.get('source_timestamp_id') is not None:
+        shifted_artifact['source_timestamp_id'] = int(shifted_artifact['source_timestamp_id']) + timestamp_offset
     if shifted_artifact.get('png_file'):
         shifted_artifact['png_file'] = _shift_png_file_name(shifted_artifact['png_file'], timestamp_offset)
+    _shift_composite_sources(shifted_artifact, timestamp_offset)
     return shifted_artifact
+
+
+def _shift_composite_sources(artifact: dict, timestamp_offset: int) -> None:
+    composite = artifact.get('composite') or {}
+    for source in composite.get('sources') or []:
+        source.pop('artifact_id', None)
+        if source.get('source_timestamp_id') is not None:
+            source['source_timestamp_id'] = int(source['source_timestamp_id']) + timestamp_offset
+        if source.get('png_file'):
+            source['png_file'] = _shift_png_file_name(source['png_file'], timestamp_offset)
 
 
 def _shift_png_file_name(file_name: str, timestamp_offset: int) -> str:
@@ -213,7 +288,7 @@ def _panel_to_dict(panel: Panel) -> dict:
 
 
 def _legacy_panel_keys() -> List[str]:
-    return ['panel_id', 'type', 'title', 'row_title', 'from_collapsed_row', 'row_id', 'grid_pos', 'links']
+    return ['panel_id', 'type', 'title', 'display_title', 'row_title', 'from_collapsed_row', 'row_id', 'grid_pos', 'links']
 
 
 def _repeating_panel_dict(panel: Panel) -> dict:
@@ -234,6 +309,7 @@ __all__ = [
     "_merge_upload_panel_data",
     "_shift_artifact",
     "_shift_artifacts",
+    "_shift_matrix_dashboard_links",
     "_shift_png_file_name",
     "_upload_config_matches_folder",
     "_upload_match_key",

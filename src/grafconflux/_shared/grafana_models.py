@@ -3,7 +3,7 @@ import re
 from abc import ABC
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Pattern, Tuple
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from grafconflux._shared.time import GrafanaTimeDownloader, GrafanaTimeUploader
 
 logger = logging.getLogger('grafconflux.grafana')
@@ -42,6 +42,7 @@ SNAPSHOT_HYDRATION_MIN_STEP_PX = 320
 SNAPSHOT_HYDRATION_DWELL_SECONDS = 0.8
 SNAPSHOT_HYDRATION_FINAL_DWELL_SECONDS = 1.0
 SNAPSHOT_PAGE_DOWN_DWELL_SECONDS = 0.2
+RENDER_MATRIX_KEY = 'render_matrix'
 SNAPSHOT_LOADER_WAIT_LIMIT = 16
 SNAPSHOT_LOADER_WAIT_INTERVAL_SECONDS = 0.25
 SNAPSHOT_ROW_EXPAND_LIMIT = 10
@@ -58,6 +59,7 @@ DEFAULT_SCREENSHOT_NETWORK_IDLE_MS = 750
 DEFAULT_SCREENSHOT_NO_NETWORK_GRACE_MS = 1000
 DEFAULT_SCREENSHOT_MIN_SETTLE_MS = 200
 DEFAULT_SCREENSHOT_POLL_INTERVAL_MS = 100
+SENSITIVE_QUERY_FRAGMENTS = ('token', 'password', 'passwd', 'secret', 'key', 'auth', 'session', 'cookie')
 
 
 class ConfigurationError(ValueError):
@@ -270,23 +272,29 @@ class GrafanaConfigBase(ABC):
         self.backup_dashboard_links: List[str] = []
         self.snapshot_urls: Optional[List[str]] = None; self.dashboard_uid: Optional[str] = None
         self.dashboard_title: Optional[str] = None; self.folder_uid: Optional[str] = None
+        self.manifest: Dict[str, Any] = {}; self.order_index: Optional[int] = None
         self.folder_title: Optional[str] = None
+        self.matrix_dashboard_links: List[Dict[str, Any]] = []
 
 
 class GrafanaConfigUploader(GrafanaConfigBase):
     def __init__(self, name: str, config: Dict):
         super().__init__(name)
+        self.manifest = config.get('manifest', {}) or {}
+        self.order_index = self.manifest.get('dashboard_order_index')
         self.dashboard_uid = config.get('dashboard_uid'); self.dashboard_title = config.get('dashboard_title')
         self.folder_uid = config.get('folder_uid'); self.folder_title = config.get('folder_title')
         self.panels: Optional[List[Panel]] = []
-        if isinstance(config['panels'][0], Panel):
-            self.panels = config['panels']
+        panels_metadata = config.get('panels') or []
+        if panels_metadata and isinstance(panels_metadata[0], Panel):
+            self.panels = panels_metadata
         else:
-            for panel in config['panels']:
+            for panel in panels_metadata:
                 panel = self.__with_legacy_repeat_artifact(panel, config['timestamps'])
                 self.panels.append(self.__panel_from_metadata(panel, config['timestamps']))
         self.full_links: Optional[List[str]] = config['full_links']; self.snapshot_urls: Optional[List[str]] = config.get('snapshot_urls', [])
         self.backup_dashboard_links: List[str] = config.get('backup_dashboard_links', []) or []
+        self.matrix_dashboard_links: List[Dict[str, Any]] = config.get('matrix_dashboard_links', []) or []
         self.charts_path: str = config['charts_path']; self.timestamps: List[GrafanaTimeUploader] = []
         for timestamp in config['timestamps']:
             self.timestamps.append(timestamp if isinstance(timestamp, GrafanaTimeUploader) else GrafanaTimeUploader(timestamp))
@@ -372,12 +380,21 @@ class GrafanaConfigDownloader(GrafanaConfigBase):
         self.login: Optional[str] = config.get('login', None); self.password: Optional[str] = config.get('password', None)
         self.token: Optional[str] = config.get('token', None); self.auth: bool = config.get('auth', True)
         self.domain: bool = config.get('domain', False); self.verify_ssl: bool = config.get('verify_ssl', True)
+        self.credential_ref: Optional[str] = config.get('credential_ref')
+        self.config_source: str = config.get('config_source', 'inline')
+        self.session_mode: str = config.get('session_mode', 'isolated')
+        self.session_key: Optional[str] = config.get('session_key')
+        self.order_index: Optional[int] = config.get('order_index')
         self.folder: Optional[str] = config.get('folder', None); self.folder_uid: Optional[str] = config.get('folder_uid', None)
         self.folder_title: Optional[str] = config.get('folder_title', None); self.download_collapsed_rows: bool = _validated_collapsed_rows(self.name, config)
         self.backup_dashboard_links: List[str] = _validated_backup_dashboard_links(self.name, config)
         self.download_collapse_panels: bool = self.download_collapsed_rows; self.disable_graph_types: List = config.get('disable_graph_types', [])
         self.panel_filtering: PanelFilteringConfig = PanelFilteringConfig.from_config(self.name, config.get(PANEL_FILTERING_KEY))
         self.rename_panels: List[Dict[str, Any]] = _validated_rename_panels(self.name, config)
+        self.panel_variants: List[Dict[str, Any]] = _validated_panel_variants(self.name, config)
+        self.render_matrix: Optional[Dict[str, Any]] = _validated_render_matrix(self.name, config)
+        self.render_matrix_rows_by_timestamp: Dict[int, List[Dict[str, Any]]] = {}
+        self.composites: List[Dict[str, Any]] = _validated_composites(self.name, config)
         _validate_dashboard_lookup(self.name, self.dashboard_uid, self.dash_title, self.folder, self.folder_uid)
 
 
@@ -395,18 +412,19 @@ def _validated_grafana_url(dashboard_name: str, config: Dict) -> GrafanaUrlParts
     value = config.get(GRAFANA_URL_KEY)
     if not isinstance(value, str) or not value.strip():
         raise ConfigurationError(
-            f'dashboards.{dashboard_name}.{GRAFANA_URL_KEY}: invalid value="{value}", '
+            f'dashboards.{dashboard_name}.{GRAFANA_URL_KEY}: invalid value="{_safe_config_value(value)}", '
             'expected full Grafana base URL with http(s) scheme'
         )
     parsed = urlparse(value.strip())
     if parsed.scheme not in ('http', 'https') or not parsed.netloc:
         raise ConfigurationError(
-            f'dashboards.{dashboard_name}.{GRAFANA_URL_KEY}: invalid value="{value}", '
+            f'dashboards.{dashboard_name}.{GRAFANA_URL_KEY}: invalid value="{sanitize_url_for_log(value)}", '
             'expected absolute URL with http(s) scheme'
         )
+    _reject_url_userinfo(dashboard_name, GRAFANA_URL_KEY, parsed)
     if parsed.query or parsed.fragment:
         raise ConfigurationError(
-            f'dashboards.{dashboard_name}.{GRAFANA_URL_KEY}: invalid value="{value}", '
+            f'dashboards.{dashboard_name}.{GRAFANA_URL_KEY}: invalid value="{sanitize_url_for_log(value)}", '
             'expected Grafana base URL without query or fragment'
         )
     app_path = _normalized_app_path(parsed.path)
@@ -419,14 +437,60 @@ def _validated_auth_url(dashboard_name: str, value: Any) -> Optional[str]:
         return None
     if not isinstance(value, str):
         raise ConfigurationError(
-            f'dashboards.{dashboard_name}.{AUTH_URL_KEY}: invalid value="{value}", expected absolute URL'
+            f'dashboards.{dashboard_name}.{AUTH_URL_KEY}: invalid value="{_safe_config_value(value)}", expected absolute URL'
         )
     parsed = urlparse(value)
     if parsed.scheme not in ('http', 'https') or not parsed.netloc:
         raise ConfigurationError(
-            f'dashboards.{dashboard_name}.{AUTH_URL_KEY}: invalid value="{value}", '
+            f'dashboards.{dashboard_name}.{AUTH_URL_KEY}: invalid value="{sanitize_url_for_log(value)}", '
             'expected absolute URL with http(s) scheme'
         )
+    _reject_url_userinfo(dashboard_name, AUTH_URL_KEY, parsed)
+    return value
+
+
+def _reject_url_userinfo(dashboard_name: str, key: str, parsed) -> None:
+    if parsed.username is None and parsed.password is None:
+        return
+    raise ConfigurationError(
+        f'dashboards.{dashboard_name}.{key}: URL userinfo is not supported; '
+        'use login/password or token fields instead'
+    )
+
+
+def _safe_config_value(value: Any) -> str:
+    if isinstance(value, str):
+        return sanitize_url_for_log(value)
+    return str(value)
+
+
+def sanitize_url_for_log(value: Any) -> str:
+    if not isinstance(value, str):
+        return str(value)
+    parsed = urlparse(value)
+    if not parsed.scheme or not parsed.netloc:
+        return value
+    netloc = _sanitized_netloc(parsed)
+    query = _sanitized_query(parsed.query)
+    return urlunparse((parsed.scheme, netloc, parsed.path, parsed.params, query, ''))
+
+
+def _sanitized_netloc(parsed) -> str:
+    host = parsed.hostname or ''
+    if ':' in host and not host.startswith('['):
+        host = f'[{host}]'
+    return f'{host}:{parsed.port}' if parsed.port is not None else host
+
+
+def _sanitized_query(query: str) -> str:
+    items = [(_key, _safe_query_value(_key, value)) for _key, value in parse_qsl(query, keep_blank_values=True)]
+    return urlencode(items, doseq=True)
+
+
+def _safe_query_value(key: str, value: str) -> str:
+    lowered_key = key.lower()
+    if any(fragment in lowered_key for fragment in SENSITIVE_QUERY_FRAGMENTS):
+        return 'REDACTED'
     return value
 
 
@@ -454,7 +518,7 @@ def _normalize_grafana_app_route(dashboard_name: str, raw_url: str, grafana_orig
     route = _strip_grafana_app_path(path, grafana_app_path)
     if not route.startswith(route_prefix):
         raise ConfigurationError(
-            f'dashboards.{dashboard_name}: Grafana API returned unsupported dashboard url="{raw_url}", '
+            f'dashboards.{dashboard_name}: Grafana API returned unsupported dashboard url="{sanitize_url_for_log(raw_url)}", '
             f'expected route starting with {route_prefix}'
         )
     return route
@@ -464,7 +528,7 @@ def _validate_same_grafana_origin(dashboard_name: str, raw_url: str, parsed, gra
     origin = urlunparse((parsed.scheme, parsed.netloc, '', '', '', ''))
     if origin != grafana_origin:
         raise ConfigurationError(
-            f'dashboards.{dashboard_name}: Grafana API returned cross-origin dashboard url="{raw_url}"'
+            f'dashboards.{dashboard_name}: Grafana API returned cross-origin dashboard url="{sanitize_url_for_log(raw_url)}"'
         )
 
 
@@ -558,6 +622,50 @@ def _validated_repeating_panels(dashboard_name: str, config: Dict) -> List[Dict]
     if isinstance(value, list) and all(isinstance(item, dict) for item in value):
         return list(value)
     raise ConfigurationError(f'dashboards.{dashboard_name}.{REPEATING_PANELS_KEY}: invalid value="{value}", expected list[object], suggested fix: configure explicit repeating panel rules')
+
+
+def _validated_panel_variants(dashboard_name: str, config: Dict) -> List[Dict[str, Any]]:
+    value = config.get('panel_variants', [])
+    if value is None:
+        return []
+    if isinstance(value, list) and all(isinstance(item, dict) for item in value):
+        _validate_variant_rules(dashboard_name, value)
+        return list(value)
+    raise ConfigurationError(f'dashboards.{dashboard_name}.panel_variants: expected list of mappings')
+
+
+def _validate_variant_rules(dashboard_name: str, rules: List[Dict[str, Any]]) -> None:
+    from grafconflux._grafana.variants import validated_panel_variants
+
+    validated_panel_variants(dashboard_name, {'panel_variants': rules})
+
+
+def _validated_render_matrix(dashboard_name: str, config: Dict) -> Optional[Dict[str, Any]]:
+    from grafconflux._grafana.matrix import validated_render_matrix
+
+    return validated_render_matrix(dashboard_name, config)
+
+
+def _validated_composites(dashboard_name: str, config: Dict) -> List[Dict[str, Any]]:
+    value = config.get('composites', [])
+    if value is None:
+        return []
+    if isinstance(value, list) and all(isinstance(item, dict) for item in value):
+        _validate_composite_rules(dashboard_name, value)
+        return list(value)
+    raise ConfigurationError(f'dashboards.{dashboard_name}.composites: expected list of mappings')
+
+
+def _validate_composite_rules(dashboard_name: str, rules: List[Dict[str, Any]]) -> None:
+    for index, rule in enumerate(rules):
+        if rule.get('layout', 'vertical') not in {'vertical', 'horizontal', 'grid', 'dashboard_grid'}:
+            raise ConfigurationError(f'dashboards.{dashboard_name}.composites[{index}].layout: unsupported layout')
+        if rule.get('three_panel_policy', 'preserve') not in {'preserve', 'top_wide', 'bottom_half'}:
+            raise ConfigurationError(f'dashboards.{dashboard_name}.composites[{index}].three_panel_policy: expected preserve, top_wide, or bottom_half')
+        if rule.get('missing_source', 'fail') not in {'fail', 'skip', 'placeholder'}:
+            raise ConfigurationError(f'dashboards.{dashboard_name}.composites[{index}].missing_source: expected fail, skip, or placeholder')
+        if not isinstance(rule.get('sources'), list) or not rule['sources']:
+            raise ConfigurationError(f'dashboards.{dashboard_name}.composites[{index}].sources: expected non-empty list')
 
 
 def _validate_dashboard_lookup(dashboard_name: str, dashboard_uid: Optional[str], dash_title: Optional[str],

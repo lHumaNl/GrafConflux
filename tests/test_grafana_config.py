@@ -2,6 +2,7 @@ import os
 import tempfile
 import textwrap
 import unittest
+from unittest.mock import patch
 
 from grafconflux.grafana import ConfigurationError, GrafanaConfigDownloader, GrafanaManager
 
@@ -62,6 +63,39 @@ class TestGrafanaConfigLoading(unittest.TestCase):
         self.assertEqual(len(configs), 1)
         self.assertEqual(configs[0].name, "new_dashboard")
 
+    def test_default_grafana_credentials_must_be_mapping(self):
+        config_path = self.write_config(
+            "settings: {}\n"
+            "default_grafana_credentials: prod\n"
+            "dashboards:\n"
+            "  demo:\n"
+            "    dash_title: Demo\n",
+            raw=True,
+        )
+
+        with self.assertRaisesRegex(ConfigurationError, "default_grafana_credentials"):
+            GrafanaManager.load_grafana_config(config_path)
+
+    def test_default_grafana_credentials_allow_dashboard_session_override(self):
+        config_path = self.write_config(
+            "settings: {}\n"
+            "default_grafana_credentials:\n"
+            "  grafana_url: https://grafana.example\n"
+            "  token: env:GRAFANA_TOKEN\n"
+            "dashboards:\n"
+            "  demo:\n"
+            "    dash_title: Demo\n"
+            "    session_mode: isolated\n",
+            raw=True,
+        )
+
+        with patch.dict(os.environ, {"GRAFANA_TOKEN": "token"}):
+            config = GrafanaManager.load_grafana_config(config_path)[0]
+
+        self.assertEqual(config.config_source, "default_credentials")
+        self.assertEqual(config.session_mode, "isolated")
+        self.assertIsNone(config.session_key)
+
     def test_grafana_url_with_subpath_is_normalized(self):
         config = GrafanaConfigDownloader(
             "demo",
@@ -101,6 +135,32 @@ class TestGrafanaConfigLoading(unittest.TestCase):
             with self.subTest(value=value):
                 with self.assertRaisesRegex(ConfigurationError, "grafana_url"):
                     GrafanaConfigDownloader("demo", {"dash_title": "Dashboard", "grafana_url": value})
+
+    def test_grafana_and_auth_urls_reject_userinfo_without_leaking_values(self):
+        configs = [
+            {"dash_title": "Dashboard", "grafana_url": "https://user:secret@grafana.example"},
+            {
+                "dash_title": "Dashboard",
+                "grafana_url": "https://grafana.example",
+                "auth_url": "https://user:secret@auth.example/bootstrap",
+            },
+        ]
+
+        for config in configs:
+            with self.subTest(config=config):
+                with self.assertRaisesRegex(ConfigurationError, "userinfo") as context:
+                    GrafanaConfigDownloader("demo", config)
+                self.assertNotIn("secret", str(context.exception))
+
+    def test_sensitive_query_values_are_redacted_in_url_validation_errors(self):
+        with self.assertRaises(ConfigurationError) as context:
+            GrafanaConfigDownloader("demo", {
+                "dash_title": "Dashboard",
+                "grafana_url": "https://grafana.example/grafana?token=secret&orgId=1",
+            })
+
+        self.assertIn("token=REDACTED", str(context.exception))
+        self.assertNotIn("secret", str(context.exception))
 
     def test_rejects_settings_without_dashboards(self):
         config_path = self.write_config(

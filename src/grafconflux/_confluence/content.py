@@ -7,6 +7,8 @@ from typing import List, Optional
 from grafconflux._shared.display import normalize_grafana_display_value
 from grafconflux._shared.grafana_models import GrafanaConfigBase
 from grafconflux._shared.time import GrafanaTimeBase
+from grafconflux._confluence.matrix_content import has_matrix_artifacts, render_matrix_dashboard
+from grafconflux._confluence.row_groups import group_entries_by_row
 
 GRAPHS_PLACEHOLDER = '%%%graphs%%%'
 DEFAULT_CHILD_TITLE_PREFIX = 'GrafConflux: '
@@ -21,6 +23,8 @@ class ChildPageInclude:
 
     title: str
     space_key: str
+    page_id: int | None = None
+    page_url: str | None = None
 
 __all__ = (
     'GRAPHS_PLACEHOLDER',
@@ -209,18 +213,31 @@ def _render_dashboards_section(grafana_configs: List[GrafanaConfigBase], timesta
                                graph_width: int) -> str:
     new_content = ''
     for grafana_config in grafana_configs:
+        matrix_artifacts_present = has_matrix_artifacts(grafana_config)
         dash_title = html.escape(grafana_config.name)
         new_content += f'<h2>{dash_title}</h2>\n<p>Dashboard links</p>\n'
         new_content += _render_dashboard_links(grafana_config, timestamps)
+        if _has_matrix_dashboard_links(grafana_config) and not matrix_artifacts_present:
+            new_content += '<p>Matrix dashboard links</p>\n'
+            new_content += _render_matrix_dashboard_links(grafana_config)
         if getattr(grafana_config, 'backup_dashboard_links', []):
             new_content += '<p>Backup dashboard links</p>\n'
             new_content += _render_backup_dashboard_links(grafana_config, timestamps)
+        if matrix_artifacts_present:
+            new_content += _render_matrix_dashboard(grafana_config, graph_width)
+            continue
         new_content += '<p>Panels</p>\n'
         new_content += f'<ac:structured-macro ac:name="expand">\n'
         new_content += f'  <ac:parameter ac:name="title">{dash_title}</ac:parameter>\n'
         new_content += '  <ac:rich-text-body>\n'
         new_content += _render_panels(grafana_config, timestamps, graph_width)
         new_content += '  </ac:rich-text-body>\n</ac:structured-macro>\n'
+    return new_content
+
+
+def _render_matrix_dashboard(grafana_config: GrafanaConfigBase, graph_width: int) -> str:
+    new_content = '<p>Panels</p>\n'
+    new_content += render_matrix_dashboard(grafana_config, graph_width)
     return new_content
 
 
@@ -239,6 +256,11 @@ def _render_dashboard_links(grafana_config: GrafanaConfigBase, timestamps: List[
     return new_content
 
 
+def _has_matrix_dashboard_links(grafana_config: GrafanaConfigBase) -> bool:
+    matrix_links = getattr(grafana_config, 'matrix_dashboard_links', [])
+    return isinstance(matrix_links, list) and bool(matrix_links)
+
+
 def _render_backup_dashboard_links(grafana_config: GrafanaConfigBase, timestamps: List[GrafanaTimeBase]) -> str:
     new_content = ''
     for backup_link in getattr(grafana_config, 'backup_dashboard_links', []):
@@ -250,6 +272,19 @@ def _render_backup_dashboard_links(grafana_config: GrafanaConfigBase, timestamps
                 timestamp.end_time_timestamp,
             )
             new_content += f'<p><a href="{html.escape(url)}">{period}</a></p>\n'
+    return new_content
+
+
+def _render_matrix_dashboard_links(grafana_config: GrafanaConfigBase) -> str:
+    new_content = ''
+    matrix_links = getattr(grafana_config, 'matrix_dashboard_links', [])
+    if not isinstance(matrix_links, list):
+        return new_content
+    for link in matrix_links:
+        label = html.escape(str(link.get('label') or 'Matrix'))
+        url = html.escape(str(link.get('url') or ''))
+        if url:
+            new_content += f'<p><a href="{url}">{label}</a></p>\n'
     return new_content
 
 
@@ -265,8 +300,28 @@ def _with_dashboard_timerange(url: str, start_time: int, end_time: int) -> str:
 
 
 def _render_panels(grafana_config: GrafanaConfigBase, timestamps: List[GrafanaTimeBase], graph_width: int) -> str:
+    entries = [{'panel': panel} for panel in _ordered_panels(grafana_config.panels)]
+    groups = group_entries_by_row(entries)
+    if len(groups) == 1:
+        return _render_panel_entries(grafana_config, timestamps, graph_width, next(iter(groups.values())))
+    return ''.join(_render_flat_row_group(grafana_config, timestamps, graph_width, title, items) for title, items in groups.items())
+
+
+def _render_flat_row_group(grafana_config: GrafanaConfigBase, timestamps: List[GrafanaTimeBase],
+                           graph_width: int, title: str, entries: list[dict]) -> str:
+    row_title = html.escape(title)
+    content = f'<ac:structured-macro ac:name="expand">\n  <ac:parameter ac:name="title">{row_title}</ac:parameter>\n'
+    content += '  <ac:rich-text-body>\n'
+    content += _render_panel_entries(grafana_config, timestamps, graph_width, entries)
+    content += '  </ac:rich-text-body>\n</ac:structured-macro>\n'
+    return content
+
+
+def _render_panel_entries(grafana_config: GrafanaConfigBase, timestamps: List[GrafanaTimeBase],
+                          graph_width: int, entries: list[dict]) -> str:
     new_content = ''
-    for panel in grafana_config.panels:
+    for entry in entries:
+        panel = entry['panel']
         row_title = html.escape(getattr(panel, 'display_title', panel.title))
         new_content += f'<h3>{row_title}</h3>\n'
         new_content += f'<ac:structured-macro ac:name="expand">\n'
@@ -297,16 +352,67 @@ def _render_panel_timestamps(grafana_config: GrafanaConfigBase, panel, timestamp
 
 def _render_panel_artifacts(panel, row_title: str, graph_width: int) -> str:
     new_content = ''
-    for artifact in panel.artifacts:
+    if _has_matrix_artifacts(panel.artifacts):
+        new_content += _render_matrix_artifacts(panel, row_title, graph_width)
+    for artifact in _ordered_artifacts(panel.artifacts):
+        if artifact.get('artifact_type') == 'matrix':
+            continue
+        if not _artifact_is_visible(artifact):
+            continue
         if not _artifact_has_rendered_png(artifact):
             continue
         title = _artifact_title(panel, row_title, artifact)
-        link = html.escape(artifact.get('link') or _first_panel_link(panel))
+        link = artifact.get('link') or _first_panel_link(panel)
         new_content += f'    <h4>{title}</h4>\n'
-        new_content += f'    <p><a href="{link}">{title}</a></p>\n'
+        if link:
+            new_content += f'    <p><a href="{html.escape(link)}">{title}</a></p>\n'
+        else:
+            new_content += f'    <p>{title} (Grafana link unavailable)</p>\n'
         new_content += f'    <p><ac:image ac:width="{graph_width}">'
         new_content += f'<ri:attachment ri:filename="{html.escape(artifact["png_file"])}" /></ac:image></p>\n'
     return new_content
+
+
+def _has_matrix_artifacts(artifacts) -> bool:
+    return any(artifact.get('artifact_type') == 'matrix' for artifact in artifacts or [])
+
+
+def _render_matrix_artifacts(panel, row_title: str, graph_width: int) -> str:
+    new_content = ''
+    for group_title, artifacts in _grouped_matrix_artifacts(panel.artifacts).items():
+        new_content += f'    <h4>{html.escape(group_title)}</h4>\n'
+        new_content += '    <ac:structured-macro ac:name="expand">\n'
+        new_content += f'      <ac:parameter ac:name="title">{html.escape(group_title)}</ac:parameter>\n'
+        new_content += '      <ac:rich-text-body>\n'
+        for artifact in artifacts:
+            new_content += _render_artifact_image_block(panel, row_title, artifact, graph_width, '        ')
+        new_content += '      </ac:rich-text-body>\n    </ac:structured-macro>\n'
+    return new_content
+
+
+def _render_artifact_image_block(panel, row_title: str, artifact, graph_width: int, indent: str) -> str:
+    title = _artifact_title(panel, row_title, artifact)
+    link = artifact.get('link') or _first_panel_link(panel)
+    block = f'{indent}<h5>{title}</h5>\n'
+    if link:
+        block += f'{indent}<p><a href="{html.escape(link)}">{title}</a></p>\n'
+    else:
+        block += f'{indent}<p>{title} (Grafana link unavailable)</p>\n'
+    block += f'{indent}<p><ac:image ac:width="{graph_width}">'
+    block += f'<ri:attachment ri:filename="{html.escape(artifact["png_file"])}" /></ac:image></p>\n'
+    return block
+
+
+def _grouped_matrix_artifacts(artifacts):
+    grouped = {}
+    for artifact in _ordered_artifacts(artifacts):
+        if artifact.get('artifact_type') != 'matrix':
+            continue
+        if not _artifact_is_visible(artifact) or not _artifact_has_rendered_png(artifact):
+            continue
+        group_title = ((artifact.get('matrix') or {}).get('group') or 'Matrix')
+        grouped.setdefault(str(group_title), []).append(artifact)
+    return grouped
 
 
 def _artifact_has_rendered_png(artifact) -> bool:
@@ -314,6 +420,17 @@ def _artifact_has_rendered_png(artifact) -> bool:
 
 
 def _artifact_title(panel, row_title: str, artifact) -> str:
+    if artifact.get('artifact_type') == 'matrix':
+        if artifact.get('display_title'):
+            return html.escape(str(artifact['display_title']))
+        label = (artifact.get('matrix') or {}).get('label')
+        return html.escape(str(label or row_title))
+    if artifact.get('artifact_type') == 'variant':
+        label = (artifact.get('variant') or {}).get('label')
+        return html.escape(str(label or row_title))
+    if artifact.get('artifact_type') == 'composite':
+        composite = artifact.get('composite') or {}
+        return html.escape(str(composite.get('title') or composite.get('name') or row_title))
     if artifact.get('repeat_value') is None:
         return _non_repeating_artifact_title(row_title, artifact)
     repeat_var = html.escape(str(artifact.get('repeat_var') or getattr(panel, 'repeat_var', 'value')))
@@ -331,6 +448,19 @@ def _non_repeating_artifact_title(row_title: str, artifact) -> str:
 def _first_panel_link(panel) -> str:
     links = getattr(panel, 'links', [])
     return next((link for link in links if link), '')
+
+
+def _ordered_panels(panels):
+    return sorted(panels or [], key=lambda panel: getattr(panel, 'order_index', 0))
+
+
+def _ordered_artifacts(artifacts):
+    return sorted(artifacts or [], key=lambda artifact: artifact.get('order_index', 0))
+
+
+def _artifact_is_visible(artifact) -> bool:
+    confluence = artifact.get('confluence') or {}
+    return confluence.get('visible', True) is not False
 
 
 def _dashboard_period(timestamp: GrafanaTimeBase, timestamps_count: int) -> str:

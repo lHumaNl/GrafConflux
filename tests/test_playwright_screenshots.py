@@ -6,6 +6,7 @@ from grafconflux._grafana.playwright_screenshots import (
     PlaywrightPanelScreenshotRunner,
     PlaywrightResponseCollector,
 )
+from grafconflux._shared.grafana_models import sanitize_url_for_log
 from grafconflux.grafana import GrafanaConfigDownloader
 
 
@@ -98,6 +99,11 @@ class TestPlaywrightScreenshotReadiness(unittest.TestCase):
 
         self.assertEqual(status, 401)
         self.assertEqual(browser.page.waited_ms, 0)
+
+    def test_sanitize_url_for_log_redacts_query_and_fragment(self):
+        sanitized = sanitize_url_for_log("https://grafana.example/d/demo?token=secret&viewPanel=7#frag")
+
+        self.assertEqual(sanitized, "https://grafana.example/d/demo?token=REDACTED&viewPanel=7")
 
     def create_runner(self, loading_states=None, timeout=5, **readiness_overrides):
         config = self.create_config(timeout=timeout, **readiness_overrides)

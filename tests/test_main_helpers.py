@@ -5,6 +5,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import main
+from grafconflux._orchestration.paths import sanitize_run_folder_segment
+from grafconflux._orchestration.runner import _build_test_folder
 from grafconflux.orchestration import _create_confluence_manager
 from grafconflux.grafana import GrafanaConfigUploader
 
@@ -67,6 +69,7 @@ class TestMainHelpers(unittest.TestCase):
                 "source_panel_id": 17,
                 "repeat_var": "host",
                 "artifacts": [{
+                    "timestamp_id": 0,
                     "timestamp_tag": repeat_value,
                     "from": "1700000000000",
                     "to": "1700003600000",
@@ -77,6 +80,8 @@ class TestMainHelpers(unittest.TestCase):
                     "repeat_value": repeat_value,
                     "repeat_value_slug": repeat_value,
                     "link": f"link-{repeat_value}",
+                    "artifact_id": f"stale-{repeat_value}",
+                    "order_index": 500,
                 }],
             }],
         })
@@ -102,6 +107,7 @@ class TestMainHelpers(unittest.TestCase):
         for index, tag in enumerate(timestamp_tags):
             png_file = f"{name}__17__repeat-{tag}__{index}.png"
             artifacts.append({
+                "timestamp_id": index,
                 "timestamp_tag": tag,
                 "from": "1700000000000",
                 "to": "1700003600000",
@@ -112,6 +118,8 @@ class TestMainHelpers(unittest.TestCase):
                 "repeat_value": tag,
                 "repeat_value_slug": tag,
                 "link": f"link-{tag}",
+                "artifact_id": f"stale-{name}-{tag}",
+                "order_index": 500 + index,
             })
             timestamps.append({
                 "time_tag": tag,
@@ -167,6 +175,9 @@ class TestMainHelpers(unittest.TestCase):
 
         artifacts = merged_configs[0].panels[0].artifacts
         self.assertEqual([artifact["repeat_value"] for artifact in artifacts], ["prod-1", "prod-2"])
+        self.assertEqual([artifact["timestamp_id"] for artifact in artifacts], [0, 1])
+        self.assertEqual([artifact["order_index"] for artifact in artifacts], [0, 1])
+        self.assertTrue(all(not artifact["artifact_id"].startswith("stale-") for artifact in artifacts))
 
     def test_multi_folder_filename_shift_rewrites_repeated_artifact_png_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -197,6 +208,64 @@ class TestMainHelpers(unittest.TestCase):
             self.assertTrue(os.path.isfile(alpha_path))
             self.assertTrue(os.path.isfile(beta_path))
 
+    def test_multi_folder_merge_rewrites_composite_source_metadata(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            folders, configs = self.make_composite_upload_folders(temp_dir)
+            args = SimpleNamespace(test_upload_folders=folders, test_root_folder=temp_dir, test_id="merged")
+
+            merged_configs, folder_graphs = main.transform_grafana_configs(configs, args)
+
+            panel = merged_configs[0].panels[0]
+            composite_panel = merged_configs[0].panels[1]
+            composite_artifact = composite_panel.artifacts[1]
+            source = composite_artifact["composite"]["sources"][0]
+            shifted_path = os.path.join(folder_graphs, "demo", composite_artifact["png_file"])
+
+            self.assertTrue(os.path.isfile(shifted_path))
+
+        self.assertEqual(composite_artifact["timestamp_id"], 1)
+        self.assertEqual(composite_artifact["png_file"], "demo__composite-overview__1.png")
+        self.assertEqual(source["png_file"], "demo__17__1.png")
+        self.assertEqual(source["artifact_id"], panel.artifacts[1]["artifact_id"])
+
+    def test_multi_folder_merge_shifts_new_panel_links_and_variant_source_timestamp(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            first_folder = os.path.join(temp_dir, "one")
+            second_folder = os.path.join(temp_dir, "two")
+            os.makedirs(os.path.join(first_folder, "demo"))
+            os.makedirs(os.path.join(second_folder, "demo"))
+            with open(os.path.join(first_folder, "demo", "demo__17__0.png"), "wb") as image_file:
+                image_file.write(b"png")
+            with open(os.path.join(second_folder, "demo", "demo__18__0.png"), "wb") as image_file:
+                image_file.write(b"png")
+            configs = [
+                GrafanaConfigUploader("demo", {
+                    "charts_path": os.path.join(first_folder, "demo"), "full_links": ["dash-a"], "snapshot_urls": [],
+                    "timestamps": [{"time_tag": "a", "id_time": 0, "start_time_timestamp": 1, "end_time_timestamp": 2,
+                                    "start_time_human": "a", "end_time_human": "b"}],
+                    "panels": [{"panel_id": 17, "type": "timeseries", "title": "CPU", "links": ["link-a"],
+                                "artifacts": [{"artifact_type": "normal", "timestamp_id": 0, "timestamp_tag": "a",
+                                               "render_status": "rendered", "png_file": "demo__17__0.png"}]}],
+                }),
+                GrafanaConfigUploader("demo", {
+                    "charts_path": os.path.join(second_folder, "demo"), "full_links": ["dash-b"], "snapshot_urls": [],
+                    "timestamps": [{"time_tag": "b", "id_time": 0, "start_time_timestamp": 3, "end_time_timestamp": 4,
+                                    "start_time_human": "c", "end_time_human": "d"}],
+                    "panels": [{"panel_id": 18, "type": "timeseries", "title": "Memory", "links": ["link-b"],
+                                "artifacts": [{"artifact_type": "variant", "timestamp_id": 0, "timestamp_tag": "b",
+                                               "source_timestamp_id": 0, "render_status": "rendered", "png_file": "demo__18__0.png"}]}],
+                }),
+            ]
+            args = SimpleNamespace(test_upload_folders=[first_folder, second_folder], test_root_folder=temp_dir, test_id="merged")
+
+            merged_configs, _ = main.transform_grafana_configs(configs, args)
+
+        first_panel, second_panel = merged_configs[0].panels
+        self.assertEqual(first_panel.links, ["link-a"])
+        self.assertEqual(second_panel.links, [None, "link-b"])
+        self.assertEqual(second_panel.artifacts[0]["timestamp_id"], 1)
+        self.assertEqual(second_panel.artifacts[0]["source_timestamp_id"], 1)
+
     def test_multi_folder_upload_copies_snapshot_json_once_and_ignores_unrelated_files(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             folders, configs = self.make_upload_folders(temp_dir)
@@ -212,6 +281,70 @@ class TestMainHelpers(unittest.TestCase):
 
         self.assertEqual(root_entries.count("demo__snapshot.json"), 1)
         self.assertNotIn("notes.txt", root_entries)
+
+    def test_transform_grafana_configs_sanitizes_test_id_in_output_folder(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            folders, configs = self.make_upload_folders(temp_dir)
+            args = SimpleNamespace(
+                test_upload_folders=folders,
+                test_root_folder=temp_dir,
+                test_id=r"Release / 1.1 Гбит\с",
+            )
+
+            _, folder_graphs = main.transform_grafana_configs(configs, args)
+
+        self.assertEqual(os.path.dirname(folder_graphs), temp_dir)
+        self.assertIn(sanitize_run_folder_segment(args.test_id), os.path.basename(folder_graphs))
+
+    def test_build_test_folder_sanitizes_test_id(self):
+        args = SimpleNamespace(test_root_folder=r"C:\tmp", test_id=r"Release / 1.1 Гбит\с")
+
+        folder = _build_test_folder(args)
+
+        self.assertEqual(os.path.dirname(folder), args.test_root_folder)
+        self.assertIn(sanitize_run_folder_segment(args.test_id), os.path.basename(folder))
+
+    def make_composite_upload_folders(self, temp_dir):
+        folders = []
+        configs = []
+        for folder_name, tag in (("one", "a"), ("two", "b")):
+            folder = os.path.join(temp_dir, folder_name)
+            charts_path = os.path.join(folder, "demo")
+            os.makedirs(charts_path)
+            for png_file in ("demo__17__0.png", "demo__composite-overview__0.png"):
+                with open(os.path.join(charts_path, png_file), "wb") as image_file:
+                    image_file.write(b"png")
+            folders.append(folder)
+            configs.append(self.make_composite_upload_config(charts_path, tag))
+        return folders, configs
+
+    @staticmethod
+    def make_composite_upload_config(charts_path, tag):
+        return GrafanaConfigUploader("demo", {
+            "charts_path": charts_path,
+            "full_links": [f"dashboard-{tag}"],
+            "snapshot_urls": [],
+            "timestamps": [{
+                "time_tag": tag,
+                "id_time": 0,
+                "start_time_timestamp": 1700000000000,
+                "end_time_timestamp": 1700003600000,
+                "start_time_human": "2023/11/14 22:13:20",
+                "end_time_human": "2023/11/14 23:13:20",
+            }],
+            "panels": [
+                {"panel_id": 17, "type": "timeseries", "title": "CPU", "links": [f"link-{tag}"],
+                 "artifacts": [{"artifact_type": "normal", "timestamp_id": 0, "timestamp_tag": tag,
+                                "render_status": "rendered", "png_file": "demo__17__0.png",
+                                "artifact_id": f"stale-source-{tag}", "order_index": 99}]},
+                {"panel_id": 0, "type": "composite", "title": "Overview", "links": [None],
+                 "artifacts": [{"artifact_type": "composite", "timestamp_id": 0, "timestamp_tag": tag,
+                                "render_status": "rendered", "png_file": "demo__composite-overview__0.png",
+                                "artifact_id": f"stale-composite-{tag}", "order_index": 100,
+                                "composite": {"name": "overview", "sources": [{"panel_id": 17,
+                                    "png_file": "demo__17__0.png", "artifact_id": f"stale-source-{tag}"}]}}]},
+            ],
+        })
 
     def test_get_yaml_files_returns_only_yaml_files(self):
         with tempfile.TemporaryDirectory() as temp_dir:

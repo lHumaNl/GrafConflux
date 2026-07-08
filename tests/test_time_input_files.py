@@ -382,6 +382,35 @@ class TestTimeFileBatchRunner(unittest.TestCase):
             ],
         )
 
+    def test_batch_runs_create_isolated_session_pools_per_item(self):
+        pools = []
+        batch_args = [self.make_run_args(1, "first"), self.make_run_args(2, "second")]
+        args = SimpleNamespace(batch_run_args=batch_args)
+
+        class FakeGrafanaManager:
+            @staticmethod
+            def load_grafana_config(config_file):
+                return [SimpleNamespace(dash_title=config_file)]
+
+        class FakeConfluenceManager:
+            def __init__(self, **kwargs):
+                self.page_id = kwargs["page_id"]
+
+            def upload_charts(self, *args):
+                return None
+
+            def update_page_content(self, *args):
+                return None
+
+        def process_dashboard(grafana_config, test_folder, run_args, confluence_manager):
+            pools.append(run_args._grafana_session_pool)
+
+        run_impl(args, FakeConfluenceManager, FakeGrafanaManager, process_dashboard)
+
+        self.assertEqual(len(pools), 2)
+        self.assertIsNotNone(pools[0])
+        self.assertIsNot(pools[0], pools[1])
+
     def test_child_batch_updates_parent_once_after_children_succeed(self):
         calls = []
         batch_args = [self.make_run_args(None, "first"), self.make_run_args(None, "second")]

@@ -37,11 +37,11 @@ from grafconflux._config.yaml_settings import (
 from grafconflux._shared.time import GrafanaTimeDownloader
 
 
-def run_from_config_file(config_file="config.yaml", **kwargs) -> None:
+def run_from_config_file(config_file="config.yaml", **kwargs):
     """Run GrafConflux from a YAML config and library-provided options."""
     from grafconflux.orchestration import run as orchestration_run
 
-    orchestration_run(options_from_config_file(config_file, **kwargs))
+    return orchestration_run(options_from_config_file(config_file, **kwargs))
 
 __all__ = [
     "DEFAULT_CONFLUENCE_UPLOAD_THREADS",

@@ -187,6 +187,17 @@ class TestPhase2Compatibility(unittest.TestCase):
         self.assertEqual(uploader.snapshot_urls, [])
         self.assertEqual(uploader.panels[0].links, ["panel-link"])
 
+    def test_upload_only_empty_panel_metadata_is_accepted(self) -> None:
+        uploader = GrafanaConfigUploader("demo", {
+            "panels": [],
+            "full_links": [],
+            "charts_path": "unused",
+            "timestamps": [],
+        })
+
+        self.assertEqual(uploader.panels, [])
+        self.assertEqual(uploader.timestamps, [])
+
     def test_public_run_options_contract_fields_remain_stable(self) -> None:
         self.assertEqual(
             [field.name for field in fields(GrafConfluxRunOptions)],
@@ -255,9 +266,10 @@ class TestPhase2PipelineOrdering(unittest.TestCase):
         manager._GrafanaManager__save_params_to_file = Mock(side_effect=lambda timestamps, folder: calls.append("metadata"))
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            manager.download_charts(temp_dir, [task.timestamp])
+            with self.assertRaisesRegex(RuntimeError, "download failed"):
+                manager.download_charts(temp_dir, [task.timestamp])
 
-        self.assertEqual(calls, ["panels", "snapshot", "metadata"])
+        self.assertEqual(calls, ["panels"])
         self.assertEqual(manager.browser_list, [])
 
     @staticmethod

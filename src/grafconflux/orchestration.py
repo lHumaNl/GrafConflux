@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from grafconflux._orchestration.runner import (
+    ConfluencePageLink,
     RunArgs,
+    RunResult,
     _build_test_folder,
     _load_upload_configs,
     _raise_failed_futures,
@@ -34,8 +36,8 @@ from grafconflux.confluence import ConfluenceManager
 from grafconflux.grafana import GrafanaConfigDownloader, GrafanaConfigUploader, GrafanaManager
 
 
-def run(args: RunArgs) -> None:
-    _run_impl(args, ConfluenceManager, GrafanaManager, process_grafana_dashboard)
+def run(args: RunArgs) -> RunResult:
+    return _run_impl(args, ConfluenceManager, GrafanaManager, process_grafana_dashboard)
 
 
 def upload_already_downloaded_graphs(args: RunArgs):
@@ -63,10 +65,12 @@ def process_grafana_dashboard(
 
 __all__ = [
     "ConfluenceManager",
+    "ConfluencePageLink",
     "GrafanaConfigDownloader",
     "GrafanaConfigUploader",
     "GrafanaManager",
     "RunArgs",
+    "RunResult",
     "_UploadMergeState",
     "_build_test_folder",
     "_copy_snapshot_backups",

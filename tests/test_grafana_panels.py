@@ -926,6 +926,23 @@ class TestGrafanaPanels(unittest.TestCase):
         self.assertEqual(fallback_query["viewPanel"], ["21"])
         self.assertEqual(task.panel.links[0], fallback_probe)
 
+    def test_download_chart_render_mode_raises_without_writing_missing_image(self):
+        manager = self.create_manager(timeout=45)
+        manager.dashboard_url = "/d/dashboard-uid/dashboard"
+        timestamp = self.create_timestamps(count=1)[0]
+        task = PanelRenderTask(Panel(21, "graph", "Memory", 1), timestamp)
+        response = Mock(status_code=500, content=b"")
+        response.raise_for_status = Mock(side_effect=RuntimeError("render failed"))
+        manager.session.get = Mock(return_value=response)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager.charts_path = temp_dir
+            with self.assertRaisesRegex(RuntimeError, "Failed to download chart"):
+                manager._GrafanaManager__download_chart(task)
+            self.assertFalse(os.path.exists(os.path.join(temp_dir, "demo__21__0.png")))
+
+        self.assertIsNone(task.panel.links[0])
+
     def test_take_screenshot_first_use_records_fullscreen_route(self):
         manager = self.create_manager(render=False, timeout=45)
         task = self.create_screenshot_task()
@@ -992,6 +1009,19 @@ class TestGrafanaPanels(unittest.TestCase):
         self.assertNotIn("no captured HTTP response", "\n".join(logs.output))
         self.assertEqual(browser.visited_urls, [f"{final_url}&fullscreen", final_url])
         self.assertEqual(browser.saved_paths, ["panel.png"])
+
+    def test_take_screenshot_raises_when_fullscreen_and_fallback_fail(self):
+        manager = self.create_manager(render=False, timeout=45)
+        task = self.create_screenshot_task()
+        final_url = "https://grafana.example/panel?viewPanel=17"
+        browser = FakeScreenshotBrowser({f"{final_url}&fullscreen": 500, final_url: 500})
+        manager.thread_local.is_fullscreen = None
+        manager._GrafanaManager__get_panel_data_sources = Mock(return_value=[])
+
+        with self.assertRaisesRegex(RuntimeError, "Failed to take screenshot"):
+            manager._GrafanaManager__take_screenshot(browser, task, final_url, "panel.png")
+
+        self.assertEqual(browser.saved_paths, [])
 
     def test_take_screenshot_reuses_detected_fullscreen_route(self):
         manager = self.create_manager(render=False, timeout=45)

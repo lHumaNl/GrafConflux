@@ -190,6 +190,44 @@ class TestConfluenceContent(unittest.TestCase):
         self.assertIn("<h3>Renamed CPU</h3>", content)
         self.assertIn("<ac:parameter ac:name=\"title\">Renamed CPU</ac:parameter>", content)
 
+    def test_build_confluence_storage_content_orders_panels_and_variant_composite_artifacts(self):
+        panel = Panel(17, "timeseries", "CPU", 1, ["https://grafana.example/panel/17"])
+        panel.order_index = 2
+        panel.artifacts = [
+            {
+                "artifact_type": "composite",
+                "order_index": 3,
+                "render_status": "rendered",
+                "png_file": "Demo__composite-overview__0.png",
+                "link": "https://grafana.example/composite",
+                "composite": {"title": "Overview"},
+            },
+            {
+                "artifact_type": "variant",
+                "order_index": 1,
+                "render_status": "rendered",
+                "png_file": "Demo__17__variant-00-000-deadbeef__0.png",
+                "link": None,
+                "variant": {"label": "Service: api"},
+            },
+        ]
+        earlier_panel = Panel(5, "timeseries", "Memory", 1, ["https://grafana.example/panel/5"])
+        earlier_panel.order_index = 1
+        configs = [SimpleNamespace(
+            name="Demo dashboard",
+            full_links=["https://grafana.example/d/demo?from=1&to=2"],
+            backup_dashboard_links=[],
+            snapshot_urls=None,
+            panels=[panel, earlier_panel],
+        )]
+
+        content = build_confluence_storage_content(configs, self.timestamps, 900)
+
+        self.assertLess(content.index("<h3>Memory</h3>"), content.index("<h3>CPU</h3>"))
+        self.assertLess(content.index("Service: api"), content.index("Overview"))
+        self.assertIn("<a href=\"https://grafana.example/panel/17\">Service: api</a>", content)
+        self.assertIn("<a href=\"https://grafana.example/composite\">Overview</a>", content)
+
     def test_build_confluence_storage_content_normalizes_all_repeat_value_in_titles(self):
         panel = Panel(17, "timeseries", "CPU by iface", 1, ["legacy-link"])
         panel.is_repeating = True
@@ -376,7 +414,10 @@ class TestConfluenceContent(unittest.TestCase):
         child_page = manager.create_or_get_child_page(123, args)
 
         self.assertEqual(args.confluence_page_id, 456)
-        self.assertEqual(child_page, ChildPageInclude("Child", "OPS"))
+        self.assertEqual(
+            child_page,
+            ChildPageInclude("Child", "OPS", 456, "https://wiki.example/pages/viewpage.action?pageId=456"),
+        )
         confluence.create_page.assert_called_once_with(
             space="OPS",
             title="Child",
@@ -406,5 +447,20 @@ class TestConfluenceContent(unittest.TestCase):
         child_page = manager.create_or_get_child_page(123, args)
 
         self.assertEqual(args.confluence_page_id, 456)
-        self.assertEqual(child_page, ChildPageInclude("Child", "OPS"))
+        self.assertEqual(
+            child_page,
+            ChildPageInclude("Child", "OPS", 456, "https://wiki.example/pages/viewpage.action?pageId=456"),
+        )
         confluence.create_page.assert_not_called()
+
+    def test_build_confluence_page_url_preserves_subpath_and_trailing_slash(self):
+        url = confluence.build_confluence_page_url("https://wiki.example/confluence/", 789)
+
+        self.assertEqual(url, "https://wiki.example/confluence/pages/viewpage.action?pageId=789")
+
+    def test_build_confluence_page_url_prefers_metadata_webui(self):
+        page = {"_links": {"base": "https://wiki.example/confluence", "webui": "/display/OPS/Page"}}
+
+        url = confluence.build_confluence_page_url("https://fallback.example", 789, page)
+
+        self.assertEqual(url, "https://wiki.example/confluence/display/OPS/Page")
