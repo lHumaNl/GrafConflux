@@ -15,6 +15,7 @@ import demjson3
 import yaml
 
 from grafconflux._shared.time import GrafanaTimeDownloader, GrafanaTimeUploader
+from grafconflux._shared.confluence_settings import confluence_rendering_settings_from_config
 from grafconflux._grafana.browser_session import GrafanaBrowserSession
 from grafconflux._grafana.lookup import log_lookup_mode, search_params, select_dashboard
 from grafconflux._grafana.playwright_screenshots import PlaywrightPanelScreenshotRunner
@@ -1057,6 +1058,7 @@ class GrafanaManager:
             'timestamps': self.convert_to_dict(timestamps),
             'panels': self.convert_to_dict(self.config.panels),
             'manifest': dashboard_manifest_metadata(self.config),
+            'confluence_rendering': self.config.confluence_rendering.to_metadata(),
         }
 
         if self.config.render_matrix:
@@ -1424,10 +1426,12 @@ class GrafanaManager:
             config = yaml.safe_load(file) or {}
 
         dashboards = GrafanaManager._dashboard_configs_from_yaml(config)
+        confluence_rendering = confluence_rendering_settings_from_config(config).to_metadata()
         configs = []
         for order_index, (config_name, config_data) in enumerate(dashboards.items()):
             config_data = dict(config_data)
             config_data['order_index'] = order_index
+            config_data['confluence_rendering'] = confluence_rendering
             configs.append(GrafanaConfigDownloader(config_name, config_data))
         return configs
 

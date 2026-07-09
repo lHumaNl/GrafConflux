@@ -5,6 +5,15 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from typing import List, Optional
 
 from grafconflux._shared.display import normalize_grafana_display_value
+from grafconflux._shared.confluence_settings import (
+    ConfluenceRenderingSettings,
+    DESCRIPTION_BACKUP_DASHBOARD_LINKS,
+    DESCRIPTION_DASHBOARD_LINKS,
+    DESCRIPTION_PANELS,
+    DESCRIPTION_TEST_TIMES,
+    effective_time_zone,
+    format_timestamp_time,
+)
 from grafconflux._shared.grafana_models import GrafanaConfigBase
 from grafconflux._shared.time import GrafanaTimeBase
 from grafconflux._confluence.matrix_content import has_matrix_artifacts, render_matrix_dashboard
@@ -26,31 +35,7 @@ class ChildPageInclude:
     page_id: int | None = None
     page_url: str | None = None
 
-__all__ = (
-    'GRAPHS_PLACEHOLDER',
-    '_artifact_has_rendered_png',
-    '_artifact_title',
-    '_dashboard_period',
-    '_first_panel_link',
-    '_non_repeating_artifact_title',
-    '_panel_period',
-    '_render_dashboard_links',
-    '_render_backup_dashboard_links',
-    '_render_dashboards_section',
-    '_render_panel_artifacts',
-    '_render_panel_timestamps',
-    '_render_panels',
-    '_render_snapshot_backup_section',
-    '_render_test_times_section',
-    'apply_graphs_placeholder',
-    'apply_graphs_placeholder_if_present',
-    'build_child_page_title',
-    'build_confluence_storage_content',
-    'build_parent_include_content',
-    'sanitize_confluence_page_title',
-    'ChildPageInclude',
-    'DEFAULT_CHILD_TITLE_PREFIX',
-)
+__all__ = ('GRAPHS_PLACEHOLDER', '_artifact_has_rendered_png', '_artifact_title', '_dashboard_period', '_first_panel_link', '_non_repeating_artifact_title', '_panel_period', '_render_dashboard_links', '_render_backup_dashboard_links', '_render_dashboards_section', '_render_panel_artifacts', '_render_panel_timestamps', '_render_panels', '_render_snapshot_backup_section', '_render_test_times_section', 'apply_graphs_placeholder', 'apply_graphs_placeholder_if_present', 'build_child_page_title', 'build_confluence_storage_content', 'build_parent_include_content', 'sanitize_confluence_page_title', 'ChildPageInclude', 'DEFAULT_CHILD_TITLE_PREFIX')
 
 
 def apply_graphs_placeholder(body: str, new_content: str) -> str:
@@ -167,14 +152,23 @@ def _render_include_page_macro(child_page: ChildPageInclude) -> str:
 
 
 def build_confluence_storage_content(grafana_configs: List[GrafanaConfigBase], timestamps: List[GrafanaTimeBase],
-                                     graph_width: int, snapshot_list: Optional[List[str]] = None) -> str:
+                                      graph_width: int, snapshot_list: Optional[List[str]] = None) -> str:
     """Build Confluence storage-format HTML for downloaded Grafana artifacts."""
+    settings = _rendering_settings(grafana_configs)
     new_content = ''
     if snapshot_list:
         new_content += _render_snapshot_backup_section(snapshot_list)
-    new_content += _render_test_times_section(timestamps)
-    new_content += _render_dashboards_section(grafana_configs, timestamps, graph_width)
+    new_content += _render_test_times_section(timestamps, settings)
+    new_content += _render_dashboards_section(grafana_configs, timestamps, graph_width, settings)
     return new_content
+
+
+def _rendering_settings(grafana_configs: List[GrafanaConfigBase]) -> ConfluenceRenderingSettings:
+    for grafana_config in grafana_configs:
+        settings = getattr(grafana_config, 'confluence_rendering', None)
+        if isinstance(settings, ConfluenceRenderingSettings):
+            return settings
+    return ConfluenceRenderingSettings()
 
 
 def _render_snapshot_backup_section(snapshot_list: List[str]) -> str:
@@ -191,18 +185,23 @@ def _render_snapshot_backup_section(snapshot_list: List[str]) -> str:
     return new_content
 
 
-def _render_test_times_section(timestamps: List[GrafanaTimeBase]) -> str:
+def _render_test_times_section(timestamps: List[GrafanaTimeBase],
+                               settings: ConfluenceRenderingSettings | None = None) -> str:
+    settings = settings or ConfluenceRenderingSettings()
+    zone = effective_time_zone(settings)
+    title = f'{settings.label(DESCRIPTION_TEST_TIMES)} ({zone.label})'
     new_content = '<ac:structured-macro ac:name="expand">\n'
-    new_content += '  <ac:parameter ac:name="title">Test times</ac:parameter>\n'
+    new_content += f'  <ac:parameter ac:name="title">{html.escape(title)}</ac:parameter>\n'
     new_content += '  <ac:rich-text-body>\n'
+    new_content += f'<p>Timezone: {html.escape(zone.label)}</p>\n'
     new_content += '<table>\n  <tbody>\n    <tr>\n'
     new_content += '      <th>Test tag</th>\n      <th>Start test time</th>\n'
     new_content += '      <th>End test time</th>\n    </tr>\n'
     for timestamp in timestamps:
         new_content += '    <tr>\n'
         new_content += f'      <td>{html.escape(str(timestamp.time_tag))}</td>\n'
-        new_content += f'      <td>{html.escape(str(timestamp.start_time_human))}</td>\n'
-        new_content += f'      <td>{html.escape(str(timestamp.end_time_human))}</td>\n'
+        new_content += f'      <td>{html.escape(format_timestamp_time(timestamp, "start", settings))}</td>\n'
+        new_content += f'      <td>{html.escape(format_timestamp_time(timestamp, "end", settings))}</td>\n'
         new_content += '    </tr>\n'
     new_content += '  </tbody>\n</table>\n'
     new_content += '  </ac:rich-text-body>\n</ac:structured-macro>\n'
@@ -210,35 +209,54 @@ def _render_test_times_section(timestamps: List[GrafanaTimeBase]) -> str:
 
 
 def _render_dashboards_section(grafana_configs: List[GrafanaConfigBase], timestamps: List[GrafanaTimeBase],
-                               graph_width: int) -> str:
+                               graph_width: int, settings: ConfluenceRenderingSettings | None = None) -> str:
+    settings = settings or ConfluenceRenderingSettings()
     new_content = ''
     for grafana_config in grafana_configs:
         matrix_artifacts_present = has_matrix_artifacts(grafana_config)
         dash_title = html.escape(grafana_config.name)
-        new_content += f'<h2>{dash_title}</h2>\n<p>Dashboard links</p>\n'
-        new_content += _render_dashboard_links(grafana_config, timestamps)
-        if _has_matrix_dashboard_links(grafana_config) and not matrix_artifacts_present:
-            new_content += '<p>Matrix dashboard links</p>\n'
-            new_content += _render_matrix_dashboard_links(grafana_config)
-        if getattr(grafana_config, 'backup_dashboard_links', []):
-            new_content += '<p>Backup dashboard links</p>\n'
+        new_content += f'<h2>{dash_title}</h2>\n'
+        dashboard_links = ''
+        if settings.dashboard_links_at_dashboard(matrix_artifacts_present):
+            dashboard_links += _render_dashboard_links(grafana_config, timestamps)
+        if _should_render_matrix_links_at_dashboard(grafana_config, matrix_artifacts_present, settings):
+            dashboard_links += _render_matrix_dashboard_links(grafana_config)
+        if dashboard_links:
+            new_content += f'<p>{html.escape(settings.label(DESCRIPTION_DASHBOARD_LINKS))}</p>\n'
+            new_content += dashboard_links
+        if settings.enabled(DESCRIPTION_BACKUP_DASHBOARD_LINKS) and getattr(grafana_config, 'backup_dashboard_links', []):
+            label = html.escape(settings.label(DESCRIPTION_BACKUP_DASHBOARD_LINKS))
+            new_content += f'<p>{label}</p>\n'
             new_content += _render_backup_dashboard_links(grafana_config, timestamps)
         if matrix_artifacts_present:
-            new_content += _render_matrix_dashboard(grafana_config, graph_width)
+            new_content += _render_matrix_dashboard(grafana_config, graph_width, settings)
             continue
-        new_content += '<p>Panels</p>\n'
-        new_content += f'<ac:structured-macro ac:name="expand">\n'
-        new_content += f'  <ac:parameter ac:name="title">{dash_title}</ac:parameter>\n'
-        new_content += '  <ac:rich-text-body>\n'
-        new_content += _render_panels(grafana_config, timestamps, graph_width)
-        new_content += '  </ac:rich-text-body>\n</ac:structured-macro>\n'
+        new_content += _render_panel_root(grafana_config, timestamps, graph_width, settings, dash_title)
     return new_content
 
 
-def _render_matrix_dashboard(grafana_config: GrafanaConfigBase, graph_width: int) -> str:
-    new_content = '<p>Panels</p>\n'
-    new_content += render_matrix_dashboard(grafana_config, graph_width)
-    return new_content
+def _render_panel_root(grafana_config: GrafanaConfigBase, timestamps: List[GrafanaTimeBase],
+                       graph_width: int, settings: ConfluenceRenderingSettings, dash_title: str) -> str:
+    panels = _render_panels(grafana_config, timestamps, graph_width)
+    if not settings.enabled(DESCRIPTION_PANELS):
+        return panels
+    content = f'<p>{html.escape(settings.label(DESCRIPTION_PANELS))}</p>\n'
+    content += f'<ac:structured-macro ac:name="expand">\n'
+    content += f'  <ac:parameter ac:name="title">{dash_title}</ac:parameter>\n'
+    content += '  <ac:rich-text-body>\n'
+    content += panels
+    content += '  </ac:rich-text-body>\n</ac:structured-macro>\n'
+    return content
+
+
+def _render_matrix_dashboard(grafana_config: GrafanaConfigBase, graph_width: int,
+                             settings: ConfluenceRenderingSettings) -> str:
+    return render_matrix_dashboard(grafana_config, graph_width, settings)
+
+
+def _should_render_matrix_links_at_dashboard(grafana_config: GrafanaConfigBase, matrix_artifacts_present: bool,
+                                              settings: ConfluenceRenderingSettings) -> bool:
+    return _has_matrix_dashboard_links(grafana_config) and settings.dashboard_links_at_dashboard(matrix_artifacts_present)
 
 
 def _render_dashboard_links(grafana_config: GrafanaConfigBase, timestamps: List[GrafanaTimeBase]) -> str:

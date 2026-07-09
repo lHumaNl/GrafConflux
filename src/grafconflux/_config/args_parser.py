@@ -221,6 +221,7 @@ class ArgsParser:
         self.playwright_browser: Optional[str] = args.playwright_browser
         self.playwright_browser_channel: Optional[str] = args.playwright_browser_channel
         self.playwright_browser_executable_path: Optional[str] = args.playwright_browser_executable_path
+        self.confluence_rendering = yaml_settings.confluence_rendering
         self.batch_run_args: List[ArgsParser] = []
 
         self.timestamps: List[GrafanaTimeDownloader] = []

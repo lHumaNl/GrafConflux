@@ -25,6 +25,8 @@ class _UploadMergeState:
     full_links: dict[str, list] = field(default_factory=dict)
     matrix_dashboard_links: dict[str, list] = field(default_factory=dict)
     backup_dashboard_links: dict[str, list] = field(default_factory=dict)
+    confluence_rendering: dict[str, dict] = field(default_factory=dict)
+    render_matrix: dict[str, dict | None] = field(default_factory=dict)
     timestamps: dict[str, list] = field(default_factory=dict)
     panels: dict[str, list] = field(default_factory=dict)
 
@@ -36,6 +38,8 @@ class _UploadMergeState:
         self.full_links[grafana_config.name] = []
         self.matrix_dashboard_links[grafana_config.name] = []
         self.backup_dashboard_links[grafana_config.name] = list(grafana_config.backup_dashboard_links)
+        self.confluence_rendering[grafana_config.name] = grafana_config.confluence_rendering.to_metadata()
+        self.render_matrix[grafana_config.name] = getattr(grafana_config, 'render_matrix', None)
         self.timestamps[grafana_config.name] = []
         self.panels[grafana_config.name] = []
 
@@ -175,6 +179,8 @@ def _merged_upload_config_dict(
         'full_links': merge_state.full_links[config_name],
         'matrix_dashboard_links': merge_state.matrix_dashboard_links[config_name],
         'backup_dashboard_links': merge_state.backup_dashboard_links[config_name],
+        'confluence_rendering': merge_state.confluence_rendering[config_name],
+        'render_matrix': merge_state.render_matrix[config_name],
         'timestamps': merge_state.timestamps[config_name],
         'panels': merge_state.panels[config_name],
         'charts_path': os.path.join(new_folder_graphs, config_name),

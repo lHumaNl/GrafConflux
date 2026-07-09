@@ -4,6 +4,10 @@ from abc import ABC
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Pattern, Tuple
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from grafconflux._shared.confluence_settings import (
+    ConfluenceRenderingSettings,
+    confluence_rendering_settings_from_metadata,
+)
 from grafconflux._shared.time import GrafanaTimeDownloader, GrafanaTimeUploader
 
 logger = logging.getLogger('grafconflux.grafana')
@@ -275,6 +279,8 @@ class GrafanaConfigBase(ABC):
         self.manifest: Dict[str, Any] = {}; self.order_index: Optional[int] = None
         self.folder_title: Optional[str] = None
         self.matrix_dashboard_links: List[Dict[str, Any]] = []
+        self.render_matrix: Optional[Dict[str, Any]] = None
+        self.confluence_rendering: ConfluenceRenderingSettings = ConfluenceRenderingSettings()
 
 
 class GrafanaConfigUploader(GrafanaConfigBase):
@@ -295,6 +301,8 @@ class GrafanaConfigUploader(GrafanaConfigBase):
         self.full_links: Optional[List[str]] = config['full_links']; self.snapshot_urls: Optional[List[str]] = config.get('snapshot_urls', [])
         self.backup_dashboard_links: List[str] = config.get('backup_dashboard_links', []) or []
         self.matrix_dashboard_links: List[Dict[str, Any]] = config.get('matrix_dashboard_links', []) or []
+        self.render_matrix: Optional[Dict[str, Any]] = config.get('render_matrix')
+        self.confluence_rendering = confluence_rendering_settings_from_metadata(config)
         self.charts_path: str = config['charts_path']; self.timestamps: List[GrafanaTimeUploader] = []
         for timestamp in config['timestamps']:
             self.timestamps.append(timestamp if isinstance(timestamp, GrafanaTimeUploader) else GrafanaTimeUploader(timestamp))
@@ -393,6 +401,7 @@ class GrafanaConfigDownloader(GrafanaConfigBase):
         self.rename_panels: List[Dict[str, Any]] = _validated_rename_panels(self.name, config)
         self.panel_variants: List[Dict[str, Any]] = _validated_panel_variants(self.name, config)
         self.render_matrix: Optional[Dict[str, Any]] = _validated_render_matrix(self.name, config)
+        self.confluence_rendering = confluence_rendering_settings_from_metadata(config)
         self.render_matrix_rows_by_timestamp: Dict[int, List[Dict[str, Any]]] = {}
         self.composites: List[Dict[str, Any]] = _validated_composites(self.name, config)
         _validate_dashboard_lookup(self.name, self.dashboard_uid, self.dash_title, self.folder, self.folder_uid)

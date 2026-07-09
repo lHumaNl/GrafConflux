@@ -1,6 +1,7 @@
 import ast
 import os
 import tempfile
+import time
 import unittest
 import warnings
 from datetime import datetime
@@ -8,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from grafconflux.args_parser import ArgsParser, GrafanaTimeDownloader
+from grafconflux._shared.confluence_settings import ConfluenceRenderingSettings, format_timestamp_time
 from grafconflux.config import parse_timestamps
 
 
@@ -81,6 +83,30 @@ class TestGrafanaTimeParsing(unittest.TestCase):
                 "Invalid/Zone",
             )
 
+    def test_invalid_fixed_offset_minutes_raise_clear_error(self):
+        for timezone_value in ("+03:60", "+03:99", "-05:60"):
+            with self.subTest(timezone_value=timezone_value):
+                with self.assertRaisesRegex(ValueError, "Invalid or unavailable timezone"):
+                    GrafanaTimeDownloader(
+                        "invalid__&from=1700000000&to=1700003600",
+                        0,
+                        timezone_value,
+                    )
+
+    @unittest.skipUnless(hasattr(time, "tzset"), "time.tzset is unavailable")
+    def test_host_default_timezone_uses_timestamp_specific_local_rules(self):
+        original_tz = os.environ.get("TZ")
+        self.addCleanup(self._restore_tz, original_tz)
+        os.environ["TZ"] = "America/New_York"
+        time.tzset()
+
+        settings = ConfluenceRenderingSettings()
+        winter_timestamp = GrafanaTimeDownloader("winter__&from=1736942400&to=1736946000", 0, "UTC")
+        summer_timestamp = GrafanaTimeDownloader("summer__&from=1750003200&to=1750006800", 1, "UTC")
+
+        self.assertEqual(format_timestamp_time(winter_timestamp, "start", settings), "2025/01/15 07:00:00")
+        self.assertEqual(format_timestamp_time(summer_timestamp, "start", settings), "2025/06/15 08:00:00")
+
     @staticmethod
     def _create_config(temp_dir: str) -> str:
         config_path = os.path.join(temp_dir, "config.yaml")
@@ -113,6 +139,15 @@ class TestGrafanaTimeParsing(unittest.TestCase):
             "--timestamps",
             "tag__&from=1700000000&to=1700003600",
         ]
+
+    @staticmethod
+    def _restore_tz(original_tz: str | None) -> None:
+        if original_tz is None:
+            os.unsetenv("TZ")
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = original_tz
+        time.tzset()
 
 
 class TestRemovedTimezoneDependency(unittest.TestCase):

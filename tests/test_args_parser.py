@@ -483,6 +483,72 @@ class TestArgsParser(unittest.TestCase):
         self.assertEqual(args.playwright_browser_channel, "chrome")
         self.assertEqual(args.playwright_browser_executable_path, "C:/Browsers/chrome.exe")
 
+    def test_yaml_description_settings_accept_stable_ids(self):
+        config_path = self.create_config(
+            "settings:\n"
+            "  description_rename:\n"
+            "    dashboard_links: Run dashboards\n"
+            "    backup_dashboard_links: Backup links\n"
+            "    panels: Charts\n"
+            "    test_times: Window\n"
+            "  description_switch:\n"
+            "    dashboard_links: true\n"
+            "    backup_dashboard_links: false\n"
+            "    panels: true\n"
+            "    test_times: true\n"
+            "  time_zone: '+03:00'\n"
+            "  dashboard_links_location: leaf\n"
+        )
+
+        args = self.parse_args(
+            [
+                "prog",
+                "--config",
+                config_path,
+                "--wiki_url",
+                "https://cli.example",
+                "--confluence_page_id",
+                "1",
+                "--timestamps",
+                "tag__&from=1700000000&to=1700003600",
+            ],
+            env={"CONFLUENCE_LOGIN": "user", "CONFLUENCE_PASSWORD": "secret"},
+        )
+
+        self.assertEqual(args.confluence_rendering.label("panels"), "Charts")
+        self.assertFalse(args.confluence_rendering.enabled("backup_dashboard_links"))
+        self.assertEqual(args.confluence_rendering.time_zone, "+03:00")
+
+    def test_yaml_description_settings_reject_unknown_ids_and_disabled_test_times(self):
+        cases = [
+            ("description_rename:\n    unknown: Label", "unknown description id"),
+            ("description_switch:\n    test_times: false", "test_times cannot be disabled"),
+            ("time_zone: Invalid/Zone", "Invalid or unavailable timezone"),
+            ("time_zone: '+03:60'", "Invalid or unavailable timezone"),
+            ("time_zone: '+03:99'", "Invalid or unavailable timezone"),
+            ("time_zone: '-05:60'", "Invalid or unavailable timezone"),
+            ("dashboard_links_location: top", "dashboard_links_location"),
+        ]
+
+        for yaml_body, expected_error in cases:
+            with self.subTest(yaml_body=yaml_body):
+                config_path = self.create_config(f"settings:\n  {yaml_body}\n")
+                with self.assertRaisesRegex(ValueError, expected_error):
+                    self.parse_args(
+                        [
+                            "prog",
+                            "--config",
+                            config_path,
+                            "--wiki_url",
+                            "https://cli.example",
+                            "--confluence_page_id",
+                            "1",
+                            "--timestamps",
+                            "tag__&from=1700000000&to=1700003600",
+                        ],
+                        env={"CONFLUENCE_LOGIN": "user", "CONFLUENCE_PASSWORD": "secret"},
+                    )
+
     def test_cli_playwright_browser_options_override_yaml_settings(self):
         config_path = self.create_config(
             "settings:\n"

@@ -13,6 +13,7 @@ from grafconflux._confluence.content import (
     sanitize_confluence_page_title,
 )
 from grafconflux.grafana import GrafanaConfigUploader, Panel
+from grafconflux._shared.confluence_settings import ConfluenceRenderingSettings
 
 
 class TestConfluenceContent(unittest.TestCase):
@@ -136,6 +137,41 @@ class TestConfluenceContent(unittest.TestCase):
         self.assertIn('2025/01/01 &lt;start&gt; &amp; &quot;quoted&quot;', content)
         self.assertIn('2025/01/01 &lt;/end&gt; &amp; &#x27;quoted&#x27;', content)
         self.assertNotIn('<script>alert("tag")</script>', content)
+
+    def test_description_settings_rename_and_switch_optional_blocks(self):
+        config = self.grafana_configs[0]
+        config.backup_dashboard_links = ["https://backup.example/d/demo"]
+        config.confluence_rendering = ConfluenceRenderingSettings(
+            description_rename={"dashboard_links": "Run dashboards", "panels": "Charts", "test_times": "Window"},
+            description_switch={"dashboard_links": False, "backup_dashboard_links": False, "panels": True},
+            time_zone="+03:00",
+        )
+        self.timestamps[0].start_time_timestamp = 1700000000000
+        self.timestamps[0].end_time_timestamp = 1700003600000
+
+        content = build_confluence_storage_content([config], self.timestamps, 900)
+
+        self.assertIn("Window (+03:00)", content)
+        self.assertIn("2023/11/15 01:13:20", content)
+        self.assertIn("Charts", content)
+        self.assertNotIn("Run dashboards", content)
+        self.assertNotIn("Backup dashboard links", content)
+
+    def test_host_timezone_label_does_not_pin_current_offset(self):
+        content = build_confluence_storage_content(self.grafana_configs, self.timestamps, 900)
+
+        self.assertIn("Test times (host timezone)", content)
+        self.assertIn("Timezone: host timezone", content)
+
+    def test_disabled_panels_label_keeps_panel_images_visible(self):
+        config = self.grafana_configs[0]
+        config.confluence_rendering = ConfluenceRenderingSettings(description_switch={"panels": False})
+
+        content = build_confluence_storage_content([config], self.timestamps, 900)
+
+        self.assertNotIn("<p>Panels</p>", content)
+        self.assertIn("Demo dashboard__7__0.png", content)
+        self.assertIn('<ac:structured-macro ac:name="expand">', content)
 
     def test_build_confluence_storage_content_groups_repeating_artifacts(self):
         panel = Panel(17, "timeseries", "CPU by host", 1, ["legacy-link"])

@@ -139,6 +139,30 @@ Confluence SSL verification:
 - CLI: `--confluence_verify_ssl true|false`
 - YAML: `settings.confluence_verify_ssl`
 
+Confluence report layout can also be controlled with stable description ids:
+
+```yaml
+settings:
+  description_rename:
+    dashboard_links: Dashboard links
+    backup_dashboard_links: Backup links
+    panels: Charts
+    test_times: Test times
+  description_switch:
+    dashboard_links: true
+    backup_dashboard_links: false
+    panels: true
+    test_times: true
+  time_zone: Europe/Moscow
+  dashboard_links_location: leaf
+```
+
+- Supported description ids: `dashboard_links`, `backup_dashboard_links`, `panels`, `test_times`.
+- `test_times` is mandatory and cannot be disabled.
+- `time_zone` accepts an IANA name or a fixed offset such as `+03:00`; if omitted, the Confluence `Test times` section uses the host timezone.
+- `dashboard_links_location` supports `leaf` (default), `dashboard`, and `none`.
+- Matrix layouts omit the root visible `Panels` wrapper; `description_switch.panels: false` only hides the label/wrapper and never suppresses downloaded images.
+
 ## Grafana rendering modes
 
 ### `render: true`
@@ -420,6 +444,7 @@ dashboards:
 - `grafana_variable`: actual Grafana URL variable name. Default is the matrix key.
 - `label_template`: optional row label built from variable keys or aliases, for example `{environment} / {Service}`.
 - `combination_mode`: `product` (default) or `zip`.
+- `layout`: optional Confluence matrix layout. Use `matrix_values_first` to place matrix branches before dashboard/panel grouping.
 - `max_rows`: optional hard limit for resolved matrix rows. Default is 500.
 - Static dashboard `vars` are kept and merged with matrix variables in panel and dashboard links.
 - Matrix filenames use stable hashes, not raw variable values.

@@ -7,6 +7,10 @@ from collections import OrderedDict
 from typing import Any
 
 from grafconflux._shared.display import normalize_grafana_display_value
+from grafconflux._shared.confluence_settings import (
+    ConfluenceRenderingSettings,
+    DESCRIPTION_DASHBOARD_LINKS,
+)
 from grafconflux._confluence.row_groups import group_entries_by_row, row_group_title
 
 
@@ -14,44 +18,60 @@ def has_matrix_artifacts(grafana_config: Any) -> bool:
     return any(_matrix_artifacts(panel) for panel in getattr(grafana_config, "panels", []) or [])
 
 
-def render_matrix_dashboard(grafana_config: Any, graph_width: int) -> str:
+def render_matrix_dashboard(grafana_config: Any, graph_width: int,
+                            settings: ConfluenceRenderingSettings | None = None) -> str:
+    settings = settings or _settings_for_config(grafana_config)
+    if _matrix_layout(grafana_config) == "matrix_values_first":
+        return _render_context_sections(grafana_config, graph_width, settings, full_context=True)
     title = html.escape(str(grafana_config.name))
     content = '<ac:structured-macro ac:name="expand">\n'
     content += f'  <ac:parameter ac:name="title">{title}</ac:parameter>\n'
     content += '  <ac:rich-text-body>\n'
-    content += _render_context_sections(grafana_config, graph_width)
+    content += _render_context_sections(grafana_config, graph_width, settings)
     content += '  </ac:rich-text-body>\n</ac:structured-macro>\n'
     return content
 
 
-def _render_context_sections(grafana_config: Any, graph_width: int) -> str:
-    sections = _context_sections(grafana_config)
-    return ''.join(_render_context_section(grafana_config, section, graph_width) for section in sections.values())
+def _settings_for_config(grafana_config: Any) -> ConfluenceRenderingSettings:
+    return getattr(grafana_config, "confluence_rendering", None) or ConfluenceRenderingSettings()
 
 
-def _context_sections(grafana_config: Any) -> OrderedDict[str, dict[str, Any]]:
+def _render_context_sections(grafana_config: Any, graph_width: int,
+                             settings: ConfluenceRenderingSettings, full_context: bool = False) -> str:
+    sections = _context_sections(grafana_config, full_context)
+    return ''.join(_render_context_section(grafana_config, section, graph_width, settings) for section in sections.values())
+
+
+def _context_sections(grafana_config: Any, full_context: bool = False) -> OrderedDict[str, dict[str, Any]]:
     sections: OrderedDict[str, dict[str, Any]] = OrderedDict()
     for panel in _ordered_panels(getattr(grafana_config, "panels", []) or []):
         for artifact in _matrix_artifacts(panel):
-            key, title = _section_key_title(grafana_config, artifact)
-            section = sections.setdefault(key, {"title": title, "panels": OrderedDict(), "context": _context_path(artifact)})
+            key, title = _section_key_title(grafana_config, artifact, full_context)
+            section = sections.setdefault(
+                key,
+                {"title": title, "panels": OrderedDict(), "context": _context_path(artifact), "full_context": full_context},
+            )
             panel_entry = section["panels"].setdefault(id(panel), {"panel": panel, "artifacts": []})
             panel_entry["artifacts"].append(artifact)
     return sections
 
 
-def _render_context_section(grafana_config: Any, section: dict[str, Any], graph_width: int) -> str:
+def _render_context_section(grafana_config: Any, section: dict[str, Any], graph_width: int,
+                            settings: ConfluenceRenderingSettings) -> str:
     content = f'<h3>{html.escape(section["title"])}</h3>\n'
-    content += '<p>Dashboard links</p>\n'
-    content += _render_section_dashboard_links(grafana_config, section["context"])
+    if settings.dashboard_links_at_leaf():
+        section_links = _render_section_dashboard_links(grafana_config, section["context"], section["full_context"])
+        if section_links:
+            content += f'<p>{html.escape(settings.label(DESCRIPTION_DASHBOARD_LINKS))}</p>\n'
+            content += section_links
     content += _render_row_groups(section["panels"].values(), graph_width)
     return content
 
 
-def _render_section_dashboard_links(grafana_config: Any, context_path: list[dict[str, str]]) -> str:
+def _render_section_dashboard_links(grafana_config: Any, context_path: list[dict[str, str]], full_context: bool) -> str:
     content = ''
     for link in getattr(grafana_config, "matrix_dashboard_links", []) or []:
-        if not _same_first_context(context_path, link.get("context_path") or []):
+        if not _same_link_context(context_path, link.get("context_path") or [], full_context):
             continue
         label = html.escape(str(link.get("label") or "Matrix"))
         url = html.escape(str(link.get("url") or ""))
@@ -115,13 +135,24 @@ def _render_artifact(panel: Any, artifact: dict[str, Any], graph_width: int) -> 
     return content
 
 
-def _section_key_title(grafana_config: Any, artifact: dict[str, Any]) -> tuple[str, str]:
+def _section_key_title(grafana_config: Any, artifact: dict[str, Any], full_context: bool = False) -> tuple[str, str]:
     context = _context_path(artifact)
     if not context:
         return "matrix", f"{grafana_config.name} (Matrix)"
+    if full_context:
+        return _full_context_key(context), _context_label(context)
     first = context[0]
     label = _context_item_label(first)
     return f'{first.get("key")}={first.get("value")}', f"{grafana_config.name} ({label})"
+
+
+def _full_context_key(context: list[dict[str, str]]) -> str:
+    return "|".join(f'{item.get("key")}={item.get("value")}' for item in context)
+
+
+def _matrix_layout(grafana_config: Any) -> str:
+    matrix = getattr(grafana_config, "render_matrix", None) or {}
+    return str(matrix.get("layout", "dashboard_first")) if isinstance(matrix, dict) else "dashboard_first"
 
 
 def _artifact_title(panel: Any, artifact: dict[str, Any]) -> str:
@@ -154,6 +185,16 @@ def _same_first_context(left: list[dict[str, str]], right: list[dict[str, str]])
     if not left or not right:
         return True
     return left[0].get("key") == right[0].get("key") and left[0].get("value") == right[0].get("value")
+
+
+def _same_link_context(left: list[dict[str, str]], right: list[dict[str, str]], full_context: bool) -> bool:
+    if not full_context:
+        return _same_first_context(left, right)
+    return _context_signature(left) == _context_signature(right)
+
+
+def _context_signature(context: list[dict[str, str]]) -> list[tuple[str | None, str | None]]:
+    return [(item.get("key"), item.get("value")) for item in context]
 
 
 def _matrix_artifacts(panel: Any) -> list[dict[str, Any]]:

@@ -1,6 +1,6 @@
 import re
 from abc import ABC
-from datetime import datetime, timezone, tzinfo
+from datetime import datetime, timedelta, timezone, tzinfo
 from typing import Dict, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -11,6 +11,7 @@ TIMESTAMP_SECONDS_LENGTH = 10
 ISO_TIME_RANGE_PATTERN = re.compile(r'&from=([\d\-T:.Z]+).*?&to=([\d\-T:.Z]+)')
 START_EPOCH_PATTERN = re.compile(r'&from=(\d+)')
 END_EPOCH_PATTERN = re.compile(r'&to=(\d+)')
+FIXED_OFFSET_PATTERN = re.compile(r'^([+-])(\d{2}):(\d{2})$')
 
 
 class GrafanaTimeBase(ABC):
@@ -72,10 +73,28 @@ class GrafanaTimeDownloader(GrafanaTimeBase):
 def _load_timezone(tz: str) -> tzinfo:
     if tz == "UTC":
         return timezone.utc
+    fixed_offset = _fixed_offset_timezone(tz)
+    if fixed_offset is not None:
+        return fixed_offset
     try:
         return ZoneInfo(tz)
     except ZoneInfoNotFoundError as error:
         raise ValueError(f"Invalid or unavailable timezone: {tz}") from error
+
+
+def _fixed_offset_timezone(tz: str) -> timezone | None:
+    match = FIXED_OFFSET_PATTERN.match(tz)
+    if match is None:
+        return None
+    sign, hours, minutes = match.groups()
+    hour_value = int(hours)
+    minute_value = int(minutes)
+    if minute_value >= 60:
+        raise ValueError(f"Invalid or unavailable timezone: {tz}")
+    offset = timedelta(hours=hour_value, minutes=minute_value)
+    if offset >= timedelta(hours=24):
+        raise ValueError(f"Invalid or unavailable timezone: {tz}")
+    return timezone(offset if sign == '+' else -offset, name=f'UTC{tz}')
 
 
 def _parse_iso_datetime(value: str) -> datetime:

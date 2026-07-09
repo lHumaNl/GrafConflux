@@ -1,6 +1,11 @@
 import os
 from typing import Any, Optional, TypeVar
 
+from grafconflux._shared.confluence_settings import (
+    ConfluenceRenderingSettings,
+    confluence_rendering_settings_from_config,
+)
+
 
 DEFAULT_GRAPH_WIDTH = 1500
 DEFAULT_THREADS = 4
@@ -93,6 +98,7 @@ class YamlSettings:
     playwright_browser_executable_path: Optional[str] = None
     confluence_child_title_prefix: Optional[str] = None
     confluence_child_title_from_test_id: Optional[bool] = None
+    confluence_rendering: ConfluenceRenderingSettings = ConfluenceRenderingSettings()
 
 
 def yaml_settings_from_config(config_data: dict) -> YamlSettings:
@@ -103,6 +109,7 @@ def yaml_settings_from_config(config_data: dict) -> YamlSettings:
         if setting_name in settings_data:
             value = _yaml_setting_value(setting_name, settings_data[setting_name])
             setattr(settings, setting_name, value)
+    settings.confluence_rendering = confluence_rendering_settings_from_config(config_data)
     return settings
 
 

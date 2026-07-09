@@ -8,6 +8,7 @@ from unittest.mock import Mock
 from grafconflux._confluence.content import build_confluence_storage_content
 from grafconflux._confluence.content import _grouped_matrix_artifacts
 from grafconflux._orchestration.upload_merge import _shift_matrix_dashboard_links, transform_grafana_configs
+from grafconflux._shared.confluence_settings import ConfluenceRenderingSettings
 from grafconflux.args_parser import GrafanaTimeDownloader
 from grafconflux.grafana import ConfigurationError, GrafanaConfigUploader, GrafanaManager, Panel
 
@@ -301,6 +302,36 @@ class TestRenderMatrixPlanning(unittest.TestCase):
         self.assertEqual(grafana.render_tasks[0].file_name, "Demo__17__0.png")
         self.assertIsNone(grafana.config.render_matrix)
 
+    def test_matrix_values_first_layout_is_accepted(self) -> None:
+        grafana = self.manager_from_config(
+            """
+            dashboards:
+              Demo:
+                grafana_url: https://grafana.example
+                dash_title: Demo
+                render_matrix:
+                  layout: matrix_values_first
+                  service: {values: [api]}
+            """
+        )
+
+        grafana.get_panels([self.timestamp()])
+
+        self.assertEqual(grafana.config.render_matrix["layout"], "matrix_values_first")
+        self.assertEqual(grafana.render_tasks[0].artifact["matrix"]["label"], "service: api")
+
+    def test_invalid_matrix_layout_fails(self) -> None:
+        with self.assertRaisesRegex(ValueError, "render_matrix.layout"):
+            GrafanaManager.load_grafana_config(self.config_path("""
+                dashboards:
+                  Demo:
+                    grafana_url: https://grafana.example
+                    dash_title: Demo
+                    render_matrix:
+                      layout: invalid
+                      service: {values: [api]}
+            """))
+
     def test_invalid_matrix_validation_fails_clearly(self) -> None:
         with self.assertRaisesRegex(ValueError, "render_matrix.variables"):
             GrafanaManager.load_grafana_config(self.config_path("""
@@ -479,6 +510,66 @@ class TestRenderMatrixReplayAndConfluence(unittest.TestCase):
 
         self.assertIn("Demo (Service: api)", content)
         self.assertIn("Requests (Service: api)", content)
+
+    def test_confluence_matrix_values_first_omits_root_panels_and_uses_leaf_links(self) -> None:
+        panel = Panel(17, "timeseries", "Requests", 1, [])
+        panel.artifacts = [{
+            "artifact_type": "matrix", "render_status": "rendered", "png_file": "Demo__17__matrix-000-hash__0.png",
+            "matrix": {"label": "Service: api", "context_path": [{"key": "service", "label": "Service", "value": "api"}]},
+        }]
+        timestamps = [SimpleNamespace(id_time=0, time_tag="smoke", start_time_human="start", end_time_human="end")]
+        config = SimpleNamespace(
+            name="Demo", full_links=["https://grafana.example/d"], backup_dashboard_links=[], snapshot_urls=None,
+            panels=[panel], matrix_dashboard_links=[{"label": "Service: api", "url": "https://grafana.example/d?var-service=api", "context_path": [{"key": "service", "value": "api"}]}],
+            render_matrix={"layout": "matrix_values_first"}, confluence_rendering=ConfluenceRenderingSettings(),
+        )
+
+        content = build_confluence_storage_content([config], timestamps, 600)
+
+        self.assertNotIn("<p>Panels</p>", content)
+        self.assertNotIn('ac:parameter ac:name="title">Demo</ac:parameter>', content)
+        self.assertIn("<h3>Service: api</h3>", content)
+        self.assertIn("https://grafana.example/d?var-service=api", content)
+
+    def test_confluence_matrix_values_first_skips_empty_leaf_dashboard_links_label(self) -> None:
+        panel = Panel(17, "timeseries", "Requests", 1, [])
+        panel.artifacts = [{
+            "artifact_type": "matrix", "render_status": "rendered", "png_file": "Demo__17__matrix-000-hash__0.png",
+            "matrix": {"label": "Service: api", "context_path": [{"key": "service", "label": "Service", "value": "api"}]},
+        }]
+        timestamps = [SimpleNamespace(id_time=0, time_tag="smoke", start_time_human="start", end_time_human="end")]
+        config = SimpleNamespace(
+            name="Demo", full_links=["https://grafana.example/d"], backup_dashboard_links=[], snapshot_urls=None,
+            panels=[panel], matrix_dashboard_links=[], render_matrix={"layout": "matrix_values_first"},
+            confluence_rendering=ConfluenceRenderingSettings(),
+        )
+
+        content = build_confluence_storage_content([config], timestamps, 600)
+
+        self.assertNotIn("<p>Dashboard links</p>", content)
+        self.assertIn("<h3>Service: api</h3>", content)
+
+    def test_confluence_dashboard_link_location_dashboard_keeps_matrix_dashboard_links(self) -> None:
+        panel = Panel(17, "timeseries", "Requests", 1, [])
+        panel.artifacts = [{
+            "artifact_type": "matrix", "render_status": "rendered", "png_file": "Demo__17__matrix-000-hash__0.png",
+            "matrix": {"label": "Service: api", "context_path": [{"key": "service", "label": "Service", "value": "api"}]},
+        }]
+        timestamps = [SimpleNamespace(id_time=0, time_tag="smoke", start_time_human="start", end_time_human="end")]
+        config = SimpleNamespace(
+            name="Demo",
+            full_links=["https://grafana.example/d?from=1&to=2"],
+            backup_dashboard_links=[],
+            snapshot_urls=None,
+            panels=[panel],
+            matrix_dashboard_links=[{"label": "Service: api", "url": "https://grafana.example/d?var-service=api", "context_path": [{"key": "service", "value": "api"}]}],
+            confluence_rendering=ConfluenceRenderingSettings(dashboard_links_location="dashboard"),
+        )
+
+        content = build_confluence_storage_content([config], timestamps, 600)
+
+        self.assertIn("https://grafana.example/d?var-service=api", content)
+        self.assertEqual(content.count("<p>Dashboard links</p>"), 1)
 
     def test_confluence_groups_same_panel_artifacts_under_one_expand_per_row(self) -> None:
         panel = Panel(17, "timeseries", "Requests", 1, ["https://grafana.example/panel/17"], row_title="Pods")

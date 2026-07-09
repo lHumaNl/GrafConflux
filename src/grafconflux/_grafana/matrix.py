@@ -15,8 +15,9 @@ RENDER_MATRIX_KEY = "render_matrix"
 DEFAULT_MAX_MATRIX_VALUES = 50
 DEFAULT_MAX_MATRIX_ROWS = 500
 MATRIX_MODES = {"product", "zip"}
+MATRIX_LAYOUTS = {"dashboard_first", "matrix_values_first"}
 MATRIX_OPTION_KEYS = {
-    "enabled", "variables", "row_grouping", "group_by", "combination_mode", "label_template", "max_rows",
+    "enabled", "variables", "row_grouping", "group_by", "combination_mode", "label_template", "max_rows", "layout",
 }
 logger = logging.getLogger(__name__)
 
@@ -93,10 +94,19 @@ def _validate_matrix(dashboard_name: str, matrix: dict[str, Any]) -> None:
         raise ConfigurationError(_path(dashboard_name, "variables") + ": expected non-empty mapping.")
     if matrix.get("combination_mode", "product") not in MATRIX_MODES:
         raise ConfigurationError(_path(dashboard_name, "combination_mode") + ": expected product or zip.")
+    _validate_layout(dashboard_name, matrix)
     _validate_max_rows(dashboard_name, matrix)
     _validate_group_by(dashboard_name, matrix, variables)
     _validate_variable_specs(dashboard_name, variables)
     _validate_label_template(dashboard_name, matrix, variables)
+
+
+def _validate_layout(dashboard_name: str, matrix: dict[str, Any]) -> None:
+    layout = matrix.get("layout", "dashboard_first")
+    if layout in MATRIX_LAYOUTS:
+        return
+    expected = ", ".join(sorted(MATRIX_LAYOUTS))
+    raise ConfigurationError(_path(dashboard_name, "layout") + f": expected one of [{expected}].")
 
 
 def _validate_group_by(dashboard_name: str, matrix: dict[str, Any], variables: dict[str, Any]) -> None:
