@@ -165,7 +165,8 @@ settings:
 - `time_format` is a Python `strftime` format for visible test times; default is `%d/%m/%Y %H:%M:%S`.
 - `timezone_label: false` hides the visible timezone line while keeping time conversion active.
 - `dashboard_links_location` supports `leaf` (default), `dashboard`, and `none`.
-- Matrix layouts omit the root visible `Panels` wrapper; `description_switch.panels: false` only hides the label/wrapper and never suppresses downloaded images.
+- Dashboard links render as links without a separate `Dashboard links` text label.
+- When enabled, `panels` is used as an expand macro title/container, not as a standalone paragraph label; `description_switch.panels: false` hides only that container and never suppresses downloaded images.
 
 ## Grafana rendering modes
 

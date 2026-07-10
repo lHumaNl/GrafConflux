@@ -8,7 +8,6 @@ from grafconflux._shared.display import normalize_grafana_display_value
 from grafconflux._shared.confluence_settings import (
     ConfluenceRenderingSettings,
     DESCRIPTION_BACKUP_DASHBOARD_LINKS,
-    DESCRIPTION_DASHBOARD_LINKS,
     DESCRIPTION_PANELS,
     DESCRIPTION_TEST_TIMES,
     effective_time_zone,
@@ -223,7 +222,6 @@ def _render_dashboards_section(grafana_configs: List[GrafanaConfigBase], timesta
         if _should_render_matrix_links_at_dashboard(grafana_config, matrix_artifacts_present, settings):
             dashboard_links += _render_matrix_dashboard_links(grafana_config)
         if dashboard_links:
-            new_content += f'<p>{html.escape(settings.label(DESCRIPTION_DASHBOARD_LINKS))}</p>\n'
             new_content += dashboard_links
         if settings.enabled(DESCRIPTION_BACKUP_DASHBOARD_LINKS) and getattr(grafana_config, 'backup_dashboard_links', []):
             label = html.escape(settings.label(DESCRIPTION_BACKUP_DASHBOARD_LINKS))
@@ -232,18 +230,18 @@ def _render_dashboards_section(grafana_configs: List[GrafanaConfigBase], timesta
         if matrix_artifacts_present:
             new_content += _render_matrix_dashboard(grafana_config, graph_width, settings)
             continue
-        new_content += _render_panel_root(grafana_config, timestamps, graph_width, settings, dash_title)
+        new_content += _render_panel_root(grafana_config, timestamps, graph_width, settings)
     return new_content
 
 
 def _render_panel_root(grafana_config: GrafanaConfigBase, timestamps: List[GrafanaTimeBase],
-                       graph_width: int, settings: ConfluenceRenderingSettings, dash_title: str) -> str:
+                       graph_width: int, settings: ConfluenceRenderingSettings) -> str:
     panels = _render_panels(grafana_config, timestamps, graph_width)
     if not settings.enabled(DESCRIPTION_PANELS):
         return panels
-    content = f'<p>{html.escape(settings.label(DESCRIPTION_PANELS))}</p>\n'
-    content += f'<ac:structured-macro ac:name="expand">\n'
-    content += f'  <ac:parameter ac:name="title">{dash_title}</ac:parameter>\n'
+    title = html.escape(settings.label(DESCRIPTION_PANELS))
+    content = f'<ac:structured-macro ac:name="expand">\n'
+    content += f'  <ac:parameter ac:name="title">{title}</ac:parameter>\n'
     content += '  <ac:rich-text-body>\n'
     content += panels
     content += '  </ac:rich-text-body>\n</ac:structured-macro>\n'
@@ -342,7 +340,6 @@ def _render_panel_entries(grafana_config: GrafanaConfigBase, timestamps: List[Gr
     for entry in entries:
         panel = entry['panel']
         row_title = html.escape(getattr(panel, 'display_title', panel.title))
-        new_content += f'<h3>{row_title}</h3>\n'
         new_content += f'<ac:structured-macro ac:name="expand">\n'
         new_content += f'  <ac:parameter ac:name="title">{row_title}</ac:parameter>\n'
         new_content += '  <ac:rich-text-body>\n'
@@ -398,7 +395,6 @@ def _has_matrix_artifacts(artifacts) -> bool:
 def _render_matrix_artifacts(panel, row_title: str, graph_width: int) -> str:
     new_content = ''
     for group_title, artifacts in _grouped_matrix_artifacts(panel.artifacts).items():
-        new_content += f'    <h4>{html.escape(group_title)}</h4>\n'
         new_content += '    <ac:structured-macro ac:name="expand">\n'
         new_content += f'      <ac:parameter ac:name="title">{html.escape(group_title)}</ac:parameter>\n'
         new_content += '      <ac:rich-text-body>\n'

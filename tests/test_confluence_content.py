@@ -117,8 +117,12 @@ class TestConfluenceContent(unittest.TestCase):
 
         self.assertIn("Demo &amp; dashboard", content)
         self.assertIn("CPU &amp; Memory", content)
+        self.assertIn('ac:parameter ac:name="title">Panels</ac:parameter>', content)
+        self.assertNotIn("<p>Dashboard links</p>", content)
+        self.assertNotIn("<p>Panels</p>", content)
         self.assertIn("snap&amp;one.json", content)
         self.assertIn("tag&amp;one", content)
+        self.assertIn("https://grafana.example/d?a=1&amp;b=2", content)
         self.assertIn("https://grafana.example/panel?a=1&amp;b=2", content)
 
     def test_build_confluence_storage_content_escapes_timestamp_table_cells(self):
@@ -246,7 +250,7 @@ class TestConfluenceContent(unittest.TestCase):
 
         content = build_confluence_storage_content(configs, self.timestamps, 900)
 
-        self.assertIn("<h3>Renamed CPU</h3>", content)
+        self.assertNotIn("<h3>Renamed CPU</h3>", content)
         self.assertIn("<ac:parameter ac:name=\"title\">Renamed CPU</ac:parameter>", content)
 
     def test_build_confluence_storage_content_orders_panels_and_variant_composite_artifacts(self):
@@ -282,7 +286,10 @@ class TestConfluenceContent(unittest.TestCase):
 
         content = build_confluence_storage_content(configs, self.timestamps, 900)
 
-        self.assertLess(content.index("<h3>Memory</h3>"), content.index("<h3>CPU</h3>"))
+        self.assertLess(
+            content.index('<ac:parameter ac:name="title">Memory</ac:parameter>'),
+            content.index('<ac:parameter ac:name="title">CPU</ac:parameter>'),
+        )
         self.assertLess(content.index("Service: api"), content.index("Overview"))
         self.assertIn("<a href=\"https://grafana.example/panel/17\">Service: api</a>", content)
         self.assertIn("<a href=\"https://grafana.example/composite\">Overview</a>", content)
