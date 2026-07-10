@@ -189,7 +189,7 @@ def _render_test_times_section(timestamps: List[GrafanaTimeBase],
                                settings: ConfluenceRenderingSettings | None = None) -> str:
     settings = settings or ConfluenceRenderingSettings()
     zone = effective_time_zone(settings)
-    title = f'{settings.label(DESCRIPTION_TEST_TIMES)} ({zone.label})'
+    title = settings.label(DESCRIPTION_TEST_TIMES)
     new_content = '<ac:structured-macro ac:name="expand">\n'
     new_content += f'  <ac:parameter ac:name="title">{html.escape(title)}</ac:parameter>\n'
     new_content += '  <ac:rich-text-body>\n'

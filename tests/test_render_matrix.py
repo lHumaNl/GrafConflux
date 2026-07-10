@@ -310,7 +310,50 @@ class TestRenderMatrixPlanning(unittest.TestCase):
                 grafana_url: https://grafana.example
                 dash_title: Demo
                 render_matrix:
-                  layout: matrix_values_first
+                  options:
+                    layout: matrix_values_first
+                  variables:
+                    service: {values: [api]}
+            """
+        )
+
+        grafana.get_panels([self.timestamp()])
+
+        self.assertEqual(grafana.config.render_matrix["layout"], "matrix_values_first")
+        self.assertEqual(grafana.render_tasks[0].artifact["matrix"]["label"], "service: api")
+
+    def test_matrix_options_layout_and_variables_take_precedence_over_flat_variables(self) -> None:
+        grafana = self.manager_from_config(
+            """
+            dashboards:
+              Demo:
+                grafana_url: https://grafana.example
+                dash_title: Demo
+                render_matrix:
+                  service: {values: [legacy]}
+                  options:
+                    layout: matrix_values_first
+                  variables:
+                    service: {values: [api]}
+            """
+        )
+
+        grafana.get_panels([self.timestamp()])
+
+        self.assertEqual(grafana.config.render_matrix["layout"], "matrix_values_first")
+        self.assertEqual(grafana.config.render_matrix["variables"]["service"]["values"], ["api"])
+        self.assertEqual(grafana.render_tasks[0].artifact["matrix"]["label"], "service: api")
+
+    def test_matrix_options_layout_accepts_legacy_flat_variables(self) -> None:
+        grafana = self.manager_from_config(
+            """
+            dashboards:
+              Demo:
+                grafana_url: https://grafana.example
+                dash_title: Demo
+                render_matrix:
+                  options:
+                    layout: matrix_values_first
                   service: {values: [api]}
             """
         )
@@ -328,7 +371,20 @@ class TestRenderMatrixPlanning(unittest.TestCase):
                     grafana_url: https://grafana.example
                     dash_title: Demo
                     render_matrix:
-                      layout: invalid
+                      options:
+                        layout: invalid
+                      service: {values: [api]}
+            """))
+
+    def test_flat_matrix_layout_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "render_matrix.layout.*options.layout"):
+            GrafanaManager.load_grafana_config(self.config_path("""
+                dashboards:
+                  Demo:
+                    grafana_url: https://grafana.example
+                    dash_title: Demo
+                    render_matrix:
+                      layout: matrix_values_first
                       service: {values: [api]}
             """))
 
@@ -511,7 +567,7 @@ class TestRenderMatrixReplayAndConfluence(unittest.TestCase):
         self.assertIn("Demo (Service: api)", content)
         self.assertIn("Requests (Service: api)", content)
 
-    def test_confluence_matrix_values_first_omits_root_panels_and_uses_leaf_links(self) -> None:
+    def test_confluence_matrix_values_first_uses_exact_context_hierarchy(self) -> None:
         panel = Panel(17, "timeseries", "Requests", 1, [])
         panel.artifacts = [{
             "artifact_type": "matrix", "render_status": "rendered", "png_file": "Demo__17__matrix-000-hash__0.png",
@@ -526,8 +582,20 @@ class TestRenderMatrixReplayAndConfluence(unittest.TestCase):
 
         content = build_confluence_storage_content([config], timestamps, 600)
 
-        self.assertNotIn("<p>Panels</p>", content)
-        self.assertNotIn('ac:parameter ac:name="title">Demo</ac:parameter>', content)
+        expected_order = [
+            'ac:parameter ac:name="title">Test times</ac:parameter>',
+            '<h2>Demo</h2>',
+            'ac:parameter ac:name="title">Demo</ac:parameter>',
+            '<h3>Service: api</h3>',
+            '<p>Dashboard links</p>',
+            '<p>Panels</p>',
+            'ac:parameter ac:name="title">Service: api</ac:parameter>',
+            'ac:parameter ac:name="title">Requests</ac:parameter>',
+            'Demo__17__matrix-000-hash__0.png',
+        ]
+        indexes = [content.index(fragment) for fragment in expected_order]
+        self.assertEqual(indexes, sorted(indexes))
+        self.assertNotIn('<h4>Requests</h4>', content)
         self.assertIn("<h3>Service: api</h3>", content)
         self.assertIn("https://grafana.example/d?var-service=api", content)
 
@@ -548,6 +616,40 @@ class TestRenderMatrixReplayAndConfluence(unittest.TestCase):
 
         self.assertNotIn("<p>Dashboard links</p>", content)
         self.assertIn("<h3>Service: api</h3>", content)
+
+    def test_matrix_dashboard_link_without_context_does_not_match_matrix_section(self) -> None:
+        panel = Panel(17, "timeseries", "Requests", 1, [])
+        panel.artifacts = [{
+            "artifact_type": "matrix", "render_status": "rendered", "png_file": "Demo__17__matrix-000-hash__0.png",
+            "matrix": {"label": "Service: api", "context_path": [{"key": "service", "label": "Service", "value": "api"}]},
+        }]
+        timestamps = [SimpleNamespace(id_time=0, time_tag="smoke", start_time_human="start", end_time_human="end")]
+        config = SimpleNamespace(
+            name="Demo", full_links=["https://grafana.example/d"], backup_dashboard_links=[], snapshot_urls=None,
+            panels=[panel], matrix_dashboard_links=[{"label": "Stale link", "url": "https://grafana.example/d?stale=1"}],
+            confluence_rendering=ConfluenceRenderingSettings(),
+        )
+
+        content = build_confluence_storage_content([config], timestamps, 600)
+
+        self.assertNotIn("https://grafana.example/d?stale=1", content)
+
+    def test_matrix_dashboard_link_without_context_matches_empty_matrix_section(self) -> None:
+        panel = Panel(17, "timeseries", "Requests", 1, [])
+        panel.artifacts = [{
+            "artifact_type": "matrix", "render_status": "rendered", "png_file": "Demo__17__matrix-000-hash__0.png",
+            "matrix": {"label": "Matrix"},
+        }]
+        timestamps = [SimpleNamespace(id_time=0, time_tag="smoke", start_time_human="start", end_time_human="end")]
+        config = SimpleNamespace(
+            name="Demo", full_links=["https://grafana.example/d"], backup_dashboard_links=[], snapshot_urls=None,
+            panels=[panel], matrix_dashboard_links=[{"label": "Matrix", "url": "https://grafana.example/d?matrix=1"}],
+            confluence_rendering=ConfluenceRenderingSettings(),
+        )
+
+        content = build_confluence_storage_content([config], timestamps, 600)
+
+        self.assertIn("https://grafana.example/d?matrix=1", content)
 
     def test_confluence_dashboard_link_location_dashboard_keeps_matrix_dashboard_links(self) -> None:
         panel = Panel(17, "timeseries", "Requests", 1, [])

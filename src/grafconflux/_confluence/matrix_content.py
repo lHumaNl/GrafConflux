@@ -10,6 +10,7 @@ from grafconflux._shared.display import normalize_grafana_display_value
 from grafconflux._shared.confluence_settings import (
     ConfluenceRenderingSettings,
     DESCRIPTION_DASHBOARD_LINKS,
+    DESCRIPTION_PANELS,
 )
 from grafconflux._confluence.row_groups import group_entries_by_row, row_group_title
 
@@ -22,12 +23,63 @@ def render_matrix_dashboard(grafana_config: Any, graph_width: int,
                             settings: ConfluenceRenderingSettings | None = None) -> str:
     settings = settings or _settings_for_config(grafana_config)
     if _matrix_layout(grafana_config) == "matrix_values_first":
-        return _render_context_sections(grafana_config, graph_width, settings, full_context=True)
+        return _render_matrix_values_first_dashboard(grafana_config, graph_width, settings)
     title = html.escape(str(grafana_config.name))
     content = '<ac:structured-macro ac:name="expand">\n'
     content += f'  <ac:parameter ac:name="title">{title}</ac:parameter>\n'
     content += '  <ac:rich-text-body>\n'
     content += _render_context_sections(grafana_config, graph_width, settings)
+    content += '  </ac:rich-text-body>\n</ac:structured-macro>\n'
+    return content
+
+
+def _render_matrix_values_first_dashboard(grafana_config: Any, graph_width: int,
+                                          settings: ConfluenceRenderingSettings) -> str:
+    title = html.escape(str(grafana_config.name))
+    content = '<ac:structured-macro ac:name="expand">\n'
+    content += f'  <ac:parameter ac:name="title">{title}</ac:parameter>\n'
+    content += '  <ac:rich-text-body>\n'
+    content += _render_matrix_values_first_sections(grafana_config, graph_width, settings)
+    content += '  </ac:rich-text-body>\n</ac:structured-macro>\n'
+    return content
+
+
+def _render_matrix_values_first_sections(grafana_config: Any, graph_width: int,
+                                         settings: ConfluenceRenderingSettings) -> str:
+    sections = _context_sections(grafana_config, full_context=True)
+    return ''.join(
+        _render_matrix_values_first_section(grafana_config, section, graph_width, settings)
+        for section in sections.values()
+    )
+
+
+def _render_matrix_values_first_section(grafana_config: Any, section: dict[str, Any], graph_width: int,
+                                        settings: ConfluenceRenderingSettings) -> str:
+    title = html.escape(section["title"])
+    content = f'<h3>{title}</h3>\n'
+    content += _render_leaf_dashboard_links(grafana_config, section, settings)
+    if settings.enabled(DESCRIPTION_PANELS):
+        content += f'<p>{html.escape(settings.label(DESCRIPTION_PANELS))}</p>\n'
+    content += _render_context_panel_expand(title, section["panels"].values(), graph_width)
+    return content
+
+
+def _render_leaf_dashboard_links(grafana_config: Any, section: dict[str, Any],
+                                 settings: ConfluenceRenderingSettings) -> str:
+    if not settings.dashboard_links_at_leaf():
+        return ''
+    links = _render_section_dashboard_links(grafana_config, section["context"], section["full_context"])
+    if not links:
+        return ''
+    label = html.escape(settings.label(DESCRIPTION_DASHBOARD_LINKS))
+    return f'<p>{label}</p>\n{links}'
+
+
+def _render_context_panel_expand(title: str, panel_entries, graph_width: int) -> str:
+    content = '<ac:structured-macro ac:name="expand">\n'
+    content += f'  <ac:parameter ac:name="title">{title}</ac:parameter>\n'
+    content += '  <ac:rich-text-body>\n'
+    content += _render_panel_entries(list(panel_entries), graph_width, show_heading=False)
     content += '  </ac:rich-text-body>\n</ac:structured-macro>\n'
     return content
 
@@ -110,14 +162,15 @@ def _render_row_group(title: str, panel_entries: list[dict[str, Any]], graph_wid
     return content
 
 
-def _render_panel_entries(panel_entries: list[dict[str, Any]], graph_width: int) -> str:
-    return ''.join(_render_panel_entry(entry, graph_width) for entry in panel_entries)
+def _render_panel_entries(panel_entries: list[dict[str, Any]], graph_width: int, show_heading: bool = True) -> str:
+    return ''.join(_render_panel_entry(entry, graph_width, show_heading) for entry in panel_entries)
 
 
-def _render_panel_entry(entry: dict[str, Any], graph_width: int) -> str:
+def _render_panel_entry(entry: dict[str, Any], graph_width: int, show_heading: bool = True) -> str:
     panel = entry["panel"]
     title = html.escape(str(getattr(panel, "display_title", panel.title)))
-    content = f'<h4>{title}</h4>\n<ac:structured-macro ac:name="expand">\n'
+    content = f'<h4>{title}</h4>\n' if show_heading else ''
+    content += '<ac:structured-macro ac:name="expand">\n'
     content += f'  <ac:parameter ac:name="title">{title}</ac:parameter>\n  <ac:rich-text-body>\n'
     for artifact in _ordered_artifacts(entry["artifacts"]):
         content += _render_artifact(panel, artifact, graph_width)
@@ -183,7 +236,7 @@ def _context_path(artifact: dict[str, Any]) -> list[dict[str, str]]:
 
 def _same_first_context(left: list[dict[str, str]], right: list[dict[str, str]]) -> bool:
     if not left or not right:
-        return True
+        return not left and not right
     return left[0].get("key") == right[0].get("key") and left[0].get("value") == right[0].get("value")
 
 

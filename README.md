@@ -423,18 +423,21 @@ dashboards:
     dash_title: Operations Overview
     vars: {region: us}
     render_matrix:
-      row_grouping: [environment]
-      label_template: "{Environment} / {Service}"
-      environment:
-        alias: Environment
-        grafana_variable: env
-        values: [prod, stage]
-      service:
-        alias: Service
-        depends_on: environment
-        values_by:
-          prod: [api, worker]
-          stage: [worker]
+      options:
+        row_grouping: [environment]
+        label_template: "{Environment} / {Service}"
+        layout: matrix_values_first
+      variables:
+        environment:
+          alias: Environment
+          grafana_variable: env
+          values: [prod, stage]
+        service:
+          alias: Service
+          depends_on: environment
+          values_by:
+            prod: [api, worker]
+            stage: [worker]
 ```
 
 - `values`: explicit list.
@@ -444,7 +447,7 @@ dashboards:
 - `grafana_variable`: actual Grafana URL variable name. Default is the matrix key.
 - `label_template`: optional row label built from variable keys or aliases, for example `{environment} / {Service}`.
 - `combination_mode`: `product` (default) or `zip`.
-- `layout`: optional Confluence matrix layout. Use `matrix_values_first` to place matrix branches before dashboard/panel grouping.
+- `options.layout`: optional Confluence matrix layout. Use `matrix_values_first` for the Test times -> dashboard -> matrix context -> panel-expand hierarchy.
 - `max_rows`: optional hard limit for resolved matrix rows. Default is 500.
 - Static dashboard `vars` are kept and merged with matrix variables in panel and dashboard links.
 - Matrix filenames use stable hashes, not raw variable values.
@@ -455,19 +458,21 @@ dashboards:
 dashboards:
   operations:
     render_matrix:
-      service:
-        grafana_variable: service
-        values_from:
-          variable: service
-          regex: "^(api|worker|db)$"
-          max_values: 2
+      variables:
+        service:
+          grafana_variable: service
+          values_from:
+            variable: service
+            regex: "^(api|worker|db)$"
+            max_values: 2
 ```
 
 Behavior notes:
 
 - Default `combination_mode` is `product`; `zip` is also supported and requires equal-length value lists.
 - Grafana `All` options (`$__all`, `__all`, `all`) are excluded from `values_from` resolution.
-- `render_matrix.variables` remains accepted for compatibility, but the PRD shape is the ordered mapping shown above.
+- Use `render_matrix.options` for renderer options and `render_matrix.variables` for matrix variables.
+- Top-level `render_matrix.layout` is not supported; put layout under `render_matrix.options.layout`. Existing flat variable keys without top-level layout remain accepted for older configs.
 - `row_grouping` (alias: `group_by`) groups matrix artifacts in Confluence expand sections using the grouped variable aliases, for example `Environment: prod`.
 - In child-page mode, grouped matrix sections are rendered on the child page; the parent page only gets include/expand content when its `%%%graphs%%%` marker exists.
 - Matrix runs also add a `Matrix dashboard links` section with one dashboard link per matrix row.

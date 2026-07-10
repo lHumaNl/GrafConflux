@@ -151,16 +151,18 @@ class TestConfluenceContent(unittest.TestCase):
 
         content = build_confluence_storage_content([config], self.timestamps, 900)
 
-        self.assertIn("Window (+03:00)", content)
+        self.assertIn('ac:parameter ac:name="title">Window</ac:parameter>', content)
+        self.assertIn("Timezone: +03:00", content)
         self.assertIn("2023/11/15 01:13:20", content)
         self.assertIn("Charts", content)
         self.assertNotIn("Run dashboards", content)
         self.assertNotIn("Backup dashboard links", content)
 
-    def test_host_timezone_label_does_not_pin_current_offset(self):
+    def test_host_timezone_is_shown_without_test_times_title_suffix(self):
         content = build_confluence_storage_content(self.grafana_configs, self.timestamps, 900)
 
-        self.assertIn("Test times (host timezone)", content)
+        self.assertIn('ac:parameter ac:name="title">Test times</ac:parameter>', content)
+        self.assertNotIn("Test times (host timezone)", content)
         self.assertIn("Timezone: host timezone", content)
 
     def test_disabled_panels_label_keeps_panel_images_visible(self):

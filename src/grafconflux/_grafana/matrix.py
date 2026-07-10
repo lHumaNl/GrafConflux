@@ -16,9 +16,10 @@ DEFAULT_MAX_MATRIX_VALUES = 50
 DEFAULT_MAX_MATRIX_ROWS = 500
 MATRIX_MODES = {"product", "zip"}
 MATRIX_LAYOUTS = {"dashboard_first", "matrix_values_first"}
-MATRIX_OPTION_KEYS = {
-    "enabled", "variables", "row_grouping", "group_by", "combination_mode", "label_template", "max_rows", "layout",
+MATRIX_NESTED_OPTION_KEYS = {
+    "enabled", "row_grouping", "group_by", "combination_mode", "label_template", "max_rows", "layout",
 }
+MATRIX_FLAT_OPTION_KEYS = MATRIX_NESTED_OPTION_KEYS - {"layout"}
 logger = logging.getLogger(__name__)
 
 
@@ -28,7 +29,7 @@ def validated_render_matrix(dashboard_name: str, config: dict[str, Any]) -> dict
         return None
     if not isinstance(value, dict):
         raise ConfigurationError(f"dashboards.{dashboard_name}.{RENDER_MATRIX_KEY}: expected mapping.")
-    matrix = _normalized_matrix(value)
+    matrix = _normalized_matrix(dashboard_name, value)
     if matrix.get("enabled", True) is False:
         return None
     _validate_matrix(dashboard_name, matrix)
@@ -70,16 +71,42 @@ def build_matrix_dashboard_links(config: Any, timestamps: list[Any], dashboard_u
     return links
 
 
-def _normalized_matrix(value: dict[str, Any]) -> dict[str, Any]:
+def _normalized_matrix(dashboard_name: str, value: dict[str, Any]) -> dict[str, Any]:
     matrix = dict(value)
-    if "variables" in matrix:
-        return matrix
-    variable_keys = [key for key in matrix if key not in MATRIX_OPTION_KEYS]
-    if not variable_keys:
-        return matrix
-    variables = {key: matrix.pop(key) for key in variable_keys}
-    matrix["variables"] = variables
-    return matrix
+    _reject_flat_layout(dashboard_name, matrix)
+    nested_options = matrix.pop("options", None)
+    variables = matrix.pop("variables", None)
+    normalized = _flat_options(matrix)
+    normalized.update(_nested_options(dashboard_name, nested_options))
+    normalized_variables = variables if variables is not None else _legacy_variables(matrix)
+    if normalized_variables:
+        normalized["variables"] = normalized_variables
+    return normalized
+
+
+def _flat_options(matrix: dict[str, Any]) -> dict[str, Any]:
+    return {key: matrix.pop(key) for key in list(matrix) if key in MATRIX_FLAT_OPTION_KEYS}
+
+
+def _reject_flat_layout(dashboard_name: str, matrix: dict[str, Any]) -> None:
+    if "layout" not in matrix:
+        return
+    raise ConfigurationError(_path(dashboard_name, "layout") + ": use render_matrix.options.layout.")
+
+
+def _nested_options(dashboard_name: str, options: Any) -> dict[str, Any]:
+    if options in (None, ""):
+        return {}
+    if not isinstance(options, dict):
+        raise ConfigurationError(_path(dashboard_name, "options") + ": expected mapping.")
+    unknown = sorted(str(key) for key in options if key not in MATRIX_NESTED_OPTION_KEYS)
+    if unknown:
+        raise ConfigurationError(_path(dashboard_name, "options") + f": unknown option(s) {unknown}.")
+    return dict(options)
+
+
+def _legacy_variables(matrix: dict[str, Any]) -> dict[str, Any]:
+    return {key: matrix.pop(key) for key in list(matrix)}
 
 
 def _dashboard_link_variables(config: Any, row: dict[str, Any]) -> dict[str, Any]:
