@@ -140,6 +140,51 @@ class TestRenderMatrixPlanning(unittest.TestCase):
         api_call = grafana.session.get.call_args_list[1]
         self.assertIn("/api/datasources/proxy/uid/prom/api/v1/label/service/values", api_call.args[0])
 
+    def test_implicit_values_from_uses_modern_prometheus_query_with_dashboard_context(self) -> None:
+        grafana = self.manager_from_config(
+            """
+            dashboards:
+              Demo:
+                grafana_url: https://grafana.example/grafana
+                dash_title: Demo
+                render_matrix:
+                  namespace:
+                    values: [team-a, team-b]
+                  pod:
+                    depends_on: namespace
+            """,
+            self.dashboard_with_modern_prometheus_pod_variable(),
+        )
+        dashboard_response = Mock(
+            status_code=200,
+            json=Mock(return_value={"dashboard": self.dashboard_with_modern_prometheus_pod_variable()}),
+        )
+
+        def response_for(url, **kwargs):
+            if "/api/datasources/proxy/uid/prom-main/api/v1/label/pod/values" in url:
+                namespace = kwargs["params"].get("var-namespace")
+                return Mock(status_code=200, json=Mock(return_value={"data": [f"{namespace}-pod"]}))
+            return dashboard_response
+
+        grafana.session.get = Mock(side_effect=response_for)
+
+        grafana.get_panels([self.timestamp()])
+
+        self.assertEqual(
+            [(task.variables["namespace"], task.variables["pod"]) for task in grafana.render_tasks],
+            [("team-a", "team-a-pod"), ("team-b", "team-b-pod")],
+        )
+        first_values_call = grafana.session.get.call_args_list[1]
+        self.assertIn("/api/datasources/proxy/uid/prom-main/api/v1/label/pod/values", first_values_call.args[0])
+        self.assertEqual(
+            first_values_call.kwargs["params"]["match[]"],
+            'kube_pod_info{cluster="prod", namespace="team-a", job="kube-state-metrics"}',
+        )
+        self.assertEqual(first_values_call.kwargs["params"]["var-datasource"], "prom-main")
+        self.assertEqual(first_values_call.kwargs["params"]["var-cluster"], "prod")
+        self.assertEqual(first_values_call.kwargs["params"]["var-job"], "kube-state-metrics")
+        self.assertEqual(first_values_call.kwargs["params"]["var-namespace"], "team-a")
+
     def test_matrix_dashboard_links_include_static_and_matrix_vars(self) -> None:
         grafana = self.manager_from_config(
             """
@@ -566,6 +611,28 @@ class TestRenderMatrixPlanning(unittest.TestCase):
             {
                 "name": "service", "type": "query", "datasource": {"type": "prometheus", "uid": "$ds"},
                 "query": "label_values(up, service)", "options": [],
+            },
+        ]}
+        return dashboard
+
+    @staticmethod
+    def dashboard_with_modern_prometheus_pod_variable() -> dict:
+        dashboard = TestRenderMatrixPlanning.dashboard()
+        dashboard["templating"] = {"list": [
+            {
+                "name": "datasource", "type": "datasource", "query": "prometheus",
+                "current": {"text": "Prometheus", "value": "prom-main"},
+            },
+            {"name": "cluster", "type": "custom", "current": {"text": "prod", "value": "prod"}},
+            {"name": "job", "type": "custom", "current": {"text": "kube-state-metrics", "value": "kube-state-metrics"}},
+            {
+                "name": "pod", "type": "query", "datasource": {"type": "prometheus", "uid": "$datasource"},
+                "query": {
+                    "queryType": "label_values",
+                    "query": 'kube_pod_info{cluster="$cluster", namespace="$namespace", job="$job"}',
+                    "label": "pod",
+                },
+                "options": [],
             },
         ]}
         return dashboard

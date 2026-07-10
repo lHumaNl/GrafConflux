@@ -293,7 +293,11 @@ def _rows_for_timestamp(config: Any, matrix: dict[str, Any], dashboard: dict[str
     if matrix.get("combination_mode", "product") == "product":
         rows = _product_rows(config, matrix, dashboard, timestamp, static_vars, session)
         if not rows:
-            raise ConfigurationError(_path(dashboard_name, "variables") + ": no rows resolved.")
+            raise ConfigurationError(
+                _path(dashboard_name, "variables")
+                + ": no rows resolved. Check values_from discovery warnings; implicit values_from requires "
+                + "a supported Grafana variable query or explicit values/values_by."
+            )
         _validate_row_limit(dashboard_name, matrix, len(rows))
         return [_row_record(dashboard_name, matrix, index, row) for index, row in enumerate(rows)]
     values, provenance = _variable_values(config, matrix, dashboard, timestamp, static_vars, session)
@@ -319,11 +323,13 @@ def _extend_rows(config: Any, matrix: dict[str, Any], key: str, spec: dict[str, 
         values, provenance = _values_for_spec(config, key, spec, dashboard, timestamp, row, static_vars, session)
         if not values:
             logger.warning(
-                "Render matrix branch skipped dashboard=%s variable=%s timestamp_id=%s context=%s reason=no_values_resolved",
+                "Render matrix branch skipped dashboard=%s variable=%s timestamp_id=%s context=%s "
+                "reason=no_values_resolved discovery=%s",
                 config.name,
                 key,
                 timestamp.id_time,
                 {name: value for name, value in row.items() if not str(name).startswith("__")},
+                provenance,
             )
             continue
         for value in values:

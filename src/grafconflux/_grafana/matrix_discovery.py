@@ -31,9 +31,11 @@ def resolve_values_from(
     config: Any = None,
 ) -> MatrixValueResult:
     source_name = _values_from_variable_name(spec.get("values_from"), spec, key)
-    effective_context = {**static_vars, **_public_context(context)}
-    if source_name in effective_context:
-        return _context_result(source_name, effective_context[source_name], timestamp)
+    public_context = _public_context(context)
+    explicit_context = {**static_vars, **public_context}
+    effective_context = {**_dashboard_current_context(dashboard, {source_name}), **explicit_context}
+    if source_name in explicit_context:
+        return _context_result(source_name, explicit_context[source_name], timestamp)
     variable = _dashboard_variable(dashboard, source_name)
     api_result = _api_values(variable, source_name, timestamp, effective_context, session, config, dashboard)
     if api_result is not None:
@@ -52,6 +54,12 @@ def _api_values(variable: dict[str, Any] | None, source_name: str, timestamp: An
     except Exception as error:  # pragma: no cover - defensive logging only
         logger.warning("Matrix values_from discovery failed variable=%s error=%s", source_name, error)
         return MatrixValueResult([], _provenance(source_name, timestamp, context, "grafana_api", "request_failed"))
+    if getattr(response, "status_code", None) != 200:
+        logger.warning(
+            "Matrix values_from discovery returned non-200 status variable=%s status=%s",
+            source_name,
+            getattr(response, "status_code", None),
+        )
     values = _response_values(response)
     if values is None:
         return None
@@ -64,11 +72,21 @@ def _prometheus_request(variable: dict[str, Any] | None, timestamp: Any,
                         dashboard: dict[str, Any]) -> dict[str, Any] | None:
     if not _is_prometheus_query_variable(variable, context, config, dashboard) or config is None:
         return None
-    query = _variable_query_text(variable.get("query")) if variable else None
-    parsed = _parse_label_values(_substitute_query_vars(query or "", context))
+    parsed = _prometheus_label_values_query(variable, context)
     if parsed is None:
+        logger.debug(
+            "Matrix values_from discovery has no supported Prometheus label_values query variable=%s",
+            variable.get("name") if isinstance(variable, dict) else None,
+        )
         return None
     datasource_uid = _resolved_datasource_type_uid(variable.get("datasource"), context, config, dashboard)[1]
+    if not datasource_uid:
+        logger.warning(
+            "Matrix values_from discovery could not resolve datasource variable=%s context_vars=%s",
+            variable.get("name") if isinstance(variable, dict) else None,
+            sorted(str(key) for key in context),
+        )
+        return None
     params = _prometheus_params(parsed[0], timestamp, variable, context)
     return {"url": _prometheus_url(config.grafana_base_url, datasource_uid, parsed[1]), "params": params}
 
@@ -135,6 +153,32 @@ def _dashboard_variable_options(variable: dict[str, Any] | None) -> list[str]:
     return _dedupe([value for option in options for value in _option_values(option)])
 
 
+def _dashboard_current_context(dashboard: dict[str, Any], exclude: set[str]) -> dict[str, str]:
+    variables = dashboard.get("templating", {}).get("list", [])
+    context: dict[str, str] = {}
+    for variable in variables:
+        name = variable.get("name") if isinstance(variable, dict) else None
+        if not name or name in exclude:
+            continue
+        value = _dashboard_variable_current_value(variable)
+        if value is not None:
+            context[str(name)] = value
+    return context
+
+
+def _dashboard_variable_current_value(variable: dict[str, Any] | None) -> str | None:
+    if not isinstance(variable, dict):
+        return None
+    current = variable.get("current")
+    if isinstance(current, dict):
+        value = _context_scalar(current.get("value")) or _context_scalar(current.get("text"))
+        if value is not None:
+            return value
+    selected = [value for option in variable.get("options", []) or [] if isinstance(option, dict) and option.get("selected")
+                for value in _option_values(option)]
+    return _context_scalar(selected)
+
+
 def _option_values(option: Any) -> list[str]:
     value = option.get("value", option.get("text")) if isinstance(option, dict) else option
     return _normalize_values(value)
@@ -144,6 +188,15 @@ def _normalize_values(value: Any) -> list[str]:
     if isinstance(value, list):
         return [item for raw in value for item in _normalize_values(raw)]
     return [] if value in (None, "") or isinstance(value, (dict, tuple, set)) else [str(value)]
+
+
+def _context_scalar(value: Any) -> str | None:
+    values = [item for item in _normalize_values(value) if item.lower() not in ALL_SENTINELS]
+    if not values:
+        return None
+    if len(values) == 1:
+        return values[0]
+    return "|".join(values)
 
 
 def _substitute_query_vars(query: str, context: dict[str, Any]) -> str:
@@ -156,6 +209,34 @@ def _parse_label_values(query: str) -> tuple[str | None, str] | None:
     inner = query.strip()[len("label_values("):-1].strip()
     metric, label = _split_label_values_args(inner)
     return (metric, label) if _is_safe_prometheus_label(label) and _is_safe_prometheus_match(metric) else None
+
+
+def _prometheus_label_values_query(variable: dict[str, Any] | None, context: dict[str, Any]) -> tuple[str | None, str] | None:
+    if not isinstance(variable, dict):
+        return None
+    query_config = variable.get("query")
+    parsed = _modern_prometheus_label_values_query(query_config, context)
+    if parsed is not None:
+        return parsed
+    for query in (_variable_query_text(query_config), variable.get("definition")):
+        if not isinstance(query, str):
+            continue
+        parsed = _parse_label_values(_substitute_query_vars(query, context))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _modern_prometheus_label_values_query(query_config: Any, context: dict[str, Any]) -> tuple[str | None, str] | None:
+    if not isinstance(query_config, dict):
+        return None
+    if query_config.get("queryType") != "label_values":
+        return None
+    label = _substitute_query_vars(str(query_config.get("label") or ""), context)
+    metric = _substitute_query_vars(str(query_config.get("query") or ""), context) or None
+    if _is_safe_prometheus_label(label) and _is_safe_prometheus_match(metric):
+        return metric, label
+    return None
 
 
 def _split_label_values_args(inner: str) -> tuple[str | None, str]:
@@ -178,12 +259,13 @@ def _is_prometheus_query_variable(variable: dict[str, Any] | None, context: dict
 def _resolved_datasource_type_uid(datasource: Any, context: dict[str, Any], config: Any,
                                   dashboard: dict[str, Any]) -> tuple[str | None, str | None]:
     datasource_type, datasource_uid = _datasource_type_uid(datasource)
-    ref_name = _datasource_ref_name(datasource_type, datasource_uid, config)
+    ref_name = _datasource_ref_name(datasource_type, datasource_uid, config) or _variable_reference_name(datasource_uid) \
+        or _variable_reference_name(datasource_type)
     if not ref_name:
-        return datasource_type, datasource_uid
+        return _resolved_context_value(datasource_type, context), _resolved_context_value(datasource_uid, context)
     variable = _dashboard_variable(dashboard, ref_name)
     resolved_type = _datasource_variable_type(variable) or _resolved_context_value(datasource_type, context)
-    resolved_uid = _resolved_context_value(datasource_uid, context)
+    resolved_uid = _resolved_context_value(datasource_uid, context) or _dashboard_variable_current_value(variable)
     return resolved_type, resolved_uid
 
 
@@ -198,8 +280,8 @@ def _datasource_ref_name(datasource_type: Any, datasource_uid: Any, config: Any)
 
 def _resolved_context_value(value: Any, context: dict[str, Any]) -> str | None:
     ref_name = _variable_reference_name(value)
-    if ref_name and ref_name in context:
-        return str(context[ref_name])
+    if ref_name:
+        return str(context[ref_name]) if ref_name in context else None
     return str(value) if value not in (None, "") else None
 
 
