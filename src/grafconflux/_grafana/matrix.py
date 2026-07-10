@@ -225,18 +225,17 @@ def _validate_source_shape(dashboard_name: str, key: str, spec: dict[str, Any], 
         return
     if source == "values_by" and _valid_values_by(value):
         return
-    if source == "values_from" and _valid_values_from(value):
+    if source == "values_from" and _valid_values_from(value, key, spec):
         return
     raise ConfigurationError(_path(dashboard_name, f"variables.{key}.{source}") + ": invalid value source.")
 
 
-def _valid_values_from(value: Any) -> bool:
+def _valid_values_from(value: Any, key: str, spec: dict[str, Any]) -> bool:
     if isinstance(value, str) and value:
-        return True
+        return value == _grafana_variable(key, spec)
     if not isinstance(value, dict):
         return False
-    variable = value.get("variable") or value.get("source")
-    return variable in (None, "grafana_variable") or (isinstance(variable, str) and bool(variable))
+    return not set(value) - {"regex", "max_values"}
 
 
 def _valid_values_by(value: Any) -> bool:

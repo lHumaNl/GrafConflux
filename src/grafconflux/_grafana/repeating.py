@@ -251,13 +251,13 @@ class RepeatingPlanner:
         value = variable.get('current', {}).get('value', variable.get('default'))
         values = self._normalize_auto_values(value)
         if values and self._should_discover_query_values(variable, value):
-            discovered_values = self._prometheus_query_variable_values(variable, repeat_var, timestamp)
+            discovered_values = self._prometheus_query_variable_values(variable, repeat_var, timestamp, dashboard)
             if discovered_values:
                 return discovered_values
         if values:
             return values
         if self._has_no_option_values(variable):
-            return self._prometheus_query_variable_values(variable, repeat_var, timestamp)
+            return self._prometheus_query_variable_values(variable, repeat_var, timestamp, dashboard)
         return []
     def _templating_option_values(self, dashboard: Dict, repeat_var: str, panel_id: int) -> List[str]:
         variable = self._templating_variable(dashboard, repeat_var)
@@ -276,13 +276,13 @@ class RepeatingPlanner:
         values = self._normalize_auto_values(value)
         return bool(values) and all(item.lower() in ALL_REPEAT_SENTINELS for item in values)
     def _prometheus_query_variable_values(self, variable: Dict[str, Any], repeat_var: str,
-                                          timestamp: Optional[GrafanaTimeDownloader]) -> List[str]:
-        query = self._prometheus_label_values_query(variable)
+                                          timestamp: Optional[GrafanaTimeDownloader], dashboard: Dict) -> List[str]:
+        query = self._prometheus_label_values_query(variable, dashboard)
         if query is None:
             return []
         try:
             response = self.session.get(
-                self._prometheus_label_values_url(variable, query[1]),
+                self._prometheus_label_values_url(variable, query[1], dashboard),
                 params=self._prometheus_label_values_params(query[0], timestamp),
                 timeout=self.config.timeout,
             )
@@ -290,8 +290,8 @@ class RepeatingPlanner:
         except Exception as error:
             logger.warning(f'Prometheus repeat values discovery failed repeat_var={repeat_var} error={error}')
             return []
-    def _prometheus_label_values_url(self, variable: Dict[str, Any], label: str) -> str:
-        datasource_uid = _datasource_type_uid(variable.get('datasource'))[1]
+    def _prometheus_label_values_url(self, variable: Dict[str, Any], label: str, dashboard: Dict) -> str:
+        datasource_uid = self._resolved_datasource_type_uid(variable.get('datasource'), dashboard)[1]
         uid_path = quote(str(datasource_uid), safe='')
         label_path = quote(label, safe='')
         return f'{self.config.grafana_base_url}/api/datasources/proxy/uid/{uid_path}/api/v1/label/{label_path}/values'
@@ -311,17 +311,57 @@ class RepeatingPlanner:
             return []
         data = response.json().get('data', [])
         return [value for value in self._normalize_auto_values(data) if value.lower() not in ALL_REPEAT_SENTINELS]
-    def _prometheus_label_values_query(self, variable: Dict[str, Any]) -> Optional[Tuple[Optional[str], str]]:
-        if not self._is_prometheus_query_variable(variable):
+    def _prometheus_label_values_query(self, variable: Dict[str, Any], dashboard: Dict) -> Optional[Tuple[Optional[str], str]]:
+        if not self._is_prometheus_query_variable(variable, dashboard):
             return None
         query = self._variable_query_text(variable.get('query'))
         if not query:
             return None
         return self._parse_prometheus_label_values_query(query)
+    def _is_prometheus_query_variable(self, variable: Dict[str, Any], dashboard: Dict) -> bool:
+        datasource_type, datasource_uid = self._resolved_datasource_type_uid(variable.get('datasource'), dashboard)
+        return (variable.get('type') == 'query' and str(datasource_type).lower() == PROMETHEUS_DATASOURCE_TYPE
+                and bool(datasource_uid))
+
+    def _resolved_datasource_type_uid(self, datasource: Any, dashboard: Dict) -> Tuple[Optional[str], Optional[str]]:
+        datasource_type, datasource_uid = _datasource_type_uid(datasource)
+        ref_name = self._datasource_ref_name(datasource_type, datasource_uid)
+        if not ref_name:
+            return datasource_type, datasource_uid
+        variable = self._templating_variable(dashboard, ref_name)
+        resolved_type = self._datasource_variable_type(variable) or self._resolved_config_var(datasource_type)
+        resolved_uid = self._resolved_config_var(datasource_uid)
+        return resolved_type, resolved_uid
+
+    def _datasource_ref_name(self, datasource_type: Any, datasource_uid: Any) -> Optional[str]:
+        datasource_vars = getattr(self.config, 'datasource_vars', {}) or {}
+        for value in (datasource_uid, datasource_type):
+            ref_name = self._variable_reference_name(value)
+            if ref_name in datasource_vars:
+                return ref_name
+        return None
+
+    def _resolved_config_var(self, value: Any) -> Optional[str]:
+        ref_name = self._variable_reference_name(value)
+        if ref_name and ref_name in (self.config.vars or {}):
+            return str(self.config.vars[ref_name])
+        return str(value) if value not in (None, '') else None
+
     @staticmethod
-    def _is_prometheus_query_variable(variable: Dict[str, Any]) -> bool:
-        datasource_type, datasource_uid = _datasource_type_uid(variable.get('datasource'))
-        return variable.get('type') == 'query' and datasource_type == PROMETHEUS_DATASOURCE_TYPE and bool(datasource_uid)
+    def _variable_reference_name(value: Any) -> Optional[str]:
+        if not isinstance(value, str):
+            return None
+        match = re.fullmatch(r'\$\{([^}]+)}|\$(\w+)', value)
+        return (match.group(1) or match.group(2)) if match else None
+
+    @staticmethod
+    def _datasource_variable_type(variable: Optional[Dict[str, Any]]) -> Optional[str]:
+        if not isinstance(variable, dict) or variable.get('type') != 'datasource':
+            return None
+        query = variable.get('query')
+        if isinstance(query, str) and query:
+            return query
+        return query.get('type') if isinstance(query, dict) else None
     @staticmethod
     def _variable_query_text(query_config: Any) -> Optional[str]:
         if isinstance(query_config, str):

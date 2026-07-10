@@ -70,6 +70,34 @@ class ConfigurationError(ValueError):
     """Raised when a dashboard lookup configuration is invalid."""
 
 
+def _validated_vars(dashboard_name: str, config: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    raw_vars = config.get('vars')
+    if raw_vars is None:
+        return None, {}
+    if not isinstance(raw_vars, dict):
+        raise ConfigurationError(f'dashboards.{dashboard_name}.vars: expected mapping.')
+    variables: Dict[str, Any] = {}
+    datasource_vars: Dict[str, Any] = {}
+    for name, value in raw_vars.items():
+        if not isinstance(name, str) or not name:
+            raise ConfigurationError(f'dashboards.{dashboard_name}.vars: variable keys must be non-empty strings.')
+        variables[name] = _validated_var_value(dashboard_name, name, value, datasource_vars)
+    return variables, datasource_vars
+
+
+def _validated_var_value(dashboard_name: str, name: str, value: Any, datasource_vars: Dict[str, Any]) -> Any:
+    if not isinstance(value, dict):
+        return value
+    if set(value) - {'is_datasource', 'value'}:
+        raise ConfigurationError(f'dashboards.{dashboard_name}.vars.{name}: unknown static var object key.')
+    if value.get('is_datasource') is not True:
+        raise ConfigurationError(f'dashboards.{dashboard_name}.vars.{name}.is_datasource: expected true.')
+    if value.get('value') in (None, ''):
+        raise ConfigurationError(f'dashboards.{dashboard_name}.vars.{name}.value: expected non-empty value.')
+    datasource_vars[name] = value['value']
+    return value['value']
+
+
 @dataclass(frozen=True)
 class NoDataPreflightConfig:
     mode: str = NO_DATA_MODE_CONSERVATIVE
@@ -374,7 +402,7 @@ class GrafanaConfigDownloader(GrafanaConfigBase):
         self.snapshot_store_dashboard_json: bool = _validated_bool_config(self.name, config, 'snapshot_store_dashboard_json', True)
         self.firefox_driver_preload_time: float = config.get('firefox_driver_preload_time', 2.5)
         self.timeout: int = config.get('timeout', 30); self.tz: Optional[str] = config.get('tz', None)
-        self.threads: int = config.get('threads', 4); self.vars: Optional[Dict[str, str]] = config.get('vars', None)
+        self.threads: int = config.get('threads', 4); self.vars, self.datasource_vars = _validated_vars(name, config)
         self.playwright_browser: Optional[str] = config.get('playwright_browser', None)
         self.playwright_browser_channel: Optional[str] = config.get('playwright_browser_channel', None)
         self.playwright_browser_executable_path: Optional[str] = config.get('playwright_browser_executable_path', None)

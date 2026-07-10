@@ -426,7 +426,9 @@ dashboards:
   operations:
     grafana_url: https://grafana.example.com/grafana
     dash_title: Operations Overview
-    vars: {region: us}
+    vars:
+      region: us
+      ds: {is_datasource: true, value: Prometheus}
     render_matrix:
       options:
         row_grouping: [environment]
@@ -447,14 +449,14 @@ dashboards:
 
 - `values`: explicit list.
 - `values_by`: map dependent values by previously resolved matrix variables. It requires `depends_on`; with multiple dependencies, keys are joined as `value1|value2`.
-- `values_from`: pull options from a dashboard variable, either as a string or as an object with `variable`, optional `regex`, and optional `max_values`.
+- `values_from`: pull options from the Grafana variable named by `grafana_variable` or by the matrix key. Use an object with optional `regex` and `max_values`.
 - `alias`: metadata and Confluence label name. Default is the matrix key.
 - `grafana_variable`: actual Grafana URL variable name. Default is the matrix key.
 - `label_template`: optional row label built from variable keys or aliases, for example `{environment} / {Service}`.
 - `combination_mode`: `product` (default) or `zip`.
 - `options.layout`: optional Confluence matrix layout. Use `matrix_values_first` for the Test times -> dashboard -> matrix grouping expands -> leaf dashboard links -> `Panels` expand -> panel-expand hierarchy.
 - `max_rows`: optional hard limit for resolved matrix rows. Default is 500.
-- Static dashboard `vars` are kept and merged with matrix variables in panel and dashboard links.
+- Static dashboard `vars` are kept and merged with matrix variables in panel and dashboard links. Datasource variables can use `{is_datasource: true, value: ...}` when the Grafana datasource variable is not named `datasource`.
 - Matrix filenames use stable hashes, not raw variable values.
 
 `values_from` example:
@@ -467,7 +469,6 @@ dashboards:
         service:
           grafana_variable: service
           values_from:
-            variable: service
             regex: "^(api|worker|db)$"
             max_values: 2
 ```

@@ -64,7 +64,6 @@ class TestRenderMatrixPlanning(unittest.TestCase):
                 render_matrix:
                   service:
                     values_from:
-                      variable: service
                       regex: "^(api|worker|db)$"
                       max_values: 2
             """,
@@ -89,7 +88,7 @@ class TestRenderMatrixPlanning(unittest.TestCase):
                     values: [prod]
                   service:
                     depends_on: environment
-                    values_from: {variable: service}
+                    values_from: {}
             """,
             self.dashboard_with_prometheus_variable(),
         )
@@ -177,7 +176,7 @@ class TestRenderMatrixPlanning(unittest.TestCase):
                     values: [prod, stage]
                   service:
                     depends_on: environment
-                    values_from: {variable: service}
+                    values_from: {}
             """,
             self.dashboard_with_prometheus_variable(),
         )
@@ -213,7 +212,7 @@ class TestRenderMatrixPlanning(unittest.TestCase):
                     values: [prod]
                   service:
                     depends_on: environment
-                    values_from: {variable: service}
+                    values_from: {}
             """,
             self.dashboard_with_prometheus_variable(),
         )
@@ -272,7 +271,7 @@ class TestRenderMatrixPlanning(unittest.TestCase):
                 dash_title: Demo
                 render_matrix:
                   service:
-                    values_from: {variable: service}
+                    values_from: {}
             """,
             dashboard,
         )
@@ -421,10 +420,62 @@ class TestRenderMatrixPlanning(unittest.TestCase):
                     render_matrix:
                       service:
                         depends_on: pod
-                        values_from: {source: grafana_variable}
+                        values_from: {}
                       pod:
                         values: [pod-a]
             """))
+
+    def test_values_from_variable_override_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "variables.service.values_from"):
+            GrafanaManager.load_grafana_config(self.config_path("""
+                dashboards:
+                  Demo:
+                    grafana_url: https://grafana.example
+                    dash_title: Demo
+                    render_matrix:
+                      service:
+                        values_from: {variable: other_service}
+            """))
+
+    def test_values_from_string_override_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "variables.service.values_from"):
+            GrafanaManager.load_grafana_config(self.config_path("""
+                dashboards:
+                  Demo:
+                    grafana_url: https://grafana.example
+                    dash_title: Demo
+                    render_matrix:
+                      service:
+                        values_from: other_service
+            """))
+
+    def test_datasource_static_var_object_resolves_query_datasource(self) -> None:
+        grafana = self.manager_from_config(
+            """
+            dashboards:
+              Demo:
+                grafana_url: https://grafana.example/grafana
+                dash_title: Demo
+                vars:
+                  ds: {is_datasource: true, value: Prometheus}
+                render_matrix:
+                  service:
+                    values_from: {max_values: 50}
+            """,
+            self.dashboard_with_datasource_variable(),
+        )
+        dashboard_response = Mock(status_code=200, json=Mock(return_value={"dashboard": self.dashboard_with_datasource_variable()}))
+        values_response = Mock(status_code=200, json=Mock(return_value={"data": ["api"]}))
+        grafana.session.get = Mock(side_effect=[dashboard_response, values_response])
+
+        grafana.get_panels([self.timestamp()])
+        grafana.config.full_links = grafana._GrafanaManager__get_full_links([self.timestamp()])
+
+        api_call = grafana.session.get.call_args_list[1]
+        self.assertIn("/api/datasources/proxy/uid/Prometheus/api/v1/label/service/values", api_call.args[0])
+        self.assertEqual(api_call.kwargs["params"]["var-ds"], "Prometheus")
+        self.assertEqual(grafana.render_tasks[0].variables["ds"], "Prometheus")
+        self.assertIn("var-ds=Prometheus", grafana.config.full_links[0])
 
     def test_expansion_limit_is_enforced(self) -> None:
         grafana = self.manager_from_config("""
@@ -475,6 +526,18 @@ class TestRenderMatrixPlanning(unittest.TestCase):
             "name": "service", "type": "query", "datasource": {"type": "prometheus", "uid": "prom"},
             "query": 'label_values(up{region="$region", env="$env"}, service)', "options": [{"value": "api"}, {"value": "worker"}],
         }]}
+        return dashboard
+
+    @staticmethod
+    def dashboard_with_datasource_variable() -> dict:
+        dashboard = TestRenderMatrixPlanning.dashboard()
+        dashboard["templating"] = {"list": [
+            {"name": "ds", "type": "datasource", "query": "prometheus"},
+            {
+                "name": "service", "type": "query", "datasource": {"type": "prometheus", "uid": "$ds"},
+                "query": "label_values(up, service)", "options": [],
+            },
+        ]}
         return dashboard
 
 

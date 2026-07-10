@@ -35,15 +35,16 @@ def resolve_values_from(
     if source_name in effective_context:
         return _context_result(source_name, effective_context[source_name], timestamp)
     variable = _dashboard_variable(dashboard, source_name)
-    api_result = _api_values(variable, source_name, timestamp, effective_context, session, config)
+    api_result = _api_values(variable, source_name, timestamp, effective_context, session, config, dashboard)
     if api_result is not None:
         return api_result
     return _templating_result(variable, source_name, timestamp, effective_context)
 
 
 def _api_values(variable: dict[str, Any] | None, source_name: str, timestamp: Any,
-                context: dict[str, Any], session: Any, config: Any) -> MatrixValueResult | None:
-    request = _prometheus_request(variable, timestamp, context, config)
+                context: dict[str, Any], session: Any, config: Any,
+                dashboard: dict[str, Any]) -> MatrixValueResult | None:
+    request = _prometheus_request(variable, timestamp, context, config, dashboard)
     if request is None or session is None:
         return None
     try:
@@ -59,14 +60,15 @@ def _api_values(variable: dict[str, Any] | None, source_name: str, timestamp: An
 
 
 def _prometheus_request(variable: dict[str, Any] | None, timestamp: Any,
-                        context: dict[str, Any], config: Any) -> dict[str, Any] | None:
-    if not _is_prometheus_query_variable(variable) or config is None:
+                        context: dict[str, Any], config: Any,
+                        dashboard: dict[str, Any]) -> dict[str, Any] | None:
+    if not _is_prometheus_query_variable(variable, context, config, dashboard) or config is None:
         return None
     query = _variable_query_text(variable.get("query")) if variable else None
     parsed = _parse_label_values(_substitute_query_vars(query or "", context))
     if parsed is None:
         return None
-    datasource_uid = _datasource_type_uid(variable.get("datasource"))[1]
+    datasource_uid = _resolved_datasource_type_uid(variable.get("datasource"), context, config, dashboard)[1]
     params = _prometheus_params(parsed[0], timestamp, variable, context)
     return {"url": _prometheus_url(config.grafana_base_url, datasource_uid, parsed[1]), "params": params}
 
@@ -120,13 +122,7 @@ def _provenance(source_name: str, timestamp: Any, context: dict[str, Any], sourc
 
 
 def _values_from_variable_name(source: Any, spec: dict[str, Any], key: str) -> str:
-    if isinstance(source, dict):
-        configured = source.get("variable")
-        if configured not in (None, ""):
-            return str(configured)
-        if source.get("source") == "grafana_variable":
-            return str(spec.get("grafana_variable") or key)
-    return str(source or spec.get("grafana_variable") or key)
+    return str(spec.get("grafana_variable") or key)
 
 
 def _dashboard_variable(dashboard: dict[str, Any], variable_name: str) -> dict[str, Any] | None:
@@ -169,9 +165,60 @@ def _split_label_values_args(inner: str) -> tuple[str | None, str]:
     return metric.strip(), label.strip()
 
 
-def _is_prometheus_query_variable(variable: dict[str, Any] | None) -> bool:
-    datasource_type, datasource_uid = _datasource_type_uid(variable.get("datasource") if variable else None)
-    return bool(variable and variable.get("type") == "query" and datasource_type == PROMETHEUS_DATASOURCE_TYPE and datasource_uid)
+def _is_prometheus_query_variable(variable: dict[str, Any] | None, context: dict[str, Any],
+                                  config: Any, dashboard: dict[str, Any]) -> bool:
+    datasource_type, datasource_uid = _resolved_datasource_type_uid(
+        variable.get("datasource") if variable else None, context, config, dashboard)
+    return bool(
+        variable and variable.get("type") == "query"
+        and str(datasource_type).lower() == PROMETHEUS_DATASOURCE_TYPE and datasource_uid
+    )
+
+
+def _resolved_datasource_type_uid(datasource: Any, context: dict[str, Any], config: Any,
+                                  dashboard: dict[str, Any]) -> tuple[str | None, str | None]:
+    datasource_type, datasource_uid = _datasource_type_uid(datasource)
+    ref_name = _datasource_ref_name(datasource_type, datasource_uid, config)
+    if not ref_name:
+        return datasource_type, datasource_uid
+    variable = _dashboard_variable(dashboard, ref_name)
+    resolved_type = _datasource_variable_type(variable) or _resolved_context_value(datasource_type, context)
+    resolved_uid = _resolved_context_value(datasource_uid, context)
+    return resolved_type, resolved_uid
+
+
+def _datasource_ref_name(datasource_type: Any, datasource_uid: Any, config: Any) -> str | None:
+    datasource_vars = getattr(config, "datasource_vars", {}) or {}
+    for value in (datasource_uid, datasource_type):
+        ref_name = _variable_reference_name(value)
+        if ref_name in datasource_vars:
+            return ref_name
+    return None
+
+
+def _resolved_context_value(value: Any, context: dict[str, Any]) -> str | None:
+    ref_name = _variable_reference_name(value)
+    if ref_name and ref_name in context:
+        return str(context[ref_name])
+    return str(value) if value not in (None, "") else None
+
+
+def _variable_reference_name(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(r"\$\{([^}]+)}|\$(\w+)", value)
+    if not match:
+        return None
+    return match.group(1) or match.group(2)
+
+
+def _datasource_variable_type(variable: dict[str, Any] | None) -> str | None:
+    if not isinstance(variable, dict) or variable.get("type") != "datasource":
+        return None
+    query = variable.get("query")
+    if isinstance(query, str) and query:
+        return query
+    return query.get("type") if isinstance(query, dict) else None
 
 
 def _variable_query_text(query_config: Any) -> str | None:

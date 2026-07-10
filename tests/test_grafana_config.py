@@ -198,6 +198,33 @@ class TestGrafanaConfigLoading(unittest.TestCase):
         self.assertEqual(config.screenshot_readiness.poll_interval_ms, 100)
         self.assertFalse(config.screenshot_readiness.strict_datasource_fragments)
 
+    def test_static_datasource_var_object_normalizes_to_value(self):
+        config_path = self.write_config(
+            "dashboard:\n"
+            "  dash_title: Dashboard\n"
+            "  grafana_url: https://grafana.example\n"
+            "  vars:\n"
+            "    ds: {is_datasource: true, value: Prometheus}\n"
+            "    region: us\n"
+        )
+
+        config = GrafanaManager.load_grafana_config(config_path)[0]
+
+        self.assertEqual(config.vars, {"ds": "Prometheus", "region": "us"})
+        self.assertEqual(config.datasource_vars, {"ds": "Prometheus"})
+
+    def test_static_var_object_requires_datasource_value(self):
+        config_path = self.write_config(
+            "dashboard:\n"
+            "  dash_title: Dashboard\n"
+            "  grafana_url: https://grafana.example\n"
+            "  vars:\n"
+            "    ds: {is_datasource: true}\n"
+        )
+
+        with self.assertRaisesRegex(ConfigurationError, "vars.ds.value"):
+            GrafanaManager.load_grafana_config(config_path)
+
     def test_loads_dashboard_playwright_browser_options(self):
         config_path = self.write_config(
             "dashboard:\n"
