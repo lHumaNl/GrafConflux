@@ -110,6 +110,36 @@ class TestRenderMatrixPlanning(unittest.TestCase):
         self.assertEqual(discovery["source"], "grafana_api")
         self.assertEqual(discovery["method"], "prometheus_label_values")
 
+    def test_dependent_variable_without_source_uses_implicit_values_from(self) -> None:
+        grafana = self.manager_from_config(
+            """
+            dashboards:
+              Demo:
+                grafana_url: https://grafana.example/grafana
+                dash_title: Demo
+                vars: {region: us}
+                render_matrix:
+                  environment:
+                    grafana_variable: env
+                    values: [prod]
+                  application:
+                    grafana_variable: service
+                    depends_on: environment
+            """,
+            self.dashboard_with_prometheus_variable(),
+        )
+        dashboard_response = Mock(status_code=200, json=Mock(return_value={"dashboard": self.dashboard_with_prometheus_variable()}))
+        values_response = Mock(status_code=200, json=Mock(return_value={"data": ["api", "worker"]}))
+        grafana.session.get = Mock(side_effect=[dashboard_response, values_response])
+
+        grafana.get_panels([self.timestamp()])
+
+        service_spec = grafana.config.render_matrix["variables"]["application"]
+        self.assertEqual(service_spec["values_from"], {})
+        self.assertEqual([task.variables["service"] for task in grafana.render_tasks], ["api", "worker"])
+        api_call = grafana.session.get.call_args_list[1]
+        self.assertIn("/api/datasources/proxy/uid/prom/api/v1/label/service/values", api_call.args[0])
+
     def test_matrix_dashboard_links_include_static_and_matrix_vars(self) -> None:
         grafana = self.manager_from_config(
             """
@@ -571,6 +601,7 @@ class TestRenderMatrixReplayAndConfluence(unittest.TestCase):
             "name": "Demo",
             "charts_path": "unused",
             "full_links": ["https://grafana.example/d/demo?from=1&to=2"],
+            "render_matrix": {"layout": "dashboard_first"},
             "matrix_dashboard_links": [{"timestamp_id": 0, "label": "Environment: prod, Service: api", "url": "https://grafana.example/d/demo?var-env=prod", "context_path": [{"key": "environment", "label": "Environment", "value": "prod", "grafana_variable": "env"}]}],
             "timestamps": [{
                 "time_tag": "smoke", "id_time": 0, "start_time_timestamp": 1, "end_time_timestamp": 2,
@@ -616,7 +647,34 @@ class TestRenderMatrixReplayAndConfluence(unittest.TestCase):
             "panels": [],
         })
 
-    def test_confluence_renders_matrix_grouping_from_live_panel(self) -> None:
+    def test_confluence_default_render_matrix_layout_is_panel_first(self) -> None:
+        panel = Panel(17, "timeseries", "Requests", 1, ["https://grafana.example/panel/17"])
+        panel.artifacts = [{
+            "artifact_type": "matrix", "render_status": "rendered", "png_file": "Demo__17__matrix-000-hash__0.png",
+            "display_title": "Requests (Service: api)",
+            "matrix": {"label": "Service: api", "context_path": [{"key": "service", "label": "Service", "value": "api"}]},
+        }]
+        timestamps = [SimpleNamespace(id_time=0, time_tag="smoke", start_time_human="start", end_time_human="end")]
+        config = SimpleNamespace(name="Demo", full_links=["https://grafana.example/d"], backup_dashboard_links=[],
+                                 snapshot_urls=None, panels=[panel], matrix_dashboard_links=[],
+                                 render_matrix={"variables": {"service": {"values": ["api"]}}})
+
+        content = build_confluence_storage_content([config], timestamps, 600)
+
+        expected_order = [
+            '<h2>Demo</h2>',
+            'ac:parameter ac:name="title">Demo</ac:parameter>',
+            'ac:parameter ac:name="title">Requests</ac:parameter>',
+            'https://grafana.example/panel/17',
+            'Demo__17__matrix-000-hash__0.png',
+        ]
+        indexes = [content.index(fragment) for fragment in expected_order]
+        self.assertEqual(indexes, sorted(indexes))
+        self.assertIn("Requests (Service: api)", content)
+        self.assertNotIn('ac:parameter ac:name="title">Panels</ac:parameter>', content)
+        self.assertNotIn("Demo (Service: api)", content)
+
+    def test_confluence_explicit_dashboard_first_preserves_context_hierarchy(self) -> None:
         panel = Panel(17, "timeseries", "Requests", 1, ["https://grafana.example/panel/17"])
         panel.artifacts = [{
             "artifact_type": "matrix", "render_status": "rendered", "png_file": "Demo__17__matrix-000-hash__0.png",
@@ -624,12 +682,13 @@ class TestRenderMatrixReplayAndConfluence(unittest.TestCase):
         }]
         timestamps = [SimpleNamespace(id_time=0, time_tag="smoke", start_time_human="start", end_time_human="end")]
         config = SimpleNamespace(name="Demo", full_links=["https://grafana.example/d"], backup_dashboard_links=[],
-                                 snapshot_urls=None, panels=[panel], matrix_dashboard_links=[])
+                                 snapshot_urls=None, panels=[panel], matrix_dashboard_links=[],
+                                 render_matrix={"layout": "dashboard_first"})
 
         content = build_confluence_storage_content([config], timestamps, 600)
 
         self.assertIn("Demo (Service: api)", content)
-        self.assertIn("Requests (Service: api)", content)
+        self.assertLess(content.index("Demo (Service: api)"), content.index("Requests (Service: api)"))
 
     def test_confluence_matrix_values_first_uses_exact_context_hierarchy(self) -> None:
         panel = Panel(17, "timeseries", "Requests", 1, ["https://grafana.example/panel/17"])
@@ -727,7 +786,7 @@ class TestRenderMatrixReplayAndConfluence(unittest.TestCase):
         config = SimpleNamespace(
             name="Demo", full_links=["https://grafana.example/d"], backup_dashboard_links=[], snapshot_urls=None,
             panels=[panel], matrix_dashboard_links=[{"label": "Stale link", "url": "https://grafana.example/d?stale=1"}],
-            confluence_rendering=ConfluenceRenderingSettings(),
+            render_matrix={"layout": "dashboard_first"}, confluence_rendering=ConfluenceRenderingSettings(),
         )
 
         content = build_confluence_storage_content([config], timestamps, 600)
@@ -744,7 +803,7 @@ class TestRenderMatrixReplayAndConfluence(unittest.TestCase):
         config = SimpleNamespace(
             name="Demo", full_links=["https://grafana.example/d"], backup_dashboard_links=[], snapshot_urls=None,
             panels=[panel], matrix_dashboard_links=[{"label": "Matrix", "url": "https://grafana.example/d?matrix=1"}],
-            confluence_rendering=ConfluenceRenderingSettings(),
+            render_matrix={"layout": "dashboard_first"}, confluence_rendering=ConfluenceRenderingSettings(),
         )
 
         content = build_confluence_storage_content([config], timestamps, 600)
@@ -825,7 +884,8 @@ class TestRenderMatrixReplayAndConfluence(unittest.TestCase):
         ]
         timestamps = [SimpleNamespace(id_time=0, time_tag="smoke", start_time_human="start", end_time_human="end")]
         config = SimpleNamespace(name="Demo", full_links=["https://grafana.example/d"], backup_dashboard_links=[],
-                                 snapshot_urls=None, panels=[panel], matrix_dashboard_links=[])
+                                 snapshot_urls=None, panels=[panel], matrix_dashboard_links=[],
+                                 render_matrix={"layout": "dashboard_first"})
 
         content = build_confluence_storage_content([config], timestamps, 600)
 

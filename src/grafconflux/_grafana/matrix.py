@@ -15,7 +15,8 @@ RENDER_MATRIX_KEY = "render_matrix"
 DEFAULT_MAX_MATRIX_VALUES = 50
 DEFAULT_MAX_MATRIX_ROWS = 500
 MATRIX_MODES = {"product", "zip"}
-MATRIX_LAYOUTS = {"dashboard_first", "matrix_values_first"}
+DEFAULT_MATRIX_LAYOUT = "panel_first"
+MATRIX_LAYOUTS = {"dashboard_first", "matrix_values_first", "panel_first"}
 MATRIX_NESTED_OPTION_KEYS = {
     "enabled", "row_grouping", "group_by", "combination_mode", "label_template", "max_rows", "layout",
 }
@@ -80,8 +81,24 @@ def _normalized_matrix(dashboard_name: str, value: dict[str, Any]) -> dict[str, 
     normalized.update(_nested_options(dashboard_name, nested_options))
     normalized_variables = variables if variables is not None else _legacy_variables(matrix)
     if normalized_variables:
-        normalized["variables"] = normalized_variables
+        normalized["variables"] = _variables_with_implicit_sources(normalized_variables)
     return normalized
+
+
+def _variables_with_implicit_sources(variables: Any) -> Any:
+    if not isinstance(variables, dict):
+        return variables
+    return {key: _variable_with_implicit_source(spec) for key, spec in variables.items()}
+
+
+def _variable_with_implicit_source(spec: Any) -> Any:
+    if not isinstance(spec, dict) or _has_value_source(spec) or not _configured_dependencies(spec):
+        return spec
+    return {**spec, "values_from": {}}
+
+
+def _has_value_source(spec: dict[str, Any]) -> bool:
+    return any(name in spec for name in ("values", "values_by", "values_from"))
 
 
 def _flat_options(matrix: dict[str, Any]) -> dict[str, Any]:
@@ -129,7 +146,7 @@ def _validate_matrix(dashboard_name: str, matrix: dict[str, Any]) -> None:
 
 
 def _validate_layout(dashboard_name: str, matrix: dict[str, Any]) -> None:
-    layout = matrix.get("layout", "dashboard_first")
+    layout = matrix.get("layout", DEFAULT_MATRIX_LAYOUT)
     if layout in MATRIX_LAYOUTS:
         return
     expected = ", ".join(sorted(MATRIX_LAYOUTS))

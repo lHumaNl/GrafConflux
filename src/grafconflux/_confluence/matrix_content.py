@@ -21,8 +21,11 @@ def has_matrix_artifacts(grafana_config: Any) -> bool:
 def render_matrix_dashboard(grafana_config: Any, graph_width: int,
                             settings: ConfluenceRenderingSettings | None = None) -> str:
     settings = settings or _settings_for_config(grafana_config)
-    if _matrix_layout(grafana_config) == "matrix_values_first":
+    layout = _matrix_layout(grafana_config)
+    if layout == "matrix_values_first":
         return _render_matrix_values_first_dashboard(grafana_config, graph_width, settings)
+    if layout == "panel_first":
+        return _render_panel_first_dashboard(grafana_config, graph_width)
     title = html.escape(str(grafana_config.name))
     content = '<ac:structured-macro ac:name="expand">\n'
     content += f'  <ac:parameter ac:name="title">{title}</ac:parameter>\n'
@@ -30,6 +33,28 @@ def render_matrix_dashboard(grafana_config: Any, graph_width: int,
     content += _render_context_sections(grafana_config, graph_width, settings)
     content += '  </ac:rich-text-body>\n</ac:structured-macro>\n'
     return content
+
+
+def _render_panel_first_dashboard(grafana_config: Any, graph_width: int) -> str:
+    title = html.escape(str(grafana_config.name))
+    content = '<ac:structured-macro ac:name="expand">\n'
+    content += f'  <ac:parameter ac:name="title">{title}</ac:parameter>\n'
+    content += '  <ac:rich-text-body>\n'
+    content += _render_panel_first_sections(grafana_config, graph_width)
+    content += '  </ac:rich-text-body>\n</ac:structured-macro>\n'
+    return content
+
+
+def _render_panel_first_sections(grafana_config: Any, graph_width: int) -> str:
+    entries = [
+        {"panel": panel, "artifacts": _matrix_artifacts(panel)}
+        for panel in _ordered_panels(getattr(grafana_config, "panels", []) or [])
+        if _matrix_artifacts(panel)
+    ]
+    groups = group_entries_by_row(entries)
+    if len(groups) == 1:
+        return _render_panel_entries(next(iter(groups.values())), graph_width)
+    return ''.join(_render_row_group(title, items, graph_width) for title, items in groups.items())
 
 
 def _render_matrix_values_first_dashboard(grafana_config: Any, graph_width: int,
@@ -248,7 +273,7 @@ def _full_context_key(context: list[dict[str, str]]) -> str:
 
 def _matrix_layout(grafana_config: Any) -> str:
     matrix = getattr(grafana_config, "render_matrix", None) or {}
-    return str(matrix.get("layout", "dashboard_first")) if isinstance(matrix, dict) else "dashboard_first"
+    return str(matrix.get("layout", "panel_first")) if isinstance(matrix, dict) else "panel_first"
 
 
 def _artifact_title(panel: Any, artifact: dict[str, Any]) -> str:
