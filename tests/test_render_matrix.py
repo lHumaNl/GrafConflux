@@ -553,7 +553,7 @@ class TestRenderMatrixReplayAndConfluence(unittest.TestCase):
         })
 
     def test_confluence_renders_matrix_grouping_from_live_panel(self) -> None:
-        panel = Panel(17, "timeseries", "Requests", 1, [])
+        panel = Panel(17, "timeseries", "Requests", 1, ["https://grafana.example/panel/17"])
         panel.artifacts = [{
             "artifact_type": "matrix", "render_status": "rendered", "png_file": "Demo__17__matrix-000-hash__0.png",
             "matrix": {"label": "Service: api", "variables": {"Service": "api"}},
@@ -568,7 +568,7 @@ class TestRenderMatrixReplayAndConfluence(unittest.TestCase):
         self.assertIn("Requests (Service: api)", content)
 
     def test_confluence_matrix_values_first_uses_exact_context_hierarchy(self) -> None:
-        panel = Panel(17, "timeseries", "Requests", 1, [])
+        panel = Panel(17, "timeseries", "Requests", 1, ["https://grafana.example/panel/17"])
         panel.artifacts = [{
             "artifact_type": "matrix", "render_status": "rendered", "png_file": "Demo__17__matrix-000-hash__0.png",
             "matrix": {"label": "Service: api", "context_path": [{"key": "service", "label": "Service", "value": "api"}]},
@@ -587,17 +587,51 @@ class TestRenderMatrixReplayAndConfluence(unittest.TestCase):
             '<h2>Demo</h2>',
             'ac:parameter ac:name="title">Demo</ac:parameter>',
             '<h3>Service: api</h3>',
-            '<p>Dashboard links</p>',
-            '<p>Panels</p>',
             'ac:parameter ac:name="title">Service: api</ac:parameter>',
+            '<p>Dashboard links</p>',
+            'ac:parameter ac:name="title">Panels</ac:parameter>',
             'ac:parameter ac:name="title">Requests</ac:parameter>',
             'Demo__17__matrix-000-hash__0.png',
         ]
         indexes = [content.index(fragment) for fragment in expected_order]
         self.assertEqual(indexes, sorted(indexes))
         self.assertNotIn('<h4>Requests</h4>', content)
+        self.assertNotIn('<h5>Requests', content)
+        self.assertNotIn('<p>Panels</p>', content)
         self.assertIn("<h3>Service: api</h3>", content)
+        self.assertIn("https://grafana.example/panel/17", content)
         self.assertIn("https://grafana.example/d?var-service=api", content)
+
+    def test_confluence_matrix_values_first_renders_each_context_level(self) -> None:
+        panel = Panel(17, "timeseries", "Requests", 1, ["https://grafana.example/panel/17"])
+        context_path = [
+            {"key": "dc", "label": "DC", "value": "prod"},
+            {"key": "host", "label": "Host", "value": "app-01"},
+        ]
+        panel.artifacts = [{
+            "artifact_type": "matrix", "render_status": "rendered", "png_file": "Demo__17__matrix-host__0.png",
+            "matrix": {"label": "DC: prod, Host: app-01", "context_path": context_path},
+        }]
+        timestamps = [SimpleNamespace(id_time=0, time_tag="smoke", start_time_human="start", end_time_human="end")]
+        config = SimpleNamespace(
+            name="Demo", full_links=["https://grafana.example/d"], backup_dashboard_links=[], snapshot_urls=None,
+            panels=[panel], matrix_dashboard_links=[{"label": "DC: prod, Host: app-01", "url": "https://grafana.example/d?var-host=app-01", "context_path": context_path}],
+            render_matrix={"layout": "matrix_values_first"}, confluence_rendering=ConfluenceRenderingSettings(),
+        )
+
+        content = build_confluence_storage_content([config], timestamps, 600)
+
+        expected_order = [
+            '<h3>DC: prod</h3>',
+            'ac:parameter ac:name="title">DC: prod</ac:parameter>',
+            '<h3>Host: app-01</h3>',
+            'ac:parameter ac:name="title">Host: app-01</ac:parameter>',
+            '<p>Dashboard links</p>',
+            'ac:parameter ac:name="title">Panels</ac:parameter>',
+            'ac:parameter ac:name="title">Requests</ac:parameter>',
+        ]
+        indexes = [content.index(fragment) for fragment in expected_order]
+        self.assertEqual(indexes, sorted(indexes))
 
     def test_confluence_matrix_values_first_skips_empty_leaf_dashboard_links_label(self) -> None:
         panel = Panel(17, "timeseries", "Requests", 1, [])

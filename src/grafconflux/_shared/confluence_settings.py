@@ -53,6 +53,8 @@ class ConfluenceRenderingSettings:
     description_rename: dict[str, str] = field(default_factory=dict)
     description_switch: dict[str, bool] = field(default_factory=dict)
     time_zone: str | None = None
+    time_format: str = HUMAN_TIME_FORMAT
+    timezone_label: bool = True
     dashboard_links_location: str = DASHBOARD_LINKS_LEAF
 
     def label(self, description_id: str) -> str:
@@ -78,6 +80,8 @@ class ConfluenceRenderingSettings:
             "description_rename": dict(self.description_rename),
             "description_switch": dict(self.description_switch),
             "time_zone": self.time_zone,
+            "time_format": self.time_format,
+            "timezone_label": self.timezone_label,
             "dashboard_links_location": self.dashboard_links_location,
         }
 
@@ -101,14 +105,18 @@ def confluence_rendering_settings_from_mapping(settings_data: Any) -> Confluence
         description_rename=_validated_renames(settings_data),
         description_switch=_validated_switches(settings_data),
         time_zone=_validated_time_zone(settings_data),
+        time_format=_validated_time_format(settings_data),
+        timezone_label=_validated_timezone_label(settings_data),
         dashboard_links_location=_validated_dashboard_links_location(settings_data),
     )
 
 
 def effective_time_zone(settings: ConfluenceRenderingSettings) -> EffectiveTimeZone:
     if settings.time_zone in (None, ""):
-        return EffectiveTimeZone(None, "host timezone")
-    return EffectiveTimeZone(_timezone_from_string(settings.time_zone), settings.time_zone)
+        host_zone = datetime.now().astimezone().tzinfo
+        return EffectiveTimeZone(None, _offset_label(host_zone) if host_zone else "+00:00")
+    zone = _timezone_from_string(settings.time_zone)
+    return EffectiveTimeZone(zone, _time_zone_label(zone, settings.time_zone))
 
 
 def format_timestamp_time(timestamp: Any, field_prefix: str, settings: ConfluenceRenderingSettings) -> str:
@@ -116,7 +124,7 @@ def format_timestamp_time(timestamp: Any, field_prefix: str, settings: Confluenc
     if epoch_value in (None, ""):
         return str(getattr(timestamp, f"{field_prefix}_time_human", ""))
     try:
-        return _format_epoch_in_effective_zone(epoch_value, effective_time_zone(settings)).strftime(HUMAN_TIME_FORMAT)
+        return _format_epoch_in_effective_zone(epoch_value, effective_time_zone(settings)).strftime(settings.time_format)
     except (TypeError, ValueError):
         return str(getattr(timestamp, f"{field_prefix}_time_human", ""))
 
@@ -165,6 +173,26 @@ def _validated_time_zone(settings_data: dict[str, Any]) -> str | None:
     return value
 
 
+def _validated_time_format(settings_data: dict[str, Any]) -> str:
+    value = settings_data.get("time_format", HUMAN_TIME_FORMAT)
+    if value in (None, ""):
+        return HUMAN_TIME_FORMAT
+    if not isinstance(value, str):
+        raise ValueError("YAML settings.time_format: expected Python strftime format string.")
+    try:
+        datetime.now().strftime(value)
+    except ValueError as error:
+        raise ValueError("YAML settings.time_format: invalid Python strftime format string.") from error
+    return value
+
+
+def _validated_timezone_label(settings_data: dict[str, Any]) -> bool:
+    value = settings_data.get("timezone_label", True)
+    if isinstance(value, bool):
+        return value
+    raise ValueError("YAML settings.timezone_label: expected bool.")
+
+
 def _validated_dashboard_links_location(settings_data: dict[str, Any]) -> str:
     value = settings_data.get("dashboard_links_location", DASHBOARD_LINKS_LEAF)
     if value in DASHBOARD_LINKS_LOCATIONS:
@@ -210,8 +238,18 @@ def _format_epoch_in_effective_zone(epoch_value: Any, effective_zone: EffectiveT
     return timestamp.astimezone(effective_zone.zone)
 
 
+def _time_zone_label(zone: tzinfo | None, configured_name: str | None = None) -> str:
+    if zone is None:
+        return "+00:00"
+    offset = _offset_label(zone)
+    if configured_name and FIXED_OFFSET_PATTERN.match(configured_name):
+        return offset
+    name = configured_name or datetime.now(zone).tzname()
+    return f"{offset} {name}" if name else offset
+
+
 def _offset_label(zone: tzinfo) -> str:
     offset = datetime.now(zone).utcoffset() or timedelta()
     sign = "+" if offset >= timedelta() else "-"
     total_minutes = abs(int(offset.total_seconds() // 60))
-    return f"UTC{sign}{total_minutes // 60:02d}:{total_minutes % 60:02d}"
+    return f"{sign}{total_minutes // 60:02d}:{total_minutes % 60:02d}"

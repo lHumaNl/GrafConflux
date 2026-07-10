@@ -154,12 +154,16 @@ settings:
     panels: true
     test_times: true
   time_zone: Europe/Moscow
+  time_format: "%d/%m/%Y %H:%M:%S"
+  timezone_label: true
   dashboard_links_location: leaf
 ```
 
 - Supported description ids: `dashboard_links`, `backup_dashboard_links`, `panels`, `test_times`.
 - `test_times` is mandatory and cannot be disabled.
-- `time_zone` accepts an IANA name or a fixed offset such as `+03:00`; if omitted, the Confluence `Test times` section uses the host timezone.
+- `time_zone` accepts an IANA name or a fixed offset such as `+03:00`; if omitted, the Confluence `Test times` section uses the host timezone and displays a concrete offset/name label.
+- `time_format` is a Python `strftime` format for visible test times; default is `%d/%m/%Y %H:%M:%S`.
+- `timezone_label: false` hides the visible timezone line while keeping time conversion active.
 - `dashboard_links_location` supports `leaf` (default), `dashboard`, and `none`.
 - Matrix layouts omit the root visible `Panels` wrapper; `description_switch.panels: false` only hides the label/wrapper and never suppresses downloaded images.
 
@@ -447,7 +451,7 @@ dashboards:
 - `grafana_variable`: actual Grafana URL variable name. Default is the matrix key.
 - `label_template`: optional row label built from variable keys or aliases, for example `{environment} / {Service}`.
 - `combination_mode`: `product` (default) or `zip`.
-- `options.layout`: optional Confluence matrix layout. Use `matrix_values_first` for the Test times -> dashboard -> matrix context -> panel-expand hierarchy.
+- `options.layout`: optional Confluence matrix layout. Use `matrix_values_first` for the Test times -> dashboard -> matrix grouping expands -> leaf dashboard links -> `Panels` expand -> panel-expand hierarchy.
 - `max_rows`: optional hard limit for resolved matrix rows. Default is 500.
 - Static dashboard `vars` are kept and merged with matrix variables in panel and dashboard links.
 - Matrix filenames use stable hashes, not raw variable values.

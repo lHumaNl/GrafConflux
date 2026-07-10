@@ -5,7 +5,7 @@ from typing import Dict, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-HUMAN_TIME_FORMAT = "%Y/%m/%d %H:%M:%S"
+HUMAN_TIME_FORMAT = "%d/%m/%Y %H:%M:%S"
 MILLISECONDS_PER_SECOND = 1000
 TIMESTAMP_SECONDS_LENGTH = 10
 ISO_TIME_RANGE_PATTERN = re.compile(r'&from=([\d\-T:.Z]+).*?&to=([\d\-T:.Z]+)')

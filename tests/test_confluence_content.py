@@ -153,17 +153,38 @@ class TestConfluenceContent(unittest.TestCase):
 
         self.assertIn('ac:parameter ac:name="title">Window</ac:parameter>', content)
         self.assertIn("Timezone: +03:00", content)
-        self.assertIn("2023/11/15 01:13:20", content)
+        self.assertIn("15/11/2023 01:13:20", content)
         self.assertIn("Charts", content)
         self.assertNotIn("Run dashboards", content)
         self.assertNotIn("Backup dashboard links", content)
 
-    def test_host_timezone_is_shown_without_test_times_title_suffix(self):
+    def test_host_timezone_label_is_concrete_without_test_times_title_suffix(self):
         content = build_confluence_storage_content(self.grafana_configs, self.timestamps, 900)
 
         self.assertIn('ac:parameter ac:name="title">Test times</ac:parameter>', content)
         self.assertNotIn("Test times (host timezone)", content)
-        self.assertIn("Timezone: host timezone", content)
+        self.assertNotIn("host timezone", content)
+        self.assertRegex(content, r"Timezone: [+-]\d{2}:\d{2}")
+
+    def test_timezone_label_can_be_hidden_while_times_are_converted(self):
+        config = self.grafana_configs[0]
+        config.confluence_rendering = ConfluenceRenderingSettings(time_zone="+03:00", timezone_label=False)
+        self.timestamps[0].start_time_timestamp = 1700000000000
+        self.timestamps[0].end_time_timestamp = 1700003600000
+
+        content = build_confluence_storage_content([config], self.timestamps, 900)
+
+        self.assertIn('ac:parameter ac:name="title">Test times</ac:parameter>', content)
+        self.assertIn("15/11/2023 01:13:20", content)
+        self.assertNotIn("Timezone:", content)
+
+    def test_iana_timezone_label_includes_offset_and_zone_name(self):
+        config = self.grafana_configs[0]
+        config.confluence_rendering = ConfluenceRenderingSettings(time_zone="Europe/Moscow")
+
+        content = build_confluence_storage_content([config], self.timestamps, 900)
+
+        self.assertIn("Timezone: +03:00 Europe/Moscow", content)
 
     def test_disabled_panels_label_keeps_panel_images_visible(self):
         config = self.grafana_configs[0]

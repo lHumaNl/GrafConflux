@@ -26,8 +26,8 @@ class TestGrafanaTimeParsing(unittest.TestCase):
 
         self.assertEqual(timestamp.start_time_timestamp, 1700000000000)
         self.assertEqual(timestamp.end_time_timestamp, 1700003600000)
-        self.assertEqual(timestamp.start_time_human, "2023/11/14 22:13:20")
-        self.assertEqual(timestamp.end_time_human, "2023/11/14 23:13:20")
+        self.assertEqual(timestamp.start_time_human, "14/11/2023 22:13:20")
+        self.assertEqual(timestamp.end_time_human, "14/11/2023 23:13:20")
 
     def test_epoch_milliseconds_are_preserved(self):
         timestamp = GrafanaTimeDownloader(
@@ -38,7 +38,7 @@ class TestGrafanaTimeParsing(unittest.TestCase):
 
         self.assertEqual(timestamp.start_time_timestamp, 1700000000123)
         self.assertEqual(timestamp.end_time_timestamp, 1700003600456)
-        self.assertEqual(timestamp.start_time_human, "2023/11/14 22:13:20")
+        self.assertEqual(timestamp.start_time_human, "14/11/2023 22:13:20")
 
     def test_iso_z_ranges_preserve_existing_timestamp_precision(self):
         timestamp = GrafanaTimeDownloader(
@@ -55,7 +55,7 @@ class TestGrafanaTimeParsing(unittest.TestCase):
             timestamp.end_time_timestamp,
             _iso_timestamp_milliseconds("2025-11-16T14:30:00.000+00:00"),
         )
-        self.assertEqual(timestamp.start_time_human, "2025/11/16 14:24:49")
+        self.assertEqual(timestamp.start_time_human, "16/11/2025 14:24:49")
 
     def test_non_utc_timezone_converts_human_times(self):
         timestamp = GrafanaTimeDownloader(
@@ -64,15 +64,15 @@ class TestGrafanaTimeParsing(unittest.TestCase):
             "Europe/Moscow",
         )
 
-        self.assertEqual(timestamp.start_time_human, "2023/11/15 01:13:20")
-        self.assertEqual(timestamp.end_time_human, "2023/11/15 02:13:20")
+        self.assertEqual(timestamp.start_time_human, "15/11/2023 01:13:20")
+        self.assertEqual(timestamp.end_time_human, "15/11/2023 02:13:20")
 
     def test_args_parser_applies_cli_timezone(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = self._create_config(temp_dir)
             args = self._parse_args(config_path)
 
-        self.assertEqual(args.timestamps[0].start_time_human, "2023/11/15 01:13:20")
+        self.assertEqual(args.timestamps[0].start_time_human, "15/11/2023 01:13:20")
         self.assertEqual(args.tz, "Europe/Moscow")
 
     def test_invalid_timezone_raises_clear_error(self):
@@ -104,8 +104,15 @@ class TestGrafanaTimeParsing(unittest.TestCase):
         winter_timestamp = GrafanaTimeDownloader("winter__&from=1736942400&to=1736946000", 0, "UTC")
         summer_timestamp = GrafanaTimeDownloader("summer__&from=1750003200&to=1750006800", 1, "UTC")
 
-        self.assertEqual(format_timestamp_time(winter_timestamp, "start", settings), "2025/01/15 07:00:00")
-        self.assertEqual(format_timestamp_time(summer_timestamp, "start", settings), "2025/06/15 08:00:00")
+        self.assertEqual(format_timestamp_time(winter_timestamp, "start", settings), "15/01/2025 07:00:00")
+        self.assertEqual(format_timestamp_time(summer_timestamp, "start", settings), "15/06/2025 08:00:00")
+
+    def test_configured_confluence_time_format_changes_visible_time_only(self):
+        settings = ConfluenceRenderingSettings(time_zone="+03:00", time_format="%Y-%m-%d %H:%M")
+        timestamp = GrafanaTimeDownloader("tag__&from=1700000000&to=1700003600", 0, "UTC")
+
+        self.assertEqual(timestamp.start_time_human, "14/11/2023 22:13:20")
+        self.assertEqual(format_timestamp_time(timestamp, "start", settings), "2023-11-15 01:13")
 
     @staticmethod
     def _create_config(temp_dir: str) -> str:

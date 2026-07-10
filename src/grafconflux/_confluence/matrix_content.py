@@ -45,23 +45,50 @@ def _render_matrix_values_first_dashboard(grafana_config: Any, graph_width: int,
 
 
 def _render_matrix_values_first_sections(grafana_config: Any, graph_width: int,
-                                         settings: ConfluenceRenderingSettings) -> str:
+                                          settings: ConfluenceRenderingSettings) -> str:
     sections = _context_sections(grafana_config, full_context=True)
-    return ''.join(
-        _render_matrix_values_first_section(grafana_config, section, graph_width, settings)
-        for section in sections.values()
-    )
+    return _render_matrix_tree(grafana_config, sections.values(), graph_width, settings)
 
 
 def _render_matrix_values_first_section(grafana_config: Any, section: dict[str, Any], graph_width: int,
                                         settings: ConfluenceRenderingSettings) -> str:
-    title = html.escape(section["title"])
-    content = f'<h3>{title}</h3>\n'
+    content = ''
     content += _render_leaf_dashboard_links(grafana_config, section, settings)
     if settings.enabled(DESCRIPTION_PANELS):
-        content += f'<p>{html.escape(settings.label(DESCRIPTION_PANELS))}</p>\n'
-    content += _render_context_panel_expand(title, section["panels"].values(), graph_width)
+        content += _render_context_panel_expand(settings.label(DESCRIPTION_PANELS), section["panels"].values(), graph_width)
+    else:
+        content += _render_panel_entries(list(section["panels"].values()), graph_width, show_heading=False)
     return content
+
+
+def _render_matrix_tree(grafana_config: Any, sections, graph_width: int,
+                        settings: ConfluenceRenderingSettings) -> str:
+    tree = _matrix_tree(sections)
+    return ''.join(_render_matrix_node(grafana_config, node, graph_width, settings) for node in tree.values())
+
+
+def _render_matrix_node(grafana_config: Any, node: dict[str, Any], graph_width: int,
+                        settings: ConfluenceRenderingSettings) -> str:
+    title = html.escape(node["title"])
+    content = f'<h3>{title}</h3>\n<ac:structured-macro ac:name="expand">\n'
+    content += f'  <ac:parameter ac:name="title">{title}</ac:parameter>\n  <ac:rich-text-body>\n'
+    if node["section"] is not None:
+        content += _render_matrix_values_first_section(grafana_config, node["section"], graph_width, settings)
+    content += ''.join(_render_matrix_node(grafana_config, child, graph_width, settings) for child in node["children"].values())
+    content += '  </ac:rich-text-body>\n</ac:structured-macro>\n'
+    return content
+
+
+def _matrix_tree(sections) -> OrderedDict[str, dict[str, Any]]:
+    tree: OrderedDict[str, dict[str, Any]] = OrderedDict()
+    for section in sections:
+        children = tree
+        for item in section["context"] or [{"key": "matrix", "label": "Matrix", "value": ""}]:
+            key = f'{item.get("key")}={item.get("value")}'
+            node = children.setdefault(key, {"title": _context_item_label(item), "children": OrderedDict(), "section": None})
+            children = node["children"]
+        node["section"] = section
+    return tree
 
 
 def _render_leaf_dashboard_links(grafana_config: Any, section: dict[str, Any],
@@ -77,7 +104,7 @@ def _render_leaf_dashboard_links(grafana_config: Any, section: dict[str, Any],
 
 def _render_context_panel_expand(title: str, panel_entries, graph_width: int) -> str:
     content = '<ac:structured-macro ac:name="expand">\n'
-    content += f'  <ac:parameter ac:name="title">{title}</ac:parameter>\n'
+    content += f'  <ac:parameter ac:name="title">{html.escape(title)}</ac:parameter>\n'
     content += '  <ac:rich-text-body>\n'
     content += _render_panel_entries(list(panel_entries), graph_width, show_heading=False)
     content += '  </ac:rich-text-body>\n</ac:structured-macro>\n'
@@ -180,7 +207,7 @@ def _render_panel_entry(entry: dict[str, Any], graph_width: int, show_heading: b
 
 def _render_artifact(panel: Any, artifact: dict[str, Any], graph_width: int) -> str:
     title = html.escape(_artifact_title(panel, artifact))
-    content = f'    <h5>{title}</h5>\n'
+    content = ''
     link = html.escape(str(artifact.get("link") or _first_panel_link(panel) or ""))
     content += f'    <p><a href="{link}">{title}</a></p>\n' if link else f'    <p>{title} (Grafana link unavailable)</p>\n'
     file_name = html.escape(str(artifact["png_file"]))
@@ -221,7 +248,7 @@ def _context_label(context_path: list[dict[str, str]]) -> str:
 
 
 def _context_item_label(item: dict[str, str]) -> str:
-    label = _friendly_label(item.get("label") or item.get("key") or "Variable")
+    label = str(item.get("label") or _friendly_label(item.get("key") or "Variable"))
     value = normalize_grafana_display_value(item.get("value"))
     return f"{label}: {value}"
 

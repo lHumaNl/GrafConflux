@@ -193,7 +193,8 @@ def _render_test_times_section(timestamps: List[GrafanaTimeBase],
     new_content = '<ac:structured-macro ac:name="expand">\n'
     new_content += f'  <ac:parameter ac:name="title">{html.escape(title)}</ac:parameter>\n'
     new_content += '  <ac:rich-text-body>\n'
-    new_content += f'<p>Timezone: {html.escape(zone.label)}</p>\n'
+    if settings.timezone_label:
+        new_content += f'<p>Timezone: {html.escape(zone.label)}</p>\n'
     new_content += '<table>\n  <tbody>\n    <tr>\n'
     new_content += '      <th>Test tag</th>\n      <th>Start test time</th>\n'
     new_content += '      <th>End test time</th>\n    </tr>\n'
@@ -381,7 +382,6 @@ def _render_panel_artifacts(panel, row_title: str, graph_width: int) -> str:
             continue
         title = _artifact_title(panel, row_title, artifact)
         link = artifact.get('link') or _first_panel_link(panel)
-        new_content += f'    <h4>{title}</h4>\n'
         if link:
             new_content += f'    <p><a href="{html.escape(link)}">{title}</a></p>\n'
         else:
@@ -411,7 +411,7 @@ def _render_matrix_artifacts(panel, row_title: str, graph_width: int) -> str:
 def _render_artifact_image_block(panel, row_title: str, artifact, graph_width: int, indent: str) -> str:
     title = _artifact_title(panel, row_title, artifact)
     link = artifact.get('link') or _first_panel_link(panel)
-    block = f'{indent}<h5>{title}</h5>\n'
+    block = ''
     if link:
         block += f'{indent}<p><a href="{html.escape(link)}">{title}</a></p>\n'
     else:

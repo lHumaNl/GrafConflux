@@ -497,6 +497,8 @@ class TestArgsParser(unittest.TestCase):
             "    panels: true\n"
             "    test_times: true\n"
             "  time_zone: '+03:00'\n"
+            "  time_format: '%H:%M %d-%m-%Y'\n"
+            "  timezone_label: false\n"
             "  dashboard_links_location: leaf\n"
         )
 
@@ -518,6 +520,8 @@ class TestArgsParser(unittest.TestCase):
         self.assertEqual(args.confluence_rendering.label("panels"), "Charts")
         self.assertFalse(args.confluence_rendering.enabled("backup_dashboard_links"))
         self.assertEqual(args.confluence_rendering.time_zone, "+03:00")
+        self.assertEqual(args.confluence_rendering.time_format, "%H:%M %d-%m-%Y")
+        self.assertFalse(args.confluence_rendering.timezone_label)
 
     def test_yaml_description_settings_reject_unknown_ids_and_disabled_test_times(self):
         cases = [
@@ -527,6 +531,8 @@ class TestArgsParser(unittest.TestCase):
             ("time_zone: '+03:60'", "Invalid or unavailable timezone"),
             ("time_zone: '+03:99'", "Invalid or unavailable timezone"),
             ("time_zone: '-05:60'", "Invalid or unavailable timezone"),
+            ("time_format: 123", "time_format"),
+            ("timezone_label: disabled", "timezone_label"),
             ("dashboard_links_location: top", "dashboard_links_location"),
         ]
 
