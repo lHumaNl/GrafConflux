@@ -24,7 +24,7 @@ class TestEmptyDashboardContextDefaults(unittest.TestCase):
         session = self.successful_session()
         resolver = self.resolver(session, {"value": "", "text": None})
 
-        with self.assertLogs("grafconflux._grafana.matrix_discovery", level="DEBUG") as logs:
+        with self.assertLogs("grafconflux._grafana.matrix_discovery", level="INFO") as logs:
             result = resolver.resolve("pod", {"values_from": {}}, self.timestamp, {}, {})
 
         self.assertEqual(result.status, MatrixDiscoveryStatus.RESOLVED)
@@ -103,7 +103,7 @@ class TestEmptyDashboardContextDefaults(unittest.TestCase):
             self.successful_session().get.return_value,
         ])
 
-        with self.assertLogs("grafconflux._grafana.matrix_discovery", level="DEBUG") as logs:
+        with self.assertLogs("grafconflux._grafana.matrix_discovery", level="INFO") as logs:
             manager.get_panels([self.timestamp])
 
         request = manager.session.get.call_args_list[1]
@@ -128,6 +128,31 @@ class TestEmptyDashboardContextDefaults(unittest.TestCase):
         self.assertIn("pod:saved_current_excluded_matrix", diagnostic)
         self.assertNotIn("prom-main", diagnostic)
         self.assertNotIn("kube_pod_info", diagnostic)
+
+    def test_info_diagnostics_are_value_free_and_include_resolution_state(self) -> None:
+        dashboard = {"templating": {"list": [{
+            "name": "pod",
+            "type": "query",
+            "datasource": {"type": "prometheus", "uid": "fake-uid-should-not-log"},
+            "query": 'label_values(up{cluster="$cluster", token="fake-query-secret"}, pod)',
+        }]}}
+        resolver = MatrixValueResolver(dashboard, Mock(), self.config, dynamic_variable_names={"pod"})
+
+        with self.assertLogs("grafconflux._grafana.matrix_discovery", level="INFO") as logs:
+            result = resolver.resolve("pod", {"values_from": {}}, self.timestamp, {}, {})
+
+        diagnostic = "\n".join(logs.output)
+        self.assertEqual(result.status, MatrixDiscoveryStatus.UNSUPPORTED)
+        self.assertIn("dashboard_variable=found", diagnostic)
+        self.assertIn("variable_type=query", diagnostic)
+        self.assertIn("current=missing", diagnostic)
+        self.assertIn("default=missing", diagnostic)
+        self.assertIn("'shape': 'mapping'", diagnostic)
+        self.assertIn("'uid_present': True", diagnostic)
+        self.assertIn("missing_references=['cluster']", diagnostic)
+        self.assertIn("reason=invalid_or_missing_context", diagnostic)
+        self.assertNotIn("fake-uid-should-not-log", diagnostic)
+        self.assertNotIn("fake-query-secret", diagnostic)
 
     def test_null_current_and_default_are_not_coerced_to_empty(self) -> None:
         session = self.successful_session()

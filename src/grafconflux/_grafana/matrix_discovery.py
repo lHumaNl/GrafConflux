@@ -13,6 +13,7 @@ from grafconflux._grafana.matrix_context import (
     DiscoveryContextAssembly,
     assemble_discovery_context,
 )
+from grafconflux._grafana.matrix_diagnostics import datasource_diagnostic, variable_diagnostic
 from grafconflux._grafana.matrix_prometheus import (
     datasource_resolution as _datasource_resolution,
     prometheus_label_values_query as _prometheus_label_values_query,
@@ -103,7 +104,7 @@ class MatrixValueResolver:
             _public_context(context),
             _public_context(static_vars),
         )
-        _log_context_assembly(source_name, timestamp, assembly)
+        _log_context_assembly(source_name, timestamp, assembly, self.dashboard)
         return assembly
 
     def _discover(
@@ -398,10 +399,10 @@ def _with_context_assembly(
 def _log_result(variable: str, timestamp: Any, result: MatrixValueResult) -> None:
     log = logger.info if result.authoritative else logger.warning
     log(
-        "Matrix discovery variable=%s timestamp_id=%s range=%s..%s status=%s source=%s method=%s count=%s values=%s",
+        "Matrix discovery variable=%s timestamp_id=%s range=%s..%s status=%s source=%s reason=%s value_count=%s",
         safe_discovery_variable(variable), timestamp.id_time, timestamp.start_time_timestamp,
         timestamp.end_time_timestamp, result.status.value, result.provenance.get("source"),
-        result.provenance.get("method"), len(result.values), safe_discovery_values(variable, result.values),
+        result.provenance.get("method"), len(result.values),
     )
 
 
@@ -450,7 +451,11 @@ def _log_context_assembly(
     source_name: str,
     timestamp: Any,
     assembly: DiscoveryContextAssembly,
+    dashboard: dict[str, Any],
 ) -> None:
+    variable = variable_diagnostic(
+        _dashboard_variable(dashboard, source_name), assembly.values, _variable_references,
+    )
     included = [
         f"{safe_discovery_variable(name)}:{assembly.value_kinds[name]}:{assembly.sources[name]}"
         for name in sorted(assembly.values)
@@ -459,9 +464,15 @@ def _log_context_assembly(
         f"{safe_discovery_variable(name)}:{reason}"
         for name, reason in assembly.exclusions
     ]
-    logger.debug(
-        "Matrix discovery context variable=%s timestamp_id=%s included=%s excluded=%s",
-        safe_discovery_variable(source_name), timestamp.id_time, included, excluded,
+    logger.info(
+        "Matrix discovery diagnostics variable=%s timestamp_id=%s dashboard_variable=%s "
+        "variable_type=%s current=%s default=%s datasource=%s references=%s missing_references=%s "
+        "included=%s excluded=%s",
+        safe_discovery_variable(source_name), timestamp.id_time,
+        variable["found"], variable["type"], variable["current"], variable["default"],
+        datasource_diagnostic(_dashboard_variable(dashboard, source_name), assembly.values),
+        [safe_discovery_variable(name) for name in variable["references"]],
+        [safe_discovery_variable(name) for name in variable["missing_references"]], included, excluded,
     )
 
 
