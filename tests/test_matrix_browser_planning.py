@@ -82,6 +82,44 @@ class TestBrowserMatrixPlanningCorrelation(unittest.TestCase):
         self.assertIn("time_correlation", diagnostic)
         self.assertNotIn("https://", diagnostic)
 
+    def test_dom_fallback_logs_safe_dashboard_navigation_telemetry(self) -> None:
+        with self.assertLogs(
+            "grafconflux._grafana.matrix_browser_planning", level="INFO",
+        ) as logs:
+            self.fallback([], navigation_url="https://grafana.example/grafana/d/uid/dashboard").discover(
+                "pod", _pod_variable(), _timestamp(), {"namespace": "app"},
+            )
+
+        diagnostic = "\n".join(logs.output)
+        self.assertIn("navigation_http_status=200", diagnostic)
+        self.assertIn("navigation_route=dashboard", diagnostic)
+        self.assertNotIn("https://", diagnostic)
+
+    def test_dom_fallback_logs_safe_login_navigation_telemetry(self) -> None:
+        with self.assertLogs(
+            "grafconflux._grafana.matrix_browser_planning", level="INFO",
+        ) as logs:
+            self.fallback([], navigation_url="https://identity.example/login", navigation_status=302).discover(
+                "pod", _pod_variable(), _timestamp(), {"namespace": "app"},
+            )
+
+        diagnostic = "\n".join(logs.output)
+        self.assertIn("navigation_http_status=302", diagnostic)
+        self.assertIn("navigation_route=login_like", diagnostic)
+        self.assertNotIn("identity.example", diagnostic)
+
+    def test_dom_fallback_marks_unavailable_navigation_signals(self) -> None:
+        with self.assertLogs(
+            "grafconflux._grafana.matrix_browser_planning", level="INFO",
+        ) as logs:
+            self.fallback([], navigation_url=None, navigation_status=None).discover(
+                "pod", _pod_variable(), _timestamp(), {"namespace": "app"},
+            )
+
+        diagnostic = "\n".join(logs.output)
+        self.assertIn("navigation_http_status=unavailable", diagnostic)
+        self.assertIn("navigation_route=other", diagnostic)
+
     def test_series_response_requires_complete_period_boundaries(self) -> None:
         for missing_boundary in ("start", "end"):
             with self.subTest(missing_boundary=missing_boundary):
@@ -252,8 +290,10 @@ class TestBrowserMatrixPlanningCorrelation(unittest.TestCase):
         self.assertEqual(result.status, MatrixDiscoveryStatus.EMPTY)
         self.assertEqual(result.values, [])
 
-    def fallback(self, responses: list[object]) -> BrowserMatrixFallback:
-        browser = _PlanningBrowser(_PlanningPage(), responses)
+    def fallback(
+        self, responses: list[object], navigation_url: str | None = None, navigation_status: int | None = 200,
+    ) -> BrowserMatrixFallback:
+        browser = _PlanningBrowser(_PlanningPage(navigation_url), responses, navigation_status)
         return BrowserMatrixFallback(
             SimpleNamespace(vars={}, orgId=2, timeout=0, datasource_vars={}),
             Mock(),
@@ -317,8 +357,9 @@ class TestBrowserMatrixPlanningDomScope(unittest.TestCase):
 
 
 class _PlanningPage:
-    def __init__(self) -> None:
+    def __init__(self, url: str | None = None) -> None:
         self.listeners: dict[str, object] = {}
+        self.url = url
 
     def on(self, event: str, handler: object) -> None:
         self.listeners[event] = handler
@@ -331,13 +372,15 @@ class _PlanningPage:
 
 
 class _PlanningBrowser:
-    def __init__(self, page: _PlanningPage, responses: list[object]) -> None:
+    def __init__(self, page: _PlanningPage, responses: list[object], navigation_status: int | None = 200) -> None:
         self.page = page
         self.responses = responses
+        self.navigation_status = navigation_status
 
-    def get(self, _url: str) -> None:
+    def get(self, _url: str) -> SimpleNamespace | None:
         for response in self.responses:
             self.page.listeners["response"](response)
+        return SimpleNamespace(status=self.navigation_status) if self.navigation_status is not None else None
 
 
 class _DomPlanningBrowser:

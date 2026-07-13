@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections import Counter
 from typing import Any, Callable
 from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
@@ -21,6 +22,7 @@ from grafconflux._grafana.matrix_discovery import (
     _result,
     safe_discovery_variable,
 )
+from grafconflux._grafana.matrix_prometheus import datasource_resolution
 from grafconflux._grafana.rendering import build_dashboard_url_params
 
 logger = logging.getLogger(__name__)
@@ -65,13 +67,18 @@ class BrowserMatrixFallback:
         )
         try:
             with collector.collect(browser.page):
-                browser.get(self._navigation_url(timestamp, context))
+                navigation_response = browser.get(self._navigation_url(timestamp, context))
                 self._wait_for_response(browser, collector)
             if collector.result is not None:
                 return collector.result
+            navigation_status, navigation_route = _navigation_telemetry(navigation_response, browser.page)
             logger.info(
-                "Matrix planning using DOM fallback variable=%s timestamp_id=%s network_diagnostics=%s",
-                safe_discovery_variable(variable_name), timestamp.id_time, collector.diagnostics(),
+                "Matrix planning using DOM fallback variable=%s timestamp_id=%s navigation_datasource_present=%s "
+                "navigation_datasource_source=%s navigation_datasource_representation=%s "
+                "navigation_http_status=%s navigation_route=%s network_diagnostics=%s",
+                safe_discovery_variable(variable_name), timestamp.id_time, collector.datasource_present,
+                collector.datasource_source, collector.datasource_representation, navigation_status,
+                navigation_route, collector.diagnostics(),
             )
             values = self._dom_values(browser, variable_name)
         except Exception as error:
@@ -195,15 +202,33 @@ class _PlanningResponseCollector:
         self.query = _prometheus_label_values_query(self.variable, context) if self.variable else None
         self.target_label = self.query[1] if self.query is not None else variable_name
         self.datasource_uid = _prometheus_datasource_uid(self.variable, context, config, dashboard)
+        resolution = datasource_resolution(self.variable.get("datasource"), context, config, dashboard)
+        self.datasource_present = resolution["uid_status"] == "resolved"
+        self.datasource_source = resolution["uid_source"]
+        self.datasource_representation = _datasource_representation(self.variable.get("datasource"))
         self.ds_query_signature = _ds_variable_query_signature(self.variable, self.query)
         self.ds_query_ref_id: str | None = None
         self.result: MatrixValueResult | None = None
         self.rejections: set[str] = set()
+        self.candidates: Counter[tuple[str, str, Any, str, str, str, str, str, str, str]] = Counter()
 
     def diagnostics(self) -> list[str]:
         if not self.datasource_uid:
             self.rejections.add("invalid_or_missing_context")
-        return sorted(self.rejections) or ["no_correlated_network_candidate"]
+        records = [
+            {
+                "route_family": route, "method": method, "status": status,
+                "datasource_extraction_source": extraction, "expected_datasource_present": expected,
+                "expected_datasource_source": source, "datasource_match": datasource_match,
+                "selector_match": selector_match, "correlation": correlation,
+                "rejection": rejection, "count": count,
+            }
+            for (route, method, status, extraction, expected, source, datasource_match,
+                 selector_match, correlation, rejection), count in sorted(self.candidates.items())
+        ]
+        return records or [{"rejection": reason, "count": 1} for reason in sorted(self.rejections)] or [
+            {"rejection": "no_correlated_network_candidate", "count": 1},
+        ]
 
     def collect(self, page: Any) -> _ListenerScope:
         return _ListenerScope(page, self._record_response)
@@ -214,6 +239,7 @@ class _PlanningResponseCollector:
         if getattr(response, "status", None) != 200:
             if _is_metadata_candidate(response):
                 self.rejections.add("http_status")
+                self._record_candidate(response, "rejected", "http_status", "unavailable", "unavailable")
             return
         method = self._correlated_method(response)
         if method is None:
@@ -222,6 +248,7 @@ class _PlanningResponseCollector:
             payload = response.json()
         except Exception:
             self.rejections.add("invalid_response_payload")
+            self._record_candidate(response, "rejected", "invalid_response_payload", "match", "unavailable")
             return
         if method in {"prometheus_label_values", "prometheus_series"} and not _successful_payload(payload):
             self.result = _result(
@@ -246,12 +273,14 @@ class _PlanningResponseCollector:
             return self._correlated_metadata_method(response, request_url, route)
         if _is_metadata_candidate(response):
             self.rejections.add("rejected_route")
+            self._record_candidate(response, "rejected", "rejected_route", "unavailable", "unavailable")
         if path.endswith("/api/ds/query"):
             ref_id = self._ds_query_ref_id(response)
             if ref_id is not None:
                 self.ds_query_ref_id = ref_id
                 return "prometheus_ds_query"
             self.rejections.add("query_correlation")
+            self._record_candidate(response, "rejected", "query_correlation", "unavailable", "unavailable")
         return None
 
     def _correlated_metadata_method(
@@ -268,13 +297,29 @@ class _PlanningResponseCollector:
         for rejected, reason in checks:
             if rejected:
                 self.rejections.add(reason)
+                datasource_match = "mismatch" if reason == "datasource_correlation" else "unavailable"
+                self._record_candidate(response, "rejected", reason, datasource_match, "unavailable")
                 return None
         if endpoint == f"label/{self.target_label}/values":
+            self._record_candidate(response, "accepted", "none", "match", "unavailable")
             return "prometheus_label_values"
         if endpoint == "series" and self._series_request_matches(response):
+            self._record_candidate(response, "accepted", "none", "match", "match")
             return "prometheus_series"
         self.rejections.add("selector_or_label_correlation")
+        self._record_candidate(response, "rejected", "selector_or_label_correlation", "match", "mismatch")
         return None
+
+    def _record_candidate(
+        self, response: Any, correlation: str, rejection: str, datasource_match: str, selector_match: str,
+    ) -> None:
+        route, extraction = _candidate_route(response)
+        request = getattr(response, "request", None)
+        self.candidates[(
+            route, str(getattr(request, "method", "")).upper() or "none", getattr(response, "status", None),
+            extraction, str(self.datasource_present).lower(), self.datasource_source, datasource_match,
+            selector_match, correlation, rejection,
+        )] += 1
 
     def _series_request_matches(self, response: Any) -> bool:
         if self.query is None or not self.query[0]:
@@ -316,6 +361,43 @@ def _prometheus_datasource_uid(
     if str(datasource_type).lower() != "prometheus" or not datasource_uid:
         return None
     return str(datasource_uid)
+
+
+def _datasource_representation(datasource: Any) -> str:
+    if isinstance(datasource, dict):
+        return "mapping"
+    if isinstance(datasource, str):
+        return "string"
+    return "missing" if datasource is None else "unsupported"
+
+
+def _candidate_route(response: Any) -> tuple[str, str]:
+    request_url = _response_request_url(response)
+    path = urlparse(request_url).path
+    if "/api/datasources/proxy/uid/" in path:
+        return "proxy_uid", "proxy_uid_path"
+    if "/api/datasources/uid/" in path and "/resources/" in path:
+        return "uid_resources", "uid_resources_path"
+    if path.endswith("/api/ds/query"):
+        return "ds_query", "request_payload"
+    return "other", "none"
+
+
+def _navigation_telemetry(response: Any, page: Any) -> tuple[int | str, str]:
+    """Return non-sensitive navigation status and route classification."""
+    status = getattr(response, "status", None)
+    safe_status = status if isinstance(status, int) and not isinstance(status, bool) else "unavailable"
+    return safe_status, _navigation_route(getattr(page, "url", ""))
+
+
+def _navigation_route(url: Any) -> str:
+    path = urlparse(str(url or "")).path.lower()
+    segments = set(filter(None, path.split("/")))
+    if segments.intersection({"auth", "login", "oauth", "oauth2", "saml", "signin", "sso"}):
+        return "login_like"
+    if "/d/" in path:
+        return "dashboard"
+    return "other"
 
 
 def _successful_payload(payload: Any) -> bool:

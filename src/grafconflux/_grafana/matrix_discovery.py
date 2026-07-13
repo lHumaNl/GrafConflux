@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -171,12 +172,16 @@ def _prometheus_result(
     method = "prometheus_series" if metric else "prometheus_label_values"
     url = _prometheus_url(config.grafana_base_url, datasource_uid, label, bool(metric))
     params = _prometheus_params(metric, timestamp)
+    started = time.monotonic()
     try:
         response = session.get(url, params=params, timeout=getattr(config, "timeout", None))
     except Exception as error:
-        logger.warning("Matrix discovery request failed variable=%s error_type=%s", safe_discovery_variable(source_name), type(error).__name__)
+        _log_primary_series_attempt(
+            method, diagnostics, source_name, label, variable, started, None, error,
+        )
         result = _result(MatrixDiscoveryStatus.FAILED, [], source_name, timestamp, context, "grafana_api", method)
         return _with_adapter_diagnostics(result, diagnostics, "request_failed")
+    _log_primary_series_attempt(method, diagnostics, source_name, label, variable, started, response, None)
     result = _prometheus_response_result(response, source_name, timestamp, context, method, label)
     return _with_adapter_diagnostics(result, diagnostics)
 
@@ -312,6 +317,63 @@ def _prometheus_response_result(
         return _result(MatrixDiscoveryStatus.UNRESOLVED, [], source_name, timestamp, context, "grafana_api", method)
     status = MatrixDiscoveryStatus.RESOLVED if values else MatrixDiscoveryStatus.EMPTY
     return _result(status, values, source_name, timestamp, context, "grafana_api", method)
+
+
+def _log_primary_series_attempt(
+    method: str, diagnostics: dict[str, Any], variable: str, label: str,
+    definition: dict[str, Any] | None, started: float, response: Any, error: Exception | None,
+) -> None:
+    """Emit one value-free outcome record for the direct series adapter."""
+    if method != "prometheus_series":
+        return
+    status = getattr(response, "status_code", None) if response is not None else None
+    classification, prometheus_status, data_count, outcome = _series_attempt_outcome(response, error)
+    resolution = diagnostics["datasource_resolution"]
+    log = logger.info if outcome in {"success_empty", "success_nonempty"} else logger.warning
+    log(
+        "Matrix discovery primary_series adapter=prometheus route_family=proxy_uid method=GET "
+        "http_status=%s exception_class=%s duration_ms=%s datasource_uid_present=%s "
+        "datasource_uid_source=%s target_label=%s reference_vars=%s response_classification=%s "
+        "prometheus_status=%s data_count=%s outcome=%s",
+        status, type(error).__name__ if error else "none", round((time.monotonic() - started) * 1000),
+        resolution["uid_status"] == "resolved", resolution["uid_source"], safe_discovery_variable(label),
+        sorted({safe_discovery_variable(name) for name in _variable_references(definition or {})}),
+        classification, prometheus_status, data_count, outcome,
+    )
+
+
+def _series_attempt_outcome(response: Any, error: Exception | None) -> tuple[str, str, str | int, str]:
+    if error is not None:
+        return "none", "none", "unknown", "request_exception"
+    if getattr(response, "status_code", None) != 200:
+        return _response_content_classification(response), "none", "unknown", "http_non_2xx"
+    try:
+        payload = response.json()
+    except Exception:
+        return _response_content_classification(response), "none", "unknown", "invalid_json"
+    if not isinstance(payload, dict):
+        return "json_schema_invalid", "none", "unknown", "data_schema_invalid"
+    prometheus_status = _prometheus_status_enum(payload.get("status"))
+    if prometheus_status != "success":
+        return "prometheus_error", prometheus_status, "unknown", "prometheus_status_not_success"
+    data = payload.get("data")
+    if not isinstance(data, list) or not all(isinstance(item, dict) for item in data):
+        return "json_schema_invalid", prometheus_status, "unknown", "data_schema_invalid"
+    return "prometheus_success_list", prometheus_status, len(data), "success_nonempty" if data else "success_empty"
+
+
+def _response_content_classification(response: Any) -> str:
+    headers = getattr(response, "headers", {}) or {}
+    content_type = str(headers.get("Content-Type", headers.get("content-type", ""))).lower()
+    if "html" in content_type:
+        return "html_like"
+    if content_type.startswith("text/"):
+        return "text_like"
+    return "non_json"
+
+
+def _prometheus_status_enum(value: Any) -> str:
+    return str(value) if value in {"success", "error"} else "other" if value is not None else "none"
 
 
 def _prometheus_payload_values(payload: Any, method: str, label: str) -> list[str] | None:

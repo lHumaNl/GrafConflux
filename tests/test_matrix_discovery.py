@@ -148,6 +148,25 @@ class TestMatrixValueResolver(unittest.TestCase):
         self.assertEqual(result.status, MatrixDiscoveryStatus.FAILED)
         self.assertEqual(result.values, [])
 
+    def test_series_failure_logs_one_safe_compact_primary_diagnostic(self) -> None:
+        session = Mock()
+        session.get.return_value = Mock(status_code=503, headers={})
+        resolver = self.resolver(session, 'label_values(up{namespace="$namespace"}, pod)')
+
+        with self.assertLogs("grafconflux._grafana.matrix_discovery", level="WARNING") as logs:
+            resolver.resolve("pod", {"values_from": {}}, self.timestamp, {"namespace": "private"}, {})
+
+        events = [line for line in logs.output if "primary_series" in line]
+        self.assertEqual(len(events), 1)
+        diagnostic = events[0]
+        self.assertIn("route_family=proxy_uid", diagnostic)
+        self.assertIn("http_status=503", diagnostic)
+        self.assertIn("response_classification=non_json", diagnostic)
+        self.assertIn("outcome=http_non_2xx", diagnostic)
+        self.assertIn("reference_vars=['namespace']", diagnostic)
+        self.assertNotIn("private", diagnostic)
+        self.assertNotIn("up{", diagnostic)
+
     def test_saved_current_is_not_used_for_another_dynamic_matrix_variable(self) -> None:
         session = Mock()
         dashboard = {"templating": {"list": [
@@ -322,6 +341,26 @@ class TestBrowserMatrixFallback(unittest.TestCase):
 
         self.assertEqual(result.status, MatrixDiscoveryStatus.RESOLVED)
         self.assertEqual(result.values, ["api-1"])
+
+    def test_dom_fallback_aggregates_safe_network_rejections(self) -> None:
+        page = _FakePlanningPage()
+        browser = _FakePlanningBrowser(page, responses=[
+            _series_response("other", "1700000000", "1700003600", "wrong"),
+            _series_response("prom", "1700000001", "1700003600", "wrong"),
+        ])
+        fallback = self.fallback(browser)
+
+        with self.assertLogs("grafconflux._grafana.matrix_browser_planning", level="INFO") as logs:
+            result = fallback.discover("pod", self.variable(), self.timestamp(), {"namespace": "private"})
+
+        self.assertEqual(result.status, MatrixDiscoveryStatus.UNRESOLVED)
+        diagnostic = "\n".join(logs.output)
+        self.assertIn("navigation_datasource_present=True", diagnostic)
+        self.assertIn("navigation_datasource_source=direct", diagnostic)
+        self.assertIn("route_family': 'proxy_uid'", diagnostic)
+        self.assertIn("rejection': 'datasource_correlation'", diagnostic)
+        self.assertNotIn("private", diagnostic)
+        self.assertNotIn("https://", diagnostic)
 
     def test_label_response_rejects_same_label_from_another_datasource(self) -> None:
         page = _FakePlanningPage()
