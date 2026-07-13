@@ -121,6 +121,7 @@ class TestEmptyDashboardContextDefaults(unittest.TestCase):
             "source": "direct",
             "type_status": "resolved_prometheus",
             "uid_status": "resolved",
+            "uid_source": "direct",
         })
         diagnostic = "\n".join(logs.output)
         self.assertIn("cluster:empty_string:dashboard.current.value", diagnostic)
@@ -203,8 +204,52 @@ class TestEmptyDashboardContextDefaults(unittest.TestCase):
             "source": "direct",
             "type_status": "resolved_prometheus",
             "uid_status": "missing",
+            "uid_source": "missing",
         })
         session.get.assert_not_called()
+
+    def test_explicit_empty_cluster_override_is_used_when_saved_current_is_missing(self) -> None:
+        session = self.successful_session()
+        resolver = self.resolver(session, None)
+
+        result = resolver.resolve("pod", {"values_from": {}}, self.timestamp, {}, {"cluster": ""})
+
+        self.assertEqual(result.status, MatrixDiscoveryStatus.RESOLVED)
+        self.assertEqual(result.provenance["context_sources"]["cluster"], "explicit_vars")
+        self.assertEqual(session.get.call_args.kwargs["params"]["match[]"], 'kube_pod_info{cluster=""}')
+
+    def test_prometheus_mapping_without_uid_uses_validated_datasource_context(self) -> None:
+        dashboard = self.dashboard_with_missing_pod_uid({"query": "prometheus", "current": {"value": "prom-main"}})
+        session = self.successful_session()
+        session.get.return_value = Mock(
+            status_code=200,
+            json=Mock(return_value={"status": "success", "data": ["api-1"]}),
+        )
+        resolver = MatrixValueResolver(dashboard, session, self.config, dynamic_variable_names={"pod"})
+
+        result = resolver.resolve("pod", {"values_from": {}}, self.timestamp, {}, {})
+
+        self.assertEqual(result.status, MatrixDiscoveryStatus.RESOLVED)
+        self.assertIn("/uid/prom-main/", session.get.call_args.args[0])
+        self.assertEqual(result.provenance["datasource_resolution"]["uid_source"], "datasource_context_validated")
+
+    def test_missing_uid_rejects_invalid_or_ambiguous_datasource_context(self) -> None:
+        cases = (
+            (({"query": "loki", "current": {"value": "loki-main"}},), {}),
+            (({"query": "prometheus", "current": {"value": "prom-main"}},), {"datasource": []}),
+            (({"query": "prometheus", "current": {"value": "prom-one"}}, {"query": "prometheus", "current": {"value": "prom-two"}}), {}),
+        )
+        for datasource_variables, static_vars in cases:
+            with self.subTest(datasource_variables=datasource_variables):
+                dashboard = self.dashboard_with_missing_pod_uid(*datasource_variables)
+                session = Mock()
+                resolver = MatrixValueResolver(dashboard, session, self.config, dynamic_variable_names={"pod"})
+
+                result = resolver.resolve("pod", {"values_from": {}}, self.timestamp, {}, static_vars)
+
+                self.assertEqual(result.status, MatrixDiscoveryStatus.UNRESOLVED)
+                self.assertEqual(result.provenance["datasource_resolution"]["uid_source"], "missing")
+                session.get.assert_not_called()
 
     def resolver(
         self,
@@ -266,6 +311,22 @@ class TestEmptyDashboardContextDefaults(unittest.TestCase):
                 },
             ]},
         }
+
+    @staticmethod
+    def dashboard_with_missing_pod_uid(*datasource_variables: dict) -> dict:
+        variables = [
+            {"name": f"datasource{index}", "type": "datasource", **value}
+            for index, value in enumerate(datasource_variables or ({"query": "prometheus", "current": {"value": "prom-main"}},))
+        ]
+        if len(variables) == 1:
+            variables[0]["name"] = "datasource"
+        variables.append({
+            "name": "pod",
+            "type": "query",
+            "datasource": {"type": "prometheus"},
+            "query": "label_values(pod)",
+        })
+        return {"templating": {"list": variables}}
 
     @staticmethod
     def successful_session() -> Mock:

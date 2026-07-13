@@ -32,14 +32,26 @@ def resolved_datasource_type_uid(
     config: Any,
     dashboard: dict[str, Any],
 ) -> tuple[str | None, str | None]:
+    resolved_type, resolved_uid, _ = _resolved_datasource_details(datasource, context, config, dashboard)
+    return resolved_type, resolved_uid
+
+
+def _resolved_datasource_details(
+    datasource: Any,
+    context: dict[str, Any],
+    config: Any,
+    dashboard: dict[str, Any],
+) -> tuple[str | None, str | None, str]:
     datasource_type, datasource_uid = _datasource_type_uid(datasource)
     ref_name = _datasource_reference(datasource_type, datasource_uid, config)
     if not ref_name:
-        return _resolved_context_value(datasource_type, context), _resolved_context_value(datasource_uid, context)
+        resolved_type = _resolved_context_value(datasource_type, context)
+        resolved_uid = _resolved_context_value(datasource_uid, context)
+        return _direct_or_context_uid(resolved_type, resolved_uid, datasource_uid, context, dashboard)
     variable = _dashboard_variable(dashboard, ref_name)
     resolved_type = _datasource_variable_type(variable) or _resolved_context_value(datasource_type, context)
     resolved_uid = _resolved_context_value(datasource_uid, context) or dashboard_variable_current_value(variable)
-    return resolved_type, resolved_uid
+    return resolved_type, resolved_uid, "direct" if resolved_uid else "missing"
 
 
 def datasource_resolution(
@@ -50,12 +62,54 @@ def datasource_resolution(
 ) -> dict[str, str]:
     datasource_type, datasource_uid = _datasource_type_uid(datasource)
     ref_name = _datasource_reference(datasource_type, datasource_uid, config)
-    resolved_type, resolved_uid = resolved_datasource_type_uid(datasource, context, config, dashboard)
+    resolved_type, resolved_uid, uid_source = _resolved_datasource_details(
+        datasource, context, config, dashboard,
+    )
     return {
         "source": "variable_reference" if ref_name else "direct" if datasource is not None else "missing",
         "type_status": _datasource_type_status(resolved_type, bool(ref_name)),
         "uid_status": _datasource_uid_status(resolved_uid, bool(ref_name)),
+        "uid_source": uid_source,
     }
+
+
+def _direct_or_context_uid(
+    datasource_type: str | None,
+    datasource_uid: str | None,
+    raw_uid: Any,
+    context: dict[str, Any],
+    dashboard: dict[str, Any],
+) -> tuple[str | None, str | None, str]:
+    if datasource_uid:
+        return datasource_type, datasource_uid, "direct"
+    fallback_uid = _validated_prometheus_context_uid(datasource_type, raw_uid, context, dashboard)
+    return datasource_type, fallback_uid, "datasource_context_validated" if fallback_uid else "missing"
+
+
+def _validated_prometheus_context_uid(
+    datasource_type: str | None,
+    raw_uid: Any,
+    context: dict[str, Any],
+    dashboard: dict[str, Any],
+) -> str | None:
+    if raw_uid not in (None, "") or str(datasource_type).lower() != PROMETHEUS_DATASOURCE_TYPE:
+        return None
+    candidates = [_context_uid(variable, context) for variable in _dashboard_datasource_variables(dashboard)]
+    valid = [uid for uid in candidates if uid is not None]
+    return valid[0] if len(valid) == 1 else None
+
+
+def _dashboard_datasource_variables(dashboard: dict[str, Any]) -> list[dict[str, Any]]:
+    variables = dashboard.get("templating", {}).get("list", [])
+    return [variable for variable in variables if isinstance(variable, dict) and variable.get("type") == "datasource"]
+
+
+def _context_uid(variable: dict[str, Any], context: dict[str, Any]) -> str | None:
+    name = variable.get("name")
+    value = context.get(name) if isinstance(name, str) else None
+    if _datasource_variable_type(variable) != PROMETHEUS_DATASOURCE_TYPE:
+        return None
+    return value if isinstance(value, str) and value.strip() else None
 
 
 def _datasource_reference(datasource_type: Any, datasource_uid: Any, config: Any) -> str | None:
@@ -99,7 +153,8 @@ def _datasource_variable_type(variable: dict[str, Any] | None) -> str | None:
     if not isinstance(variable, dict) or variable.get("type") != "datasource":
         return None
     query = variable.get("query")
-    return query if isinstance(query, str) and query else query.get("type") if isinstance(query, dict) else None
+    value = query if isinstance(query, str) else query.get("type") if isinstance(query, dict) else None
+    return value.lower() if isinstance(value, str) and value else None
 
 
 def _datasource_type_status(value: Any, referenced: bool) -> str:
