@@ -1,4 +1,6 @@
 import unittest
+import ast
+import re
 from types import SimpleNamespace
 from unittest.mock import Mock
 from urllib.parse import urlencode
@@ -81,6 +83,99 @@ class TestBrowserMatrixPlanningCorrelation(unittest.TestCase):
         self.assertIn("selector_or_label_correlation", diagnostic)
         self.assertIn("time_correlation", diagnostic)
         self.assertNotIn("https://", diagnostic)
+
+    def test_uid_mismatch_keeps_other_correlation_evidence_and_fingerprints_values(self) -> None:
+        expected_uid = "expected-uid-secret"
+        observed_uid = "observed-uid-secret"
+        selector = 'kube_pod_info{namespace="sensitive-namespace"}'
+        variable = {
+            **_pod_variable(),
+            "datasource": {"type": "prometheus", "uid": expected_uid},
+            "query": f"label_values({selector}, pod)",
+        }
+        response = _metadata_response(
+            "resources", datasource_uid=observed_uid, selector=selector,
+        )
+        response.headers = {"Authorization": "Bearer response-token-secret"}
+        response.body = "response-body-secret"
+        response.request.headers = {"Cookie": "session-cookie-secret"}
+        response.request.post_data = "request-body-secret"
+
+        with self.assertLogs(
+            "grafconflux._grafana.matrix_browser_planning", level="INFO",
+        ) as logs:
+            result = self.fallback([response]).discover("pod", variable, _timestamp(), {})
+
+        self.assertEqual(result.status, MatrixDiscoveryStatus.UNRESOLVED)
+        diagnostic = "\n".join(logs.output)
+        record = _first_network_diagnostic(diagnostic)
+        self.assertEqual(record["rejection"], "datasource_correlation")
+        self.assertEqual(record["datasource_match"], "mismatch")
+        self.assertEqual(record["selector_match"], "match")
+        self.assertEqual(record["time_match"], "match")
+        self.assertEqual(record["method_match"], "match")
+        self.assertEqual(record["route_match"], "match")
+        self.assertNotEqual(
+            record["expected_datasource_fingerprint"],
+            record["observed_datasource_fingerprint"],
+        )
+        self.assertEqual(
+            record["expected_selector_fingerprint"],
+            record["observed_selector_fingerprint"],
+        )
+        self.assertNotIn(expected_uid, diagnostic)
+        self.assertNotIn(observed_uid, diagnostic)
+        self.assertNotIn(selector, diagnostic)
+        self.assertNotIn("sensitive-namespace", diagnostic)
+        self.assertNotIn("response-token-secret", diagnostic)
+        self.assertNotIn("response-body-secret", diagnostic)
+        self.assertNotIn("session-cookie-secret", diagnostic)
+        self.assertNotIn("request-body-secret", diagnostic)
+
+    def test_rejected_fingerprint_domains_are_distinct_and_fixed_length(self) -> None:
+        shared_value = "up"
+        variable = {
+            **_pod_variable(),
+            "datasource": {"type": "prometheus", "uid": shared_value},
+            "query": f"label_values({shared_value}, {shared_value})",
+        }
+        response = _metadata_response(
+            "resources", datasource_uid=shared_value, selector=shared_value, end="1700003601",
+        )
+
+        with self.assertLogs(
+            "grafconflux._grafana.matrix_browser_planning", level="INFO",
+        ) as logs:
+            self.fallback([response]).discover("pod", variable, _timestamp(), {})
+
+        record = _first_network_diagnostic("\n".join(logs.output))
+        datasource_fingerprint = record["expected_datasource_fingerprint"]
+        selector_fingerprint = record["expected_selector_fingerprint"]
+        label_fingerprint = record["expected_label_fingerprint"]
+        self.assertRegex(datasource_fingerprint, r"^[0-9a-f]{12}$")
+        self.assertRegex(selector_fingerprint, r"^[0-9a-f]{12}$")
+        self.assertRegex(label_fingerprint, r"^[0-9a-f]{12}$")
+        self.assertEqual(len({datasource_fingerprint, selector_fingerprint, label_fingerprint}), 3)
+
+    def test_rejected_candidate_aggregation_is_bounded(self) -> None:
+        responses = [
+            _metadata_response("resources", datasource_uid=f"other-{index}")
+            for index in range(30)
+        ]
+
+        with self.assertLogs(
+            "grafconflux._grafana.matrix_browser_planning", level="INFO",
+        ) as logs:
+            self.fallback(responses).discover(
+                "pod", _pod_variable(), _timestamp(), {"namespace": "app"},
+            )
+
+        diagnostic = "\n".join(logs.output)
+        records = _network_diagnostics(diagnostic)
+        detailed = [record for record in records if "route_family" in record]
+        self.assertLessEqual(len(detailed), 20)
+        self.assertTrue(any(record.get("rejection") == "candidate_diagnostics_truncated" for record in records))
+        self.assertNotIn("other-29", diagnostic)
 
     def test_dom_fallback_logs_safe_dashboard_navigation_telemetry(self) -> None:
         with self.assertLogs(
@@ -533,6 +628,17 @@ def _metadata_response(
 def _response(url: str, payload: dict) -> SimpleNamespace:
     request = SimpleNamespace(method="GET", url=url)
     return SimpleNamespace(status=200, url=url, request=request, json=lambda: payload)
+
+
+def _network_diagnostics(log_output: str) -> list[dict]:
+    match = re.search(r"network_diagnostics=(\[.*\])", log_output)
+    if match is None:
+        raise AssertionError("network diagnostics were not logged")
+    return ast.literal_eval(match.group(1))
+
+
+def _first_network_diagnostic(log_output: str) -> dict:
+    return _network_diagnostics(log_output)[0]
 
 
 if __name__ == "__main__":

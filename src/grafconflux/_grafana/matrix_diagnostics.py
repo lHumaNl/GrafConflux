@@ -2,13 +2,27 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import re
+import secrets
 from typing import Any, Callable
 
 PROMETHEUS_DATASOURCE_TYPE = "prometheus"
 SUPPORTED_VARIABLE_TYPES = {
     "query", "datasource", "custom", "constant", "interval", "textbox", "adhoc", "groupby",
 }
+CORRELATION_FINGERPRINT_LENGTH = 12
+_CORRELATION_FINGERPRINT_KEY = secrets.token_bytes(32)
+
+
+def correlation_fingerprint(domain: str, value: Any) -> str:
+    """Return a process-local value-free identifier for correlation diagnostics."""
+    if value in (None, ""):
+        return "unavailable"
+    message = f"{domain}\0{value}".encode("utf-8", errors="replace")
+    digest = hmac.new(_CORRELATION_FINGERPRINT_KEY, message, hashlib.sha256)
+    return digest.hexdigest()[:CORRELATION_FINGERPRINT_LENGTH]
 
 
 def variable_diagnostic(

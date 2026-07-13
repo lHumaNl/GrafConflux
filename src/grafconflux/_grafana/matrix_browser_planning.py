@@ -2,14 +2,37 @@
 
 from __future__ import annotations
 
-import json
 import logging
-import re
 from collections import Counter
 from typing import Any, Callable
-from urllib.parse import parse_qs, unquote, urlencode, urlparse
+from urllib.parse import urlencode, urlparse
 
 from grafconflux._grafana.browser_session import GrafanaBrowserSession
+from grafconflux._grafana.matrix_browser_correlation import (
+    candidate_endpoint as _candidate_endpoint,
+    correlation_record as _build_correlation_record,
+    datasource_representation as _datasource_representation,
+    ds_query_values as _ds_query_values,
+    ds_variable_query_signature as _ds_variable_query_signature,
+    endpoint_label as _endpoint_label,
+    endpoint_match_state as _endpoint_match_state,
+    evaluation_record as _evaluation_record,
+    is_metadata_candidate as _is_metadata_candidate,
+    is_prometheus_metadata_candidate as _is_prometheus_metadata_candidate,
+    metadata_rejection as _metadata_rejection,
+    navigation_telemetry as _navigation_telemetry,
+    observed_selector as _observed_selector,
+    payload_time_matches as _payload_time_matches,
+    prometheus_datasource_uid as _prometheus_datasource_uid,
+    prometheus_metadata_route as _prometheus_metadata_route,
+    query_datasource_uid as _query_datasource_uid,
+    query_matches_signature as _query_matches_signature,
+    request_json as _request_json,
+    required_match_state as _required_match_state,
+    response_request_url as _response_request_url,
+    successful_payload as _successful_payload,
+    url_time_matches as _url_time_matches,
+)
 from grafconflux._grafana.matrix_browser_dom import open_variable_script, read_variable_options_script
 from grafconflux._grafana.matrix_discovery import (
     MatrixDiscoveryStatus,
@@ -17,8 +40,6 @@ from grafconflux._grafana.matrix_discovery import (
     _dedupe,
     _prometheus_label_values_query,
     _prometheus_payload_values,
-    _prometheus_seconds,
-    _resolved_datasource_type_uid,
     _result,
     safe_discovery_variable,
 )
@@ -30,6 +51,7 @@ logger = logging.getLogger(__name__)
 PLANNING_POLL_MS = 100
 PLANNING_MAX_WAIT_MS = 5_000
 ALL_DISPLAY_VALUES = {"all", "$__all", "__all"}
+MAX_REJECTED_CANDIDATE_DIAGNOSTICS = 20
 
 
 class BrowserMatrixFallback:
@@ -210,22 +232,21 @@ class _PlanningResponseCollector:
         self.ds_query_ref_id: str | None = None
         self.result: MatrixValueResult | None = None
         self.rejections: set[str] = set()
-        self.candidates: Counter[tuple[str, str, Any, str, str, str, str, str, str, str]] = Counter()
+        self.candidates: Counter[tuple[tuple[str, Any], ...]] = Counter()
+        self.candidate_overflow = 0
 
     def diagnostics(self) -> list[str]:
         if not self.datasource_uid:
             self.rejections.add("invalid_or_missing_context")
         records = [
-            {
-                "route_family": route, "method": method, "status": status,
-                "datasource_extraction_source": extraction, "expected_datasource_present": expected,
-                "expected_datasource_source": source, "datasource_match": datasource_match,
-                "selector_match": selector_match, "correlation": correlation,
-                "rejection": rejection, "count": count,
-            }
-            for (route, method, status, extraction, expected, source, datasource_match,
-                 selector_match, correlation, rejection), count in sorted(self.candidates.items())
+            {**dict(candidate), "count": count}
+            for candidate, count in sorted(self.candidates.items(), key=lambda item: repr(item[0]))
         ]
+        if self.candidate_overflow:
+            records.append({
+                "rejection": "candidate_diagnostics_truncated",
+                "count": self.candidate_overflow,
+            })
         return records or [{"rejection": reason, "count": 1} for reason in sorted(self.rejections)] or [
             {"rejection": "no_correlated_network_candidate", "count": 1},
         ]
@@ -236,19 +257,18 @@ class _PlanningResponseCollector:
     def _record_response(self, response: Any) -> None:
         if self.result is not None:
             return
+        evaluation = self._metadata_evaluation(response) if _is_prometheus_metadata_candidate(response) else None
         if getattr(response, "status", None) != 200:
             if _is_metadata_candidate(response):
-                self.rejections.add("http_status")
-                self._record_candidate(response, "rejected", "http_status", "unavailable", "unavailable")
+                self._reject_candidate(response, "http_status", _evaluation_record(evaluation))
             return
-        method = self._correlated_method(response)
+        method = self._correlated_method(response, evaluation)
         if method is None:
             return
         try:
             payload = response.json()
         except Exception:
-            self.rejections.add("invalid_response_payload")
-            self._record_candidate(response, "rejected", "invalid_response_payload", "match", "unavailable")
+            self._reject_candidate(response, "invalid_response_payload", _evaluation_record(evaluation))
             return
         if method in {"prometheus_label_values", "prometheus_series"} and not _successful_payload(payload):
             self.result = _result(
@@ -258,74 +278,86 @@ class _PlanningResponseCollector:
             return
         values = self._values(payload, method)
         if values is None:
-            self.rejections.add("invalid_response_payload")
+            self._reject_candidate(response, "invalid_response_payload", _evaluation_record(evaluation))
             return
         status = MatrixDiscoveryStatus.RESOLVED if values else MatrixDiscoveryStatus.EMPTY
         self.result = _result(
             status, values, self.variable_name, self.timestamp, self.context, "browser_network", method,
         )
 
-    def _correlated_method(self, response: Any) -> str | None:
+    def _correlated_method(
+        self, response: Any, evaluation: tuple[str | None, str, dict[str, Any]] | None,
+    ) -> str | None:
         request_url = _response_request_url(response)
         path = urlparse(request_url).path
-        route = _prometheus_metadata_route(request_url)
-        if route is not None:
-            return self._correlated_metadata_method(response, request_url, route)
-        if _is_metadata_candidate(response):
-            self.rejections.add("rejected_route")
-            self._record_candidate(response, "rejected", "rejected_route", "unavailable", "unavailable")
+        if evaluation is not None:
+            method, rejection, record = evaluation
+            if method is not None:
+                return method
+            self._reject_candidate(response, rejection, record)
+            return None
         if path.endswith("/api/ds/query"):
             ref_id = self._ds_query_ref_id(response)
             if ref_id is not None:
                 self.ds_query_ref_id = ref_id
                 return "prometheus_ds_query"
-            self.rejections.add("query_correlation")
-            self._record_candidate(response, "rejected", "query_correlation", "unavailable", "unavailable")
+            self._reject_candidate(response, "query_correlation")
         return None
 
-    def _correlated_metadata_method(
-        self, response: Any, request_url: str, route: tuple[str, str],
-    ) -> str | None:
-        datasource_uid, endpoint = route
+    def _metadata_evaluation(
+        self, response: Any,
+    ) -> tuple[str | None, str, dict[str, Any]]:
+        request_url = _response_request_url(response)
+        route = _prometheus_metadata_route(request_url)
+        datasource_uid, endpoint = route if route is not None else (None, _candidate_endpoint(request_url))
         request = getattr(response, "request", None)
-        checks = (
-            (str(getattr(request, "method", "")).upper() != "GET", "request_method_correlation"),
-            (not self.datasource_uid, "invalid_or_missing_context"),
-            (datasource_uid != self.datasource_uid, "datasource_correlation"),
-            (not _url_time_matches(request_url, self.timestamp), "time_correlation"),
+        expected_selector = self.query[0] if self.query is not None and self.query[0] else None
+        observed_selector = _observed_selector(request_url, expected_selector)
+        observed_label = _endpoint_label(endpoint)
+        states = {
+            "route_match": "match" if route is not None else "mismatch",
+            "method_match": "match" if str(getattr(request, "method", "")).upper() == "GET" else "mismatch",
+            "datasource_match": _required_match_state(self.datasource_uid, datasource_uid),
+            "selector_match": _endpoint_match_state(endpoint, "series", expected_selector, observed_selector),
+            "time_match": "match" if _url_time_matches(request_url, self.timestamp) else "mismatch",
+            "target_label_match": _endpoint_match_state(endpoint, "label/", self.target_label, observed_label),
+        }
+        record = self._correlation_record(
+            response, states, datasource_uid, expected_selector, observed_selector, observed_label,
         )
-        for rejected, reason in checks:
-            if rejected:
-                self.rejections.add(reason)
-                datasource_match = "mismatch" if reason == "datasource_correlation" else "unavailable"
-                self._record_candidate(response, "rejected", reason, datasource_match, "unavailable")
-                return None
-        if endpoint == f"label/{self.target_label}/values":
-            self._record_candidate(response, "accepted", "none", "match", "unavailable")
-            return "prometheus_label_values"
-        if endpoint == "series" and self._series_request_matches(response):
-            self._record_candidate(response, "accepted", "none", "match", "match")
-            return "prometheus_series"
-        self.rejections.add("selector_or_label_correlation")
-        self._record_candidate(response, "rejected", "selector_or_label_correlation", "match", "mismatch")
-        return None
+        rejection = _metadata_rejection(states, bool(self.datasource_uid))
+        if rejection != "none":
+            return None, rejection, record
+        method = "prometheus_series" if endpoint == "series" else "prometheus_label_values"
+        return method, "none", record
 
-    def _record_candidate(
-        self, response: Any, correlation: str, rejection: str, datasource_match: str, selector_match: str,
+    def _correlation_record(
+        self, response: Any, states: dict[str, str], observed_uid: str | None,
+        expected_selector: str | None, observed_selector: str | None, observed_label: str | None,
+    ) -> dict[str, Any]:
+        return _build_correlation_record(
+            response, states, self.datasource_uid, observed_uid, expected_selector,
+            observed_selector, self.target_label, observed_label, self.datasource_present,
+            self.datasource_source,
+        )
+
+    def _reject_candidate(
+        self, response: Any, rejection: str, record: dict[str, Any] | None = None,
     ) -> None:
-        route, extraction = _candidate_route(response)
-        request = getattr(response, "request", None)
-        self.candidates[(
-            route, str(getattr(request, "method", "")).upper() or "none", getattr(response, "status", None),
-            extraction, str(self.datasource_present).lower(), self.datasource_source, datasource_match,
-            selector_match, correlation, rejection,
-        )] += 1
+        self.rejections.add(rejection)
+        safe_record = record or self._generic_rejection_record(response)
+        candidate = tuple({**safe_record, "correlation": "rejected", "rejection": rejection}.items())
+        if candidate in self.candidates or len(self.candidates) < MAX_REJECTED_CANDIDATE_DIAGNOSTICS:
+            self.candidates[candidate] += 1
+        else:
+            self.candidate_overflow += 1
 
-    def _series_request_matches(self, response: Any) -> bool:
-        if self.query is None or not self.query[0]:
-            return False
-        request_url = str(getattr(getattr(response, "request", None), "url", ""))
-        return self.query[0] in parse_qs(urlparse(request_url).query).get("match[]", [])
+    def _generic_rejection_record(self, response: Any) -> dict[str, Any]:
+        states = {name: "unavailable" for name in (
+            "route_match", "method_match", "datasource_match", "selector_match",
+            "time_match", "target_label_match",
+        )}
+        return self._correlation_record(response, states, None, None, None, None)
 
     def _ds_query_ref_id(self, response: Any) -> str | None:
         request = getattr(response, "request", None)
@@ -351,195 +383,3 @@ class _PlanningResponseCollector:
             return None
         return _ds_query_values(payload, self.target_label, self.ds_query_ref_id)
 
-
-def _prometheus_datasource_uid(
-    variable: dict[str, Any], context: dict[str, Any], config: Any, dashboard: dict[str, Any],
-) -> str | None:
-    datasource_type, datasource_uid = _resolved_datasource_type_uid(
-        variable.get("datasource"), context, config, dashboard,
-    )
-    if str(datasource_type).lower() != "prometheus" or not datasource_uid:
-        return None
-    return str(datasource_uid)
-
-
-def _datasource_representation(datasource: Any) -> str:
-    if isinstance(datasource, dict):
-        return "mapping"
-    if isinstance(datasource, str):
-        return "string"
-    return "missing" if datasource is None else "unsupported"
-
-
-def _candidate_route(response: Any) -> tuple[str, str]:
-    request_url = _response_request_url(response)
-    path = urlparse(request_url).path
-    if "/api/datasources/proxy/uid/" in path:
-        return "proxy_uid", "proxy_uid_path"
-    if "/api/datasources/uid/" in path and "/resources/" in path:
-        return "uid_resources", "uid_resources_path"
-    if path.endswith("/api/ds/query"):
-        return "ds_query", "request_payload"
-    return "other", "none"
-
-
-def _navigation_telemetry(response: Any, page: Any) -> tuple[int | str, str]:
-    """Return non-sensitive navigation status and route classification."""
-    status = getattr(response, "status", None)
-    safe_status = status if isinstance(status, int) and not isinstance(status, bool) else "unavailable"
-    return safe_status, _navigation_route(getattr(page, "url", ""))
-
-
-def _navigation_route(url: Any) -> str:
-    path = urlparse(str(url or "")).path.lower()
-    segments = set(filter(None, path.split("/")))
-    if segments.intersection({"auth", "login", "oauth", "oauth2", "saml", "signin", "sso"}):
-        return "login_like"
-    if "/d/" in path:
-        return "dashboard"
-    return "other"
-
-
-def _successful_payload(payload: Any) -> bool:
-    return isinstance(payload, dict) and payload.get("status") == "success"
-
-
-def _response_request_url(response: Any) -> str:
-    request_url = getattr(getattr(response, "request", None), "url", None)
-    return str(request_url or getattr(response, "url", ""))
-
-
-def _prometheus_metadata_route(url: str) -> tuple[str, str] | None:
-    path = urlparse(url).path
-    match = re.search(
-        r"/api/datasources/(?:proxy/uid/([^/]+)/api/v1|uid/([^/]+)/resources/api/v1)/"
-        r"(series|label/[A-Za-z_][A-Za-z0-9_]*/values)$",
-        path,
-    )
-    if match is None:
-        return None
-    return unquote(match.group(1) or match.group(2)), match.group(3)
-
-
-def _is_metadata_candidate(response: Any) -> bool:
-    path = urlparse(_response_request_url(response)).path
-    return "/api/datasources/" in path and (
-        path.endswith("/series") or "/label/" in path or path.endswith("/api/ds/query")
-    )
-
-
-def _url_time_matches(url: str, timestamp: Any) -> bool:
-    query = parse_qs(urlparse(url).query)
-    expected = {
-        "start": _prometheus_seconds(timestamp.start_time_timestamp),
-        "end": _prometheus_seconds(timestamp.end_time_timestamp),
-    }
-    return all(query.get(name) == [value] for name, value in expected.items())
-
-
-def _payload_time_matches(payload: dict[str, Any], timestamp: Any) -> bool:
-    expected = {
-        "from": str(timestamp.start_time_timestamp),
-        "to": str(timestamp.end_time_timestamp),
-    }
-    return all(name in payload and str(payload[name]) == value for name, value in expected.items())
-
-
-def _query_datasource_uid(query: Any) -> str | None:
-    if not isinstance(query, dict):
-        return None
-    datasource = query.get("datasource")
-    if isinstance(datasource, dict):
-        return str(datasource.get("uid")) if datasource.get("uid") not in (None, "") else None
-    return str(datasource) if datasource not in (None, "") else None
-
-
-def _request_json(request: Any) -> Any:
-    value = getattr(request, "post_data_json", None)
-    if callable(value):
-        try:
-            return value()
-        except Exception:
-            return None
-    if value is not None:
-        return value
-    try:
-        return json.loads(getattr(request, "post_data", "") or "")
-    except (TypeError, ValueError):
-        return None
-
-
-def _ds_variable_query_signature(
-    variable: dict[str, Any], parsed_query: tuple[str | None, str] | None,
-) -> tuple[str, str, str] | None:
-    query = variable.get("query")
-    if not isinstance(query, dict) or query.get("queryType") != "label_values" or parsed_query is None:
-        return None
-    ref_id = query.get("refId")
-    if not isinstance(ref_id, str) or not ref_id:
-        return None
-    expression, label = parsed_query
-    return ref_id, expression or "", label
-
-
-def _query_matches_signature(query: Any, signature: tuple[str, str, str]) -> bool:
-    if not isinstance(query, dict):
-        return False
-    ref_id, expression, label = signature
-    return (
-        query.get("queryType") == "label_values"
-        and query.get("refId") == ref_id
-        and query.get("query", "") == expression
-        and query.get("label") == label
-    )
-
-
-def _ds_query_values(payload: Any, label: str, ref_id: str) -> list[str] | None:
-    results = payload.get("results") if isinstance(payload, dict) else None
-    if not isinstance(results, dict) or _invalid_ds_metadata(payload):
-        return None
-    result = results.get(ref_id)
-    if not isinstance(result, dict) or _invalid_ds_metadata(result):
-        return None
-    frames = result.get("frames")
-    if not isinstance(frames, list) or not frames:
-        return None
-    values: list[str] = []
-    for frame in frames:
-        frame_values = _ds_frame_values(frame, label)
-        if frame_values is None:
-            return None
-        values.extend(frame_values)
-    return _dedupe(values)
-
-
-def _invalid_ds_metadata(container: dict[str, Any]) -> bool:
-    if any(container.get(key) not in (None, "") for key in ("error", "errorSource")):
-        return True
-    return "status" in container and str(container["status"]) != "200"
-
-
-def _ds_frame_values(frame: Any, label: str) -> list[str] | None:
-    if not isinstance(frame, dict):
-        return None
-    schema, data = frame.get("schema"), frame.get("data")
-    if not isinstance(schema, dict) or not isinstance(data, dict):
-        return None
-    fields, columns = schema.get("fields"), data.get("values")
-    if not _valid_frame_columns(fields, columns):
-        return None
-    indices = [index for index, field in enumerate(fields) if field.get("name") == label]
-    if len(indices) != 1:
-        return None
-    column = columns[indices[0]]
-    if any(isinstance(value, (dict, list, tuple, set)) for value in column):
-        return None
-    return [str(value) for value in column if value not in (None, "")]
-
-
-def _valid_frame_columns(fields: Any, columns: Any) -> bool:
-    if not isinstance(fields, list) or not fields or not isinstance(columns, list):
-        return False
-    if len(fields) != len(columns) or not all(isinstance(column, list) for column in columns):
-        return False
-    return all(isinstance(field, dict) and isinstance(field.get("name"), str) for field in fields)

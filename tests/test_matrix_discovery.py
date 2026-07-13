@@ -106,6 +106,121 @@ class TestMatrixValueResolver(unittest.TestCase):
             "end": "1700003600",
         })
 
+    def test_series_404_retries_same_request_through_resources_route(self) -> None:
+        session = Mock()
+        session.get.side_effect = [
+            Mock(status_code=404, headers={}),
+            Mock(
+                status_code=200,
+                json=Mock(return_value={"status": "success", "data": [{"pod": "api-1"}]}),
+            ),
+        ]
+        resolver = self.resolver(session, 'label_values(kube_pod_info{namespace="$namespace"}, pod)')
+
+        with self.assertLogs("grafconflux._grafana.matrix_discovery", level="INFO") as logs:
+            result = resolver.resolve("pod", {"values_from": {}}, self.timestamp, {"namespace": "app"}, {})
+
+        self.assertEqual(result.status, MatrixDiscoveryStatus.RESOLVED)
+        self.assertEqual(result.values, ["api-1"])
+        self.assertEqual(session.get.call_count, 2)
+        proxy_call, resources_call = session.get.call_args_list
+        self.assertIn("/api/datasources/proxy/uid/prom/api/v1/series", proxy_call.args[0])
+        self.assertIn("/api/datasources/uid/prom/resources/api/v1/series", resources_call.args[0])
+        self.assertEqual(resources_call.kwargs, proxy_call.kwargs)
+        attempts = [line for line in logs.output if "primary_series" in line]
+        self.assertEqual(len(attempts), 2)
+        self.assertIn("route_family=proxy_uid", attempts[0])
+        self.assertIn("http_status=404", attempts[0])
+        self.assertIn("route_family=uid_resources", attempts[1])
+        self.assertIn("outcome=success_nonempty", attempts[1])
+
+    def test_series_404_resources_success_can_be_authoritatively_empty(self) -> None:
+        session = Mock()
+        session.get.side_effect = [
+            Mock(status_code=404, headers={}),
+            Mock(status_code=200, json=Mock(return_value={"status": "success", "data": []})),
+        ]
+
+        result = self.resolver(session, "label_values(up, pod)").resolve(
+            "pod", {"values_from": {}}, self.timestamp, {}, {},
+        )
+
+        self.assertEqual(result.status, MatrixDiscoveryStatus.EMPTY)
+        self.assertEqual(result.values, [])
+        self.assertEqual(session.get.call_count, 2)
+
+    def test_series_non_404_status_never_uses_resources_route(self) -> None:
+        for status_code in (400, 401, 403, 429, 500, 503):
+            with self.subTest(status_code=status_code):
+                session = Mock()
+                session.get.return_value = Mock(status_code=status_code, headers={})
+
+                result = self.resolver(session, "label_values(up, pod)").resolve(
+                    "pod", {"values_from": {}}, self.timestamp, {}, {},
+                )
+
+                self.assertEqual(result.status, MatrixDiscoveryStatus.FAILED)
+                session.get.assert_called_once()
+                self.assertIn("/proxy/uid/", session.get.call_args.args[0])
+
+    def test_series_transport_error_never_uses_resources_route(self) -> None:
+        session = Mock()
+        session.get.side_effect = ConnectionError("closed network")
+
+        result = self.resolver(session, "label_values(up, pod)").resolve(
+            "pod", {"values_from": {}}, self.timestamp, {}, {},
+        )
+
+        self.assertEqual(result.status, MatrixDiscoveryStatus.FAILED)
+        session.get.assert_called_once()
+
+    def test_series_proxy_invalid_payload_never_uses_resources_route(self) -> None:
+        invalid_responses = (
+            Mock(status_code=200, json=Mock(side_effect=ValueError("invalid"))),
+            Mock(status_code=200, json=Mock(return_value={"status": "success", "data": {}})),
+        )
+        for invalid_response in invalid_responses:
+            with self.subTest(response=invalid_response):
+                session = Mock()
+                session.get.return_value = invalid_response
+
+                result = self.resolver(session, "label_values(up, pod)").resolve(
+                    "pod", {"values_from": {}}, self.timestamp, {}, {},
+                )
+
+                self.assertFalse(result.authoritative)
+                session.get.assert_called_once()
+
+    def test_series_resources_invalid_payload_is_not_retried_or_authoritative(self) -> None:
+        invalid_responses = (
+            Mock(status_code=200, json=Mock(side_effect=ValueError("invalid"))),
+            Mock(status_code=200, json=Mock(return_value={"status": "success", "data": {}})),
+            Mock(status_code=200, json=Mock(return_value={"status": "error", "data": []})),
+        )
+        for invalid_response in invalid_responses:
+            with self.subTest(response=invalid_response):
+                session = Mock()
+                session.get.side_effect = [Mock(status_code=404, headers={}), invalid_response]
+
+                result = self.resolver(session, "label_values(up, pod)").resolve(
+                    "pod", {"values_from": {}}, self.timestamp, {}, {},
+                )
+
+                self.assertFalse(result.authoritative)
+                self.assertEqual(result.values, [])
+                self.assertEqual(session.get.call_count, 2)
+
+    def test_label_values_404_does_not_change_routes(self) -> None:
+        session = Mock()
+        session.get.return_value = Mock(status_code=404, headers={})
+
+        result = self.resolver(session, "label_values(service)").resolve(
+            "service", {"values_from": {}}, self.timestamp, {}, {},
+        )
+
+        self.assertEqual(result.status, MatrixDiscoveryStatus.FAILED)
+        session.get.assert_called_once()
+
     def test_label_only_query_uses_label_values_endpoint(self) -> None:
         session = Mock()
         session.get.return_value = Mock(
