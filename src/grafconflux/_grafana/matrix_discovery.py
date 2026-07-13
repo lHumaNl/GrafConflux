@@ -10,8 +10,13 @@ from typing import Any
 from urllib.parse import quote
 
 from grafconflux._grafana.matrix_context import (
-    dashboard_current_context,
-    dashboard_variable_current_value,
+    DiscoveryContextAssembly,
+    assemble_discovery_context,
+)
+from grafconflux._grafana.matrix_prometheus import (
+    datasource_resolution as _datasource_resolution,
+    prometheus_label_values_query as _prometheus_label_values_query,
+    resolved_datasource_type_uid as _resolved_datasource_type_uid,
 )
 
 logger = logging.getLogger(__name__)
@@ -73,14 +78,14 @@ class MatrixValueResolver:
         static_vars: dict[str, Any],
     ) -> MatrixValueResult:
         source_name = str(spec.get("grafana_variable") or key)
-        effective_context, default_sources = self._effective_context(
+        assembly = self._effective_context(
             source_name, timestamp, context, static_vars,
         )
-        cache_key = _cache_key(source_name, timestamp, effective_context, default_sources)
+        cache_key = _cache_key(source_name, timestamp, assembly.values, assembly.sources)
         if cache_key in self.cache:
             return self.cache[cache_key]
-        result = self._discover(source_name, timestamp, effective_context)
-        result = _with_context_sources(result, default_sources)
+        result = self._discover(source_name, timestamp, assembly.values)
+        result = _with_context_assembly(result, assembly)
         self.cache[cache_key] = result
         _log_result(source_name, timestamp, result)
         return result
@@ -91,15 +96,15 @@ class MatrixValueResolver:
         timestamp: Any,
         context: dict[str, Any],
         static_vars: dict[str, Any],
-    ) -> tuple[dict[str, Any], dict[str, str]]:
-        explicit = {**static_vars, **_public_context(context)}
-        defaults, default_sources = dashboard_current_context(
+    ) -> DiscoveryContextAssembly:
+        assembly = assemble_discovery_context(
             self.dashboard,
             self.dynamic_variable_names | {source_name},
+            _public_context(context),
+            _public_context(static_vars),
         )
-        used_sources = {name: source for name, source in default_sources.items() if name not in explicit}
-        _log_empty_dashboard_defaults(self.dashboard, self.config, timestamp, defaults, used_sources)
-        return {**defaults, **explicit}, used_sources
+        _log_context_assembly(source_name, timestamp, assembly)
+        return assembly
 
     def _discover(
         self,
@@ -150,14 +155,18 @@ def _prometheus_result(
     dashboard: dict[str, Any],
 ) -> MatrixValueResult:
     parsed = _prometheus_query(variable, context, config, dashboard)
+    diagnostics = _adapter_diagnostics(variable, context, config, dashboard, parsed)
     if parsed is None:
         method = _prometheus_adapter_failure(variable, context, config, dashboard)
-        return _result(MatrixDiscoveryStatus.UNSUPPORTED, [], source_name, timestamp, context, "grafana_api", method)
+        result = _result(MatrixDiscoveryStatus.UNSUPPORTED, [], source_name, timestamp, context, "grafana_api", method)
+        return _with_adapter_diagnostics(result, diagnostics)
     metric, label, datasource_uid = parsed
     if not datasource_uid:
-        return _result(MatrixDiscoveryStatus.UNRESOLVED, [], source_name, timestamp, context, "grafana_api", "invalid_or_missing_context")
+        result = _result(MatrixDiscoveryStatus.UNRESOLVED, [], source_name, timestamp, context, "grafana_api", "invalid_or_missing_context")
+        return _with_adapter_diagnostics(result, diagnostics)
     if session is None:
-        return _result(MatrixDiscoveryStatus.UNRESOLVED, [], source_name, timestamp, context, "grafana_api", "session_unavailable")
+        result = _result(MatrixDiscoveryStatus.UNRESOLVED, [], source_name, timestamp, context, "grafana_api", "session_unavailable")
+        return _with_adapter_diagnostics(result, diagnostics, "session_unavailable")
     method = "prometheus_series" if metric else "prometheus_label_values"
     url = _prometheus_url(config.grafana_base_url, datasource_uid, label, bool(metric))
     params = _prometheus_params(metric, timestamp)
@@ -165,8 +174,60 @@ def _prometheus_result(
         response = session.get(url, params=params, timeout=getattr(config, "timeout", None))
     except Exception as error:
         logger.warning("Matrix discovery request failed variable=%s error_type=%s", safe_discovery_variable(source_name), type(error).__name__)
-        return _result(MatrixDiscoveryStatus.FAILED, [], source_name, timestamp, context, "grafana_api", method)
-    return _prometheus_response_result(response, source_name, timestamp, context, method, label)
+        result = _result(MatrixDiscoveryStatus.FAILED, [], source_name, timestamp, context, "grafana_api", method)
+        return _with_adapter_diagnostics(result, diagnostics, "request_failed")
+    result = _prometheus_response_result(response, source_name, timestamp, context, method, label)
+    return _with_adapter_diagnostics(result, diagnostics)
+
+
+def _adapter_diagnostics(
+    variable: dict[str, Any] | None,
+    context: dict[str, Any],
+    config: Any,
+    dashboard: dict[str, Any],
+    parsed: tuple[str | None, str, str | None] | None,
+) -> dict[str, Any]:
+    datasource = variable.get("datasource") if isinstance(variable, dict) else None
+    resolution = _datasource_resolution(datasource, context, config, dashboard)
+    diagnosis = _adapter_diagnosis(variable, context, config, resolution, parsed)
+    diagnostics: dict[str, Any] = {"diagnosis": diagnosis, "datasource_resolution": resolution}
+    missing = _missing_context_names(variable, context)
+    if missing:
+        diagnostics["missing_context_vars"] = missing
+    return diagnostics
+
+
+def _adapter_diagnosis(
+    variable: dict[str, Any] | None,
+    context: dict[str, Any],
+    config: Any,
+    resolution: dict[str, str],
+    parsed: tuple[str | None, str, str | None] | None,
+) -> str:
+    if not isinstance(variable, dict):
+        return "variable_missing"
+    if variable.get("type") != "query":
+        return "variable_not_query"
+    if config is None:
+        return "config_unavailable"
+    if resolution["type_status"] != "resolved_prometheus":
+        return f"datasource_type_{resolution['type_status']}"
+    if resolution["uid_status"] != "resolved":
+        return f"datasource_uid_{resolution['uid_status']}"
+    if _missing_context_names(variable, context):
+        return "query_context_missing"
+    return "resolved" if parsed is not None else "unsupported_query"
+
+
+def _with_adapter_diagnostics(
+    result: MatrixValueResult,
+    diagnostics: dict[str, Any],
+    diagnosis: str | None = None,
+) -> MatrixValueResult:
+    metadata = dict(diagnostics)
+    if diagnosis is not None:
+        metadata["diagnosis"] = diagnosis
+    return MatrixValueResult(result.status, result.values, {**result.provenance, **metadata})
 
 
 def _prometheus_query(
@@ -205,9 +266,18 @@ def _prometheus_adapter_failure(
 
 
 def _has_missing_context(variable: dict[str, Any], context: dict[str, Any]) -> bool:
+    return bool(_missing_context_names(variable, context))
+
+
+def _missing_context_names(
+    variable: dict[str, Any] | None,
+    context: dict[str, Any],
+) -> list[str]:
+    if not isinstance(variable, dict):
+        return []
     relevant = (variable.get("datasource"), variable.get("query"), variable.get("definition"))
     references = set(_variable_references(relevant))
-    return any(name not in context for name in references if not name.startswith("__"))
+    return sorted(name for name in references if not name.startswith("__") and name not in context)
 
 
 def _variable_references(value: Any) -> list[str]:
@@ -312,8 +382,16 @@ def _combined_failure(api_result: MatrixValueResult, fallback_result: MatrixValu
     return MatrixValueResult(status, [], provenance)
 
 
-def _with_context_sources(result: MatrixValueResult, sources: dict[str, str]) -> MatrixValueResult:
-    provenance = {**result.provenance, "dashboard_context_sources": dict(sorted(sources.items()))}
+def _with_context_assembly(
+    result: MatrixValueResult,
+    assembly: DiscoveryContextAssembly,
+) -> MatrixValueResult:
+    provenance = {
+        **result.provenance,
+        "dashboard_context_sources": dict(sorted(assembly.dashboard_sources.items())),
+        "context_sources": dict(sorted(assembly.sources.items())),
+        "context_value_kinds": dict(sorted(assembly.value_kinds.items())),
+    }
     return MatrixValueResult(result.status, result.values, provenance)
 
 
@@ -362,131 +440,29 @@ def _cache_key(
 
 def _dashboard_variable(dashboard: dict[str, Any], variable_name: str) -> dict[str, Any] | None:
     variables = dashboard.get("templating", {}).get("list", [])
-    return next((item for item in variables if item.get("name") == variable_name), None)
+    return next((
+        item for item in variables
+        if isinstance(item, dict) and item.get("name") == variable_name
+    ), None)
 
 
-def _log_empty_dashboard_defaults(
-    dashboard: dict[str, Any],
-    config: Any,
+def _log_context_assembly(
+    source_name: str,
     timestamp: Any,
-    defaults: dict[str, str],
-    sources: dict[str, str],
+    assembly: DiscoveryContextAssembly,
 ) -> None:
-    dashboard_name = dashboard.get("title") or getattr(config, "name", None) or "<unknown>"
-    for name, source in sources.items():
-        if defaults.get(name) == "":
-            logger.info(
-                "Using empty dashboard default dashboard=%s variable=%s timestamp_id=%s source=%s",
-                _safe_discovery_value(str(dashboard_name)), safe_discovery_variable(name),
-                timestamp.id_time, source,
-            )
-
-
-def _substitute_query_vars(query: str, context: dict[str, Any]) -> str:
-    pattern = r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::[^}]+)?}|\$([A-Za-z_][A-Za-z0-9_]*)|\[\[([A-Za-z_][A-Za-z0-9_]*)]]"
-    return re.sub(pattern, lambda match: str(context.get(next(group for group in match.groups() if group), match.group(0))), query)
-
-
-def _prometheus_label_values_query(variable: dict[str, Any], context: dict[str, Any]) -> tuple[str | None, str] | None:
-    query_config = variable.get("query")
-    modern = _modern_prometheus_label_values_query(query_config, context)
-    if modern is not None:
-        return modern
-    for query in (_variable_query_text(query_config), variable.get("definition")):
-        if isinstance(query, str):
-            parsed = _parse_label_values(_substitute_query_vars(query, context))
-            if parsed is not None:
-                return parsed
-    return None
-
-
-def _modern_prometheus_label_values_query(query_config: Any, context: dict[str, Any]) -> tuple[str | None, str] | None:
-    if not isinstance(query_config, dict) or query_config.get("queryType") != "label_values":
-        return None
-    label = _substitute_query_vars(str(query_config.get("label") or ""), context)
-    metric = _substitute_query_vars(str(query_config.get("query") or ""), context) or None
-    return (metric, label) if _is_safe_prometheus_label(label) and _is_safe_prometheus_match(metric) else None
-
-
-def _parse_label_values(query: str) -> tuple[str | None, str] | None:
-    stripped = query.strip()
-    if not stripped.startswith("label_values(") or not stripped.endswith(")"):
-        return None
-    metric, label = _split_label_values_args(stripped[len("label_values("):-1].strip())
-    return (metric, label) if _is_safe_prometheus_label(label) and _is_safe_prometheus_match(metric) else None
-
-
-def _split_label_values_args(inner: str) -> tuple[str | None, str]:
-    if "," not in inner:
-        return None, inner.strip()
-    metric, label = inner.rsplit(",", 1)
-    return metric.strip(), label.strip()
-
-
-def _resolved_datasource_type_uid(
-    datasource: Any,
-    context: dict[str, Any],
-    config: Any,
-    dashboard: dict[str, Any],
-) -> tuple[str | None, str | None]:
-    datasource_type, datasource_uid = _datasource_type_uid(datasource)
-    ref_name = _datasource_ref_name(datasource_type, datasource_uid, config) or _variable_reference_name(datasource_uid) or _variable_reference_name(datasource_type)
-    if not ref_name:
-        return _resolved_context_value(datasource_type, context), _resolved_context_value(datasource_uid, context)
-    variable = _dashboard_variable(dashboard, ref_name)
-    resolved_type = _datasource_variable_type(variable) or _resolved_context_value(datasource_type, context)
-    resolved_uid = _resolved_context_value(datasource_uid, context) or dashboard_variable_current_value(variable)
-    return resolved_type, resolved_uid
-
-
-def _datasource_ref_name(datasource_type: Any, datasource_uid: Any, config: Any) -> str | None:
-    datasource_vars = getattr(config, "datasource_vars", {}) or {}
-    for value in (datasource_uid, datasource_type):
-        ref_name = _variable_reference_name(value)
-        if ref_name in datasource_vars:
-            return ref_name
-    return None
-
-
-def _resolved_context_value(value: Any, context: dict[str, Any]) -> str | None:
-    ref_name = _variable_reference_name(value)
-    if ref_name:
-        return str(context[ref_name]) if ref_name in context else None
-    return str(value) if value not in (None, "") else None
-
-
-def _variable_reference_name(value: Any) -> str | None:
-    if not isinstance(value, str):
-        return None
-    match = re.fullmatch(r"\$\{([^}:]+)(?::[^}]+)?}|\$(\w+)", value)
-    return (match.group(1) or match.group(2)) if match else None
-
-
-def _datasource_variable_type(variable: dict[str, Any] | None) -> str | None:
-    if not isinstance(variable, dict) or variable.get("type") != "datasource":
-        return None
-    query = variable.get("query")
-    return query if isinstance(query, str) and query else query.get("type") if isinstance(query, dict) else None
-
-
-def _variable_query_text(query_config: Any) -> str | None:
-    if isinstance(query_config, str):
-        return query_config
-    return query_config.get("query") if isinstance(query_config, dict) and isinstance(query_config.get("query"), str) else None
-
-
-def _datasource_type_uid(datasource: Any) -> tuple[str | None, str | None]:
-    if isinstance(datasource, dict):
-        return datasource.get("type"), datasource.get("uid")
-    return (datasource, datasource) if isinstance(datasource, str) else (None, None)
-
-
-def _is_safe_prometheus_label(label: str) -> bool:
-    return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", label or ""))
-
-
-def _is_safe_prometheus_match(metric: str | None) -> bool:
-    return metric is None or (0 < len(metric) <= 2000 and not re.search(r"[$\r\n]", metric))
+    included = [
+        f"{safe_discovery_variable(name)}:{assembly.value_kinds[name]}:{assembly.sources[name]}"
+        for name in sorted(assembly.values)
+    ]
+    excluded = [
+        f"{safe_discovery_variable(name)}:{reason}"
+        for name, reason in assembly.exclusions
+    ]
+    logger.debug(
+        "Matrix discovery context variable=%s timestamp_id=%s included=%s excluded=%s",
+        safe_discovery_variable(source_name), timestamp.id_time, included, excluded,
+    )
 
 
 def _public_context(context: dict[str, Any]) -> dict[str, Any]:
