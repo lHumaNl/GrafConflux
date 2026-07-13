@@ -13,7 +13,7 @@ from grafconflux._grafana.matrix_context import (
     DiscoveryContextAssembly,
     assemble_discovery_context,
 )
-from grafconflux._grafana.matrix_diagnostics import datasource_diagnostic, variable_diagnostic
+from grafconflux._grafana.matrix_diagnostics import datasource_diagnostic, primary_adapter_attempt_block, variable_diagnostic
 from grafconflux._grafana.matrix_prometheus import (
     datasource_resolution as _datasource_resolution,
     prometheus_label_values_query as _prometheus_label_values_query,
@@ -177,16 +177,16 @@ def _prometheus_result(
     method = "prometheus_series" if metric else "prometheus_label_values"
     params = _prometheus_params(metric, timestamp)
     response, error = _prometheus_request(
-        session, config, datasource_uid, label, bool(metric), params, method,
-        diagnostics, source_name, variable, PROXY_UID_ROUTE,
+        session, config, datasource_uid, label, bool(metric), params,
+        diagnostics, source_name, PROXY_UID_ROUTE,
     )
     if error is not None:
         result = _result(MatrixDiscoveryStatus.FAILED, [], source_name, timestamp, context, "grafana_api", method)
         return _with_adapter_diagnostics(result, diagnostics, "request_failed")
     if method == "prometheus_series" and getattr(response, "status_code", None) == 404:
         response, error = _prometheus_request(
-            session, config, datasource_uid, label, True, params, method,
-            diagnostics, source_name, variable, UID_RESOURCES_ROUTE,
+            session, config, datasource_uid, label, True, params,
+            diagnostics, source_name, UID_RESOURCES_ROUTE,
         )
         if error is not None:
             result = _result(MatrixDiscoveryStatus.FAILED, [], source_name, timestamp, context, "grafana_api", method)
@@ -197,20 +197,22 @@ def _prometheus_result(
 
 def _prometheus_request(
     session: Any, config: Any, datasource_uid: str, label: str, series: bool,
-    params: dict[str, str], method: str, diagnostics: dict[str, Any], source_name: str,
-    variable: dict[str, Any] | None, route_family: str,
+    params: dict[str, str], diagnostics: dict[str, Any], source_name: str,
+    route_family: str,
 ) -> tuple[Any, Exception | None]:
     url = _prometheus_url(config.grafana_base_url, datasource_uid, label, series, route_family)
     started = time.monotonic()
     try:
         response = session.get(url, params=params, timeout=getattr(config, "timeout", None))
     except Exception as error:
-        _log_primary_series_attempt(
-            method, route_family, diagnostics, source_name, label, variable, started, None, error,
+        _log_primary_adapter_attempt(
+            route_family, diagnostics, source_name, label, started, None, error,
+            url, params, datasource_uid,
         )
         return None, error
-    _log_primary_series_attempt(
-        method, route_family, diagnostics, source_name, label, variable, started, response, None,
+    _log_primary_adapter_attempt(
+        route_family, diagnostics, source_name, label, started, response, None,
+        url, params, datasource_uid,
     )
     return response, None
 
@@ -344,27 +346,24 @@ def _prometheus_response_result(
     return _result(status, values, source_name, timestamp, context, "grafana_api", method)
 
 
-def _log_primary_series_attempt(
-    method: str, route_family: str, diagnostics: dict[str, Any], variable: str, label: str,
-    definition: dict[str, Any] | None, started: float, response: Any, error: Exception | None,
+def _log_primary_adapter_attempt(
+    route_family: str, diagnostics: dict[str, Any], variable: str, label: str,
+    started: float, response: Any, error: Exception | None, url: str,
+    params: dict[str, str], datasource_uid: str,
 ) -> None:
-    """Emit one value-free outcome record for the direct series adapter."""
-    if method != "prometheus_series":
-        return
-    status = getattr(response, "status_code", None) if response is not None else None
+    """Emit one bounded diagnostic block for a primary metadata adapter attempt."""
     classification, prometheus_status, data_count, outcome = _series_attempt_outcome(response, error)
     resolution = diagnostics["datasource_resolution"]
     log = logger.info if outcome in {"success_empty", "success_nonempty"} else logger.warning
-    log(
-        "Matrix discovery primary_series adapter=prometheus route_family=%s method=GET "
-        "http_status=%s exception_class=%s duration_ms=%s datasource_uid_present=%s "
-        "datasource_uid_source=%s target_label=%s reference_vars=%s response_classification=%s "
-        "prometheus_status=%s data_count=%s outcome=%s",
-        route_family, status, type(error).__name__ if error else "none", round((time.monotonic() - started) * 1000),
-        resolution["uid_status"] == "resolved", resolution["uid_source"], safe_discovery_variable(label),
-        sorted({safe_discovery_variable(name) for name in _variable_references(definition or {})}),
-        classification, prometheus_status, data_count, outcome,
+    block = primary_adapter_attempt_block(
+        url=url, params=params, method="GET", route_family=route_family,
+        datasource_uid=datasource_uid, datasource_uid_source=resolution["uid_source"],
+        target_label=label, variable=variable,
+        duration_ms=round((time.monotonic() - started) * 1000), response=response, error=error,
+        classification=classification, prometheus_status=prometheus_status,
+        data_count=data_count, outcome=outcome,
     )
+    log("Matrix discovery primary_adapter_attempt\n%s", block)
 
 
 def _result(

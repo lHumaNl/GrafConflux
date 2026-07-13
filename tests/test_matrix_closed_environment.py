@@ -127,8 +127,8 @@ class TestEmptyDashboardContextDefaults(unittest.TestCase):
         self.assertIn("cluster:empty_string:dashboard.current.value", diagnostic)
         self.assertIn("namespace:scalar_string:resolved_parent", diagnostic)
         self.assertIn("pod:saved_current_excluded_matrix", diagnostic)
-        self.assertNotIn("prom-main", diagnostic)
-        self.assertNotIn("kube_pod_info", diagnostic)
+        self.assertIn("datasource_uid=prom-main", diagnostic)
+        self.assertIn('normalized_selector=kube_pod_info{cluster="", namespace="team-a"}', diagnostic)
 
     def test_info_diagnostics_are_value_free_and_include_resolution_state(self) -> None:
         dashboard = {"templating": {"list": [{

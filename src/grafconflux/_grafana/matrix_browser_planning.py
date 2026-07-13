@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from collections import Counter
 from typing import Any, Callable
 from urllib.parse import urlencode, urlparse
 
@@ -20,7 +19,8 @@ from grafconflux._grafana.matrix_browser_correlation import (
     is_metadata_candidate as _is_metadata_candidate,
     is_prometheus_metadata_candidate as _is_prometheus_metadata_candidate,
     metadata_rejection as _metadata_rejection,
-    navigation_telemetry as _navigation_telemetry,
+    metadata_candidate_diagnostic as _metadata_candidate_diagnostic,
+    navigation_diagnostic as _navigation_diagnostic,
     observed_selector as _observed_selector,
     payload_time_matches as _payload_time_matches,
     prometheus_datasource_uid as _prometheus_datasource_uid,
@@ -30,6 +30,7 @@ from grafconflux._grafana.matrix_browser_correlation import (
     request_json as _request_json,
     required_match_state as _required_match_state,
     response_request_url as _response_request_url,
+    response_schema_classification as _response_schema_classification,
     successful_payload as _successful_payload,
     url_time_matches as _url_time_matches,
 )
@@ -44,6 +45,7 @@ from grafconflux._grafana.matrix_discovery import (
     safe_discovery_variable,
 )
 from grafconflux._grafana.matrix_prometheus import datasource_resolution
+from grafconflux._grafana.matrix_diagnostics import diagnostic_block
 from grafconflux._grafana.rendering import build_dashboard_url_params
 
 logger = logging.getLogger(__name__)
@@ -51,7 +53,7 @@ logger = logging.getLogger(__name__)
 PLANNING_POLL_MS = 100
 PLANNING_MAX_WAIT_MS = 5_000
 ALL_DISPLAY_VALUES = {"all", "$__all", "__all"}
-MAX_REJECTED_CANDIDATE_DIAGNOSTICS = 20
+MAX_METADATA_CANDIDATE_DIAGNOSTICS = 10
 
 
 class BrowserMatrixFallback:
@@ -91,17 +93,10 @@ class BrowserMatrixFallback:
             with collector.collect(browser.page):
                 navigation_response = browser.get(self._navigation_url(timestamp, context))
                 self._wait_for_response(browser, collector)
+            logger.info("Matrix planning navigation\n%s", _navigation_diagnostic(navigation_response, browser.page))
             if collector.result is not None:
                 return collector.result
-            navigation_status, navigation_route = _navigation_telemetry(navigation_response, browser.page)
-            logger.info(
-                "Matrix planning using DOM fallback variable=%s timestamp_id=%s navigation_datasource_present=%s "
-                "navigation_datasource_source=%s navigation_datasource_representation=%s "
-                "navigation_http_status=%s navigation_route=%s network_diagnostics=%s",
-                safe_discovery_variable(variable_name), timestamp.id_time, collector.datasource_present,
-                collector.datasource_source, collector.datasource_representation, navigation_status,
-                navigation_route, collector.diagnostics(),
-            )
+            logger.info("Matrix planning using DOM fallback\n%s", collector.fallback_diagnostic())
             values = self._dom_values(browser, variable_name)
         except Exception as error:
             logger.warning(
@@ -232,24 +227,21 @@ class _PlanningResponseCollector:
         self.ds_query_ref_id: str | None = None
         self.result: MatrixValueResult | None = None
         self.rejections: set[str] = set()
-        self.candidates: Counter[tuple[tuple[str, Any], ...]] = Counter()
-        self.candidate_overflow = 0
+        self.candidate_diagnostic_count = 0
+        self.candidate_diagnostic_overflow = 0
 
-    def diagnostics(self) -> list[str]:
-        if not self.datasource_uid:
-            self.rejections.add("invalid_or_missing_context")
-        records = [
-            {**dict(candidate), "count": count}
-            for candidate, count in sorted(self.candidates.items(), key=lambda item: repr(item[0]))
-        ]
-        if self.candidate_overflow:
-            records.append({
-                "rejection": "candidate_diagnostics_truncated",
-                "count": self.candidate_overflow,
-            })
-        return records or [{"rejection": reason, "count": 1} for reason in sorted(self.rejections)] or [
-            {"rejection": "no_correlated_network_candidate", "count": 1},
-        ]
+    def fallback_diagnostic(self) -> str:
+        rejections = ",".join(sorted(self.rejections)) or "no_correlated_network_candidate"
+        return diagnostic_block("MATRIX PLANNING DOM FALLBACK", (
+            ("variable", safe_discovery_variable(self.variable_name)),
+            ("timestamp_id", self.timestamp.id_time),
+            ("datasource_present", self.datasource_present),
+            ("datasource_source", self.datasource_source),
+            ("datasource_representation", self.datasource_representation),
+            ("candidate_diagnostics_emitted", self.candidate_diagnostic_count),
+            ("candidate_diagnostics_truncated", self.candidate_diagnostic_overflow),
+            ("rejections", rejections),
+        ))
 
     def collect(self, page: Any) -> _ListenerScope:
         return _ListenerScope(page, self._record_response)
@@ -268,9 +260,15 @@ class _PlanningResponseCollector:
         try:
             payload = response.json()
         except Exception:
-            self._reject_candidate(response, "invalid_response_payload", _evaluation_record(evaluation))
+            self._reject_candidate(
+                response, "invalid_response_payload", _evaluation_record(evaluation), "invalid_json",
+            )
             return
         if method in {"prometheus_label_values", "prometheus_series"} and not _successful_payload(payload):
+            self._emit_candidate(
+                response, _evaluation_record(evaluation), "prometheus_status_not_success",
+                _response_schema_classification(payload, method),
+            )
             self.result = _result(
                 MatrixDiscoveryStatus.UNRESOLVED, [], self.variable_name, self.timestamp,
                 self.context, "browser_network", method,
@@ -278,8 +276,15 @@ class _PlanningResponseCollector:
             return
         values = self._values(payload, method)
         if values is None:
-            self._reject_candidate(response, "invalid_response_payload", _evaluation_record(evaluation))
+            self._reject_candidate(
+                response, "invalid_response_payload", _evaluation_record(evaluation),
+                _response_schema_classification(payload, method),
+            )
             return
+        self._emit_candidate(
+            response, _evaluation_record(evaluation), "none",
+            _response_schema_classification(payload, method),
+        )
         status = MatrixDiscoveryStatus.RESOLVED if values else MatrixDiscoveryStatus.EMPTY
         self.result = _result(
             status, values, self.variable_name, self.timestamp, self.context, "browser_network", method,
@@ -343,14 +348,26 @@ class _PlanningResponseCollector:
 
     def _reject_candidate(
         self, response: Any, rejection: str, record: dict[str, Any] | None = None,
+        schema: str = "not_inspected",
     ) -> None:
         self.rejections.add(rejection)
         safe_record = record or self._generic_rejection_record(response)
-        candidate = tuple({**safe_record, "correlation": "rejected", "rejection": rejection}.items())
-        if candidate in self.candidates or len(self.candidates) < MAX_REJECTED_CANDIDATE_DIAGNOSTICS:
-            self.candidates[candidate] += 1
-        else:
-            self.candidate_overflow += 1
+        self._emit_candidate(response, safe_record, rejection, schema)
+
+    def _emit_candidate(
+        self, response: Any, record: dict[str, Any] | None, rejection: str, schema: str,
+    ) -> None:
+        if self.candidate_diagnostic_count >= MAX_METADATA_CANDIDATE_DIAGNOSTICS:
+            self.candidate_diagnostic_overflow += 1
+            return
+        states = record or self._generic_rejection_record(response)
+        self.candidate_diagnostic_count += 1
+        block = _metadata_candidate_diagnostic(
+            self.candidate_diagnostic_count, response, self.timestamp, self.datasource_uid,
+            self.query[0] if self.query and self.query[0] else None, self.target_label,
+            states, rejection, schema,
+        )
+        logger.info("Matrix browser metadata candidate\n%s", block)
 
     def _generic_rejection_record(self, response: Any) -> dict[str, Any]:
         states = {name: "unavailable" for name in (
@@ -382,4 +399,3 @@ class _PlanningResponseCollector:
         if self.ds_query_ref_id is None:
             return None
         return _ds_query_values(payload, self.target_label, self.ds_query_ref_id)
-

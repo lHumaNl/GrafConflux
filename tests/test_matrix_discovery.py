@@ -127,7 +127,7 @@ class TestMatrixValueResolver(unittest.TestCase):
         self.assertIn("/api/datasources/proxy/uid/prom/api/v1/series", proxy_call.args[0])
         self.assertIn("/api/datasources/uid/prom/resources/api/v1/series", resources_call.args[0])
         self.assertEqual(resources_call.kwargs, proxy_call.kwargs)
-        attempts = [line for line in logs.output if "primary_series" in line]
+        attempts = [line for line in logs.output if "primary_adapter_attempt" in line]
         self.assertEqual(len(attempts), 2)
         self.assertIn("route_family=proxy_uid", attempts[0])
         self.assertIn("http_status=404", attempts[0])
@@ -263,24 +263,57 @@ class TestMatrixValueResolver(unittest.TestCase):
         self.assertEqual(result.status, MatrixDiscoveryStatus.FAILED)
         self.assertEqual(result.values, [])
 
-    def test_series_failure_logs_one_safe_compact_primary_diagnostic(self) -> None:
+    def test_series_failure_logs_detailed_multiline_primary_diagnostic(self) -> None:
         session = Mock()
-        session.get.return_value = Mock(status_code=503, headers={})
+        session.get.return_value = Mock(
+            status_code=503,
+            headers={"Content-Type": "application/json"},
+            text='{"status":"error","error":"upstream unavailable"}',
+        )
         resolver = self.resolver(session, 'label_values(up{namespace="$namespace"}, pod)')
 
         with self.assertLogs("grafconflux._grafana.matrix_discovery", level="WARNING") as logs:
             resolver.resolve("pod", {"values_from": {}}, self.timestamp, {"namespace": "private"}, {})
 
-        events = [line for line in logs.output if "primary_series" in line]
+        events = [line for line in logs.output if "primary_adapter_attempt" in line]
         self.assertEqual(len(events), 1)
         diagnostic = events[0]
+        self.assertIn("--- BEGIN MATRIX DISCOVERY PRIMARY ADAPTER ATTEMPT ---\n", diagnostic)
+        self.assertIn("request_url=https://grafana.example/grafana/api/datasources/proxy/uid/prom/api/v1/series?", diagnostic)
+        self.assertIn("request_path_query=/grafana/api/datasources/proxy/uid/prom/api/v1/series?", diagnostic)
+        self.assertIn("match%5B%5D=up%7Bnamespace%3D%22private%22%7D", diagnostic)
         self.assertIn("route_family=proxy_uid", diagnostic)
         self.assertIn("http_status=503", diagnostic)
+        self.assertIn("response_content_type=application/json", diagnostic)
+        self.assertIn('response_preview={"status":"error","error":"upstream unavailable"}', diagnostic)
         self.assertIn("response_classification=non_json", diagnostic)
         self.assertIn("outcome=http_non_2xx", diagnostic)
-        self.assertIn("reference_vars=['namespace']", diagnostic)
+        self.assertIn("datasource_uid_source=direct", diagnostic)
+        self.assertIn("datasource_uid=prom", diagnostic)
+        self.assertIn('normalized_selector=up{namespace="private"}', diagnostic)
+        self.assertIn("target_label=pod", diagnostic)
+        self.assertIn("start=1700000000", diagnostic)
+        self.assertIn("end=1700003600", diagnostic)
+        self.assertIn("--- END MATRIX DISCOVERY PRIMARY ADAPTER ATTEMPT ---", diagnostic)
+
+    def test_primary_exception_diagnostic_redacts_credentials_and_secret_query_values(self) -> None:
+        session = Mock()
+        session.get.side_effect = ConnectionError(
+            "GET https://alice:password@grafana.example/grafana/api?token=private Bearer bearer-private"
+        )
+
+        with self.assertLogs("grafconflux._grafana.matrix_discovery", level="WARNING") as logs:
+            result = self.resolver(session, "label_values(up, pod)").resolve(
+                "pod", {"values_from": {}}, self.timestamp, {}, {},
+            )
+
+        self.assertEqual(result.status, MatrixDiscoveryStatus.FAILED)
+        diagnostic = "\n".join(logs.output)
+        self.assertIn("exception_class=ConnectionError", diagnostic)
+        self.assertIn("exception_message=GET https://grafana.example/grafana/api?token=<redacted>", diagnostic)
+        self.assertNotIn("alice", diagnostic)
+        self.assertNotIn("password", diagnostic)
         self.assertNotIn("private", diagnostic)
-        self.assertNotIn("up{", diagnostic)
 
     def test_saved_current_is_not_used_for_another_dynamic_matrix_variable(self) -> None:
         session = Mock()
@@ -457,7 +490,7 @@ class TestBrowserMatrixFallback(unittest.TestCase):
         self.assertEqual(result.status, MatrixDiscoveryStatus.RESOLVED)
         self.assertEqual(result.values, ["api-1"])
 
-    def test_dom_fallback_aggregates_safe_network_rejections(self) -> None:
+    def test_dom_fallback_logs_detailed_network_rejections(self) -> None:
         page = _FakePlanningPage()
         browser = _FakePlanningBrowser(page, responses=[
             _series_response("other", "1700000000", "1700003600", "wrong"),
@@ -470,12 +503,12 @@ class TestBrowserMatrixFallback(unittest.TestCase):
 
         self.assertEqual(result.status, MatrixDiscoveryStatus.UNRESOLVED)
         diagnostic = "\n".join(logs.output)
-        self.assertIn("navigation_datasource_present=True", diagnostic)
-        self.assertIn("navigation_datasource_source=direct", diagnostic)
-        self.assertIn("route_family': 'proxy_uid'", diagnostic)
-        self.assertIn("rejection': 'datasource_correlation'", diagnostic)
-        self.assertNotIn("private", diagnostic)
-        self.assertNotIn("https://", diagnostic)
+        self.assertIn("datasource_present=True", diagnostic)
+        self.assertIn("datasource_source=direct", diagnostic)
+        self.assertIn("route_category=proxy_uid", diagnostic)
+        self.assertIn("rejection_reason=datasource_correlation", diagnostic)
+        self.assertIn('expected_selector=kube_pod_info{namespace="private"}', diagnostic)
+        self.assertIn("request_url=https://grafana.example/grafana/", diagnostic)
 
     def test_label_response_rejects_same_label_from_another_datasource(self) -> None:
         page = _FakePlanningPage()
