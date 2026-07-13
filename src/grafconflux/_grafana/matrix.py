@@ -5,36 +5,21 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
-from string import Formatter
 from typing import Any
 
-from grafconflux._grafana.matrix_discovery import resolve_values_from
+from grafconflux._grafana.matrix_browser_planning import BrowserMatrixFallback
+from grafconflux._grafana.matrix_config import (
+    DEFAULT_MAX_MATRIX_ROWS,
+    RENDER_MATRIX_KEY,
+    max_values,
+    regex_value,
+    validated_render_matrix,
+)
+from grafconflux._grafana.matrix_dependencies import configured_dependencies, ordered_matrix_variables
+from grafconflux._grafana.matrix_discovery import MatrixValueResolver, safe_discovery_variable
 from grafconflux._shared.grafana_models import ConfigurationError, Panel, PanelDescriptor, PanelRenderTask
 
-RENDER_MATRIX_KEY = "render_matrix"
-DEFAULT_MAX_MATRIX_VALUES = 50
-DEFAULT_MAX_MATRIX_ROWS = 500
-MATRIX_MODES = {"product", "zip"}
-DEFAULT_MATRIX_LAYOUT = "panel_first"
-MATRIX_LAYOUTS = {"dashboard_first", "matrix_values_first", "panel_first"}
-MATRIX_NESTED_OPTION_KEYS = {
-    "enabled", "row_grouping", "group_by", "combination_mode", "label_template", "max_rows", "layout",
-}
-MATRIX_FLAT_OPTION_KEYS = MATRIX_NESTED_OPTION_KEYS - {"layout"}
 logger = logging.getLogger(__name__)
-
-
-def validated_render_matrix(dashboard_name: str, config: dict[str, Any]) -> dict[str, Any] | None:
-    value = config.get(RENDER_MATRIX_KEY)
-    if value in (None, False):
-        return None
-    if not isinstance(value, dict):
-        raise ConfigurationError(f"dashboards.{dashboard_name}.{RENDER_MATRIX_KEY}: expected mapping.")
-    matrix = _normalized_matrix(dashboard_name, value)
-    if matrix.get("enabled", True) is False:
-        return None
-    _validate_matrix(dashboard_name, matrix)
-    return matrix
 
 
 def append_matrix_tasks(
@@ -45,11 +30,25 @@ def append_matrix_tasks(
     render_tasks: list[PanelRenderTask],
     timestamps: list[Any],
     session: Any = None,
+    dashboard_url: str = "",
 ) -> list[PanelRenderTask]:
     matrix = getattr(config, "render_matrix", None)
     if not matrix:
         return render_tasks
-    rows_by_time = _rows_by_timestamp(config, matrix, dashboard, timestamps, getattr(config, "vars", None) or {}, session)
+    planning_matrix = _planning_matrix(config.name, matrix, dashboard)
+    browser_fallback = (
+        BrowserMatrixFallback(config, session, dashboard_url, dashboard=dashboard)
+        if dashboard_url else None
+    )
+    dynamic_names = {_grafana_variable(key, spec) for key, spec in matrix["variables"].items()}
+    resolver = MatrixValueResolver(dashboard, session, config, browser_fallback, dynamic_names)
+    try:
+        rows_by_time = _rows_by_timestamp(
+            config, planning_matrix, dashboard, timestamps, getattr(config, "vars", None) or {}, resolver,
+        )
+    finally:
+        if browser_fallback is not None:
+            _close_browser_fallback(browser_fallback)
     setattr(config, "render_matrix_rows_by_timestamp", rows_by_time)
     _remove_source_artifacts(panels, render_tasks)
     return _matrix_tasks(config, render_tasks, rows_by_time)
@@ -72,226 +71,36 @@ def build_matrix_dashboard_links(config: Any, timestamps: list[Any], dashboard_u
     return links
 
 
-def _normalized_matrix(dashboard_name: str, value: dict[str, Any]) -> dict[str, Any]:
-    matrix = dict(value)
-    _reject_flat_layout(dashboard_name, matrix)
-    nested_options = matrix.pop("options", None)
-    variables = matrix.pop("variables", None)
-    normalized = _flat_options(matrix)
-    normalized.update(_nested_options(dashboard_name, nested_options))
-    normalized_variables = variables if variables is not None else _legacy_variables(matrix)
-    if normalized_variables:
-        normalized["variables"] = _variables_with_implicit_sources(normalized_variables)
-    return normalized
-
-
-def _variables_with_implicit_sources(variables: Any) -> Any:
-    if not isinstance(variables, dict):
-        return variables
-    return {key: _variable_with_implicit_source(spec) for key, spec in variables.items()}
-
-
-def _variable_with_implicit_source(spec: Any) -> Any:
-    if not isinstance(spec, dict) or _has_value_source(spec) or not _configured_dependencies(spec):
-        return spec
-    return {**spec, "values_from": {}}
-
-
-def _has_value_source(spec: dict[str, Any]) -> bool:
-    return any(name in spec for name in ("values", "values_by", "values_from"))
-
-
-def _flat_options(matrix: dict[str, Any]) -> dict[str, Any]:
-    return {key: matrix.pop(key) for key in list(matrix) if key in MATRIX_FLAT_OPTION_KEYS}
-
-
-def _reject_flat_layout(dashboard_name: str, matrix: dict[str, Any]) -> None:
-    if "layout" not in matrix:
-        return
-    raise ConfigurationError(_path(dashboard_name, "layout") + ": use render_matrix.options.layout.")
-
-
-def _nested_options(dashboard_name: str, options: Any) -> dict[str, Any]:
-    if options in (None, ""):
-        return {}
-    if not isinstance(options, dict):
-        raise ConfigurationError(_path(dashboard_name, "options") + ": expected mapping.")
-    unknown = sorted(str(key) for key in options if key not in MATRIX_NESTED_OPTION_KEYS)
-    if unknown:
-        raise ConfigurationError(_path(dashboard_name, "options") + f": unknown option(s) {unknown}.")
-    return dict(options)
-
-
-def _legacy_variables(matrix: dict[str, Any]) -> dict[str, Any]:
-    return {key: matrix.pop(key) for key in list(matrix)}
-
-
 def _dashboard_link_variables(config: Any, row: dict[str, Any]) -> dict[str, Any]:
     variables = dict(getattr(config, "vars", None) or {})
     variables.update(row["url_variables"])
     return variables
 
 
-def _validate_matrix(dashboard_name: str, matrix: dict[str, Any]) -> None:
-    variables = matrix.get("variables")
-    if not isinstance(variables, dict) or not variables:
-        raise ConfigurationError(_path(dashboard_name, "variables") + ": expected non-empty mapping.")
-    if matrix.get("combination_mode", "product") not in MATRIX_MODES:
-        raise ConfigurationError(_path(dashboard_name, "combination_mode") + ": expected product or zip.")
-    _validate_layout(dashboard_name, matrix)
-    _validate_max_rows(dashboard_name, matrix)
-    _validate_group_by(dashboard_name, matrix, variables)
-    _validate_variable_specs(dashboard_name, variables)
-    _validate_label_template(dashboard_name, matrix, variables)
-
-
-def _validate_layout(dashboard_name: str, matrix: dict[str, Any]) -> None:
-    layout = matrix.get("layout", DEFAULT_MATRIX_LAYOUT)
-    if layout in MATRIX_LAYOUTS:
-        return
-    expected = ", ".join(sorted(MATRIX_LAYOUTS))
-    raise ConfigurationError(_path(dashboard_name, "layout") + f": expected one of [{expected}].")
-
-
-def _validate_group_by(dashboard_name: str, matrix: dict[str, Any], variables: dict[str, Any]) -> None:
-    group_by = matrix.get("row_grouping", matrix.get("group_by", []))
-    if group_by in (None, ""):
-        return
-    if not isinstance(group_by, list) or not all(isinstance(item, str) for item in group_by):
-        raise ConfigurationError(_path(dashboard_name, "row_grouping") + ": expected list[str].")
-    unknown = [item for item in group_by if item not in variables]
-    if unknown:
-        raise ConfigurationError(_path(dashboard_name, "row_grouping") + f": unknown variables {unknown}.")
-
-
-def _validate_variable_specs(dashboard_name: str, variables: dict[str, Any]) -> None:
-    aliases: set[str] = set()
-    previous: set[str] = set()
-    for key, spec in variables.items():
-        if not isinstance(key, str) or not key:
-            raise ConfigurationError(_path(dashboard_name, "variables") + ": variable keys must be non-empty strings.")
-        if not isinstance(spec, dict):
-            raise ConfigurationError(_path(dashboard_name, f"variables.{key}") + ": expected mapping.")
-        _validate_grafana_variable(dashboard_name, key, spec)
-        _validate_alias(dashboard_name, key, spec, aliases)
-        _validate_value_source(dashboard_name, key, spec)
-        _validate_dependencies(dashboard_name, key, spec, previous)
-        previous.add(key)
-
-
-def _validate_max_rows(dashboard_name: str, matrix: dict[str, Any]) -> None:
-    max_rows = matrix.get("max_rows", DEFAULT_MAX_MATRIX_ROWS)
-    if isinstance(max_rows, int) and not isinstance(max_rows, bool) and max_rows > 0:
-        return
-    raise ConfigurationError(_path(dashboard_name, "max_rows") + ": expected positive integer.")
-
-
-def _validate_grafana_variable(dashboard_name: str, key: str, spec: dict[str, Any]) -> None:
-    grafana_variable = spec.get("grafana_variable")
-    if grafana_variable in (None, ""):
-        return
-    if isinstance(grafana_variable, str):
-        return
-    raise ConfigurationError(_path(dashboard_name, f"variables.{key}.grafana_variable") + ": expected non-empty string.")
-
-
-def _validate_dependencies(dashboard_name: str, key: str, spec: dict[str, Any], previous: set[str]) -> None:
-    dependencies = _configured_dependencies(spec)
-    if "values_by" in spec and not dependencies:
-        raise ConfigurationError(_path(dashboard_name, f"variables.{key}.depends_on") + ": required for values_by.")
-    unknown = [dependency for dependency in dependencies if dependency not in previous]
-    if unknown:
-        raise ConfigurationError(
-            _path(dashboard_name, f"variables.{key}.depends_on")
-            + f": unknown or later dependencies {unknown}."
-        )
-
-
-def _configured_dependencies(spec: dict[str, Any]) -> list[str]:
-    depends_on = spec.get("depends_on")
-    if depends_on in (None, ""):
-        return []
-    if isinstance(depends_on, str):
-        return [depends_on]
-    if isinstance(depends_on, list) and all(isinstance(item, str) and item for item in depends_on):
-        return list(depends_on)
-    return [""]
-
-
-def _validate_alias(dashboard_name: str, key: str, spec: dict[str, Any], aliases: set[str]) -> None:
-    alias = spec.get("alias", key)
-    if not isinstance(alias, str) or not alias:
-        raise ConfigurationError(_path(dashboard_name, f"variables.{key}.alias") + ": expected non-empty string.")
-    if alias in aliases:
-        raise ConfigurationError(_path(dashboard_name, f"variables.{key}.alias") + ": duplicate metadata alias.")
-    aliases.add(alias)
-
-
-def _validate_value_source(dashboard_name: str, key: str, spec: dict[str, Any]) -> None:
-    sources = [name for name in ("values", "values_by", "values_from") if name in spec]
-    if len(sources) != 1:
-        raise ConfigurationError(_path(dashboard_name, f"variables.{key}") + ": expected exactly one value source.")
-    _validate_source_shape(dashboard_name, key, spec, sources[0])
-    _validate_regex(dashboard_name, key, spec)
-    _validate_max_values(dashboard_name, key, spec)
-
-
-def _validate_source_shape(dashboard_name: str, key: str, spec: dict[str, Any], source: str) -> None:
-    value = spec.get(source)
-    if source == "values" and isinstance(value, list) and value:
-        return
-    if source == "values_by" and _valid_values_by(value):
-        return
-    if source == "values_from" and _valid_values_from(value, key, spec):
-        return
-    raise ConfigurationError(_path(dashboard_name, f"variables.{key}.{source}") + ": invalid value source.")
-
-
-def _valid_values_from(value: Any, key: str, spec: dict[str, Any]) -> bool:
-    if isinstance(value, str) and value:
-        return value == _grafana_variable(key, spec)
-    if not isinstance(value, dict):
-        return False
-    return not set(value) - {"regex", "max_values"}
-
-
-def _valid_values_by(value: Any) -> bool:
-    if not isinstance(value, dict) or not value:
-        return False
-    return all(isinstance(items, list) and bool(items) for items in value.values())
-
-
-def _validate_regex(dashboard_name: str, key: str, spec: dict[str, Any]) -> None:
-    regex = _regex_value(spec)
-    if regex in (None, ""):
-        return
-    try:
-        re.compile(str(regex))
-    except re.error as error:
-        raise ConfigurationError(_path(dashboard_name, f"variables.{key}.regex") + f": invalid regex ({error}).") from error
-
-
-def _validate_max_values(dashboard_name: str, key: str, spec: dict[str, Any]) -> None:
-    max_values = _max_values(spec)
-    if max_values is None:
-        return
-    if not isinstance(max_values, int) or isinstance(max_values, bool) or max_values <= 0:
-        raise ConfigurationError(_path(dashboard_name, f"variables.{key}.max_values") + ": expected positive integer.")
+def _planning_matrix(dashboard_name: str, matrix: dict[str, Any], dashboard: dict[str, Any]) -> dict[str, Any]:
+    ordered, dependencies = ordered_matrix_variables(dashboard_name, matrix, dashboard)
+    variables = {
+        key: {**matrix["variables"][key], "__resolved_dependencies__": dependencies[key]}
+        for key in ordered
+    }
+    if matrix.get("combination_mode", "product") == "zip" and any(dependencies.values()):
+        raise ConfigurationError(_path(dashboard_name, "combination_mode") + ": zip does not support dependent variables.")
+    return {**matrix, "variables": variables}
 
 
 def _rows_by_timestamp(config: Any, matrix: dict[str, Any], dashboard: dict[str, Any],
-                       timestamps: list[Any], static_vars: dict[str, Any], session: Any) -> dict[int, list[dict[str, Any]]]:
+                       timestamps: list[Any], static_vars: dict[str, Any], resolver: MatrixValueResolver) -> dict[int, list[dict[str, Any]]]:
     return {
-        timestamp.id_time: _rows_for_timestamp(config, matrix, dashboard, timestamp, static_vars, session)
+        timestamp.id_time: _rows_for_timestamp(config, matrix, dashboard, timestamp, static_vars, resolver)
         for timestamp in timestamps
     }
 
 
 def _rows_for_timestamp(config: Any, matrix: dict[str, Any], dashboard: dict[str, Any],
-                         timestamp: Any, static_vars: dict[str, Any], session: Any) -> list[dict[str, Any]]:
+                         timestamp: Any, static_vars: dict[str, Any], resolver: MatrixValueResolver) -> list[dict[str, Any]]:
     dashboard_name = config.name
     if matrix.get("combination_mode", "product") == "product":
-        rows = _product_rows(config, matrix, dashboard, timestamp, static_vars, session)
+        rows = _product_rows(config, matrix, dashboard, timestamp, static_vars, resolver)
         if not rows:
             raise ConfigurationError(
                 _path(dashboard_name, "variables")
@@ -300,7 +109,7 @@ def _rows_for_timestamp(config: Any, matrix: dict[str, Any], dashboard: dict[str
             )
         _validate_row_limit(dashboard_name, matrix, len(rows))
         return [_row_record(dashboard_name, matrix, index, row) for index, row in enumerate(rows)]
-    values, provenance = _variable_values(config, matrix, dashboard, timestamp, static_vars, session)
+    values, provenance = _variable_values(config, matrix, dashboard, timestamp, static_vars, resolver)
     rows = _zip_rows(values, dashboard_name)
     _validate_row_limit(dashboard_name, matrix, len(rows))
     rows = [{**row, "__discovery__": provenance} for row in rows]
@@ -308,28 +117,29 @@ def _rows_for_timestamp(config: Any, matrix: dict[str, Any], dashboard: dict[str
 
 
 def _product_rows(config: Any, matrix: dict[str, Any], dashboard: dict[str, Any],
-                  timestamp: Any, static_vars: dict[str, Any], session: Any) -> list[dict[str, Any]]:
+                   timestamp: Any, static_vars: dict[str, Any], resolver: MatrixValueResolver) -> list[dict[str, Any]]:
     rows: list[dict[str, str]] = [{}]
     for key, spec in matrix["variables"].items():
-        rows = _extend_rows(config, matrix, key, spec, dashboard, timestamp, static_vars, rows, session)
+        rows = _extend_rows(config, matrix, key, spec, dashboard, timestamp, static_vars, rows, resolver)
     return rows
 
 
 def _extend_rows(config: Any, matrix: dict[str, Any], key: str, spec: dict[str, Any],
                  dashboard: dict[str, Any], timestamp: Any, static_vars: dict[str, Any],
-                  rows: list[dict[str, Any]], session: Any) -> list[dict[str, Any]]:
+                  rows: list[dict[str, Any]], resolver: MatrixValueResolver) -> list[dict[str, Any]]:
     extended: list[dict[str, str]] = []
     for row in rows:
-        values, provenance = _values_for_spec(config, key, spec, dashboard, timestamp, row, static_vars, session)
+        values, provenance = _values_for_spec(config, key, spec, dashboard, timestamp, row, static_vars, resolver)
         if not values:
             logger.warning(
-                "Render matrix branch skipped dashboard=%s variable=%s timestamp_id=%s context=%s "
-                "reason=no_values_resolved discovery=%s",
+                "Render matrix branch skipped dashboard=%s variable=%s timestamp_id=%s context_vars=%s "
+                "reason=authoritative_empty source=%s method=%s",
                 config.name,
-                key,
+                safe_discovery_variable(key),
                 timestamp.id_time,
-                {name: value for name, value in row.items() if not str(name).startswith("__")},
-                provenance,
+                sorted(str(name) for name in row if not str(name).startswith("__")),
+                (provenance or {}).get("source"),
+                (provenance or {}).get("method"),
             )
             continue
         for value in values:
@@ -339,40 +149,40 @@ def _extend_rows(config: Any, matrix: dict[str, Any], key: str, spec: dict[str, 
 
 
 def _variable_values(config: Any, matrix: dict[str, Any], dashboard: dict[str, Any],
-                     timestamp: Any, static_vars: dict[str, Any], session: Any) -> tuple[dict[str, list[str]], dict[str, Any]]:
+                     timestamp: Any, static_vars: dict[str, Any], resolver: MatrixValueResolver) -> tuple[dict[str, list[str]], dict[str, Any]]:
     values: dict[str, list[str]] = {}
     provenance: dict[str, Any] = {}
     for key, spec in matrix["variables"].items():
-        values[key], variable_provenance = _values_for_spec(config, key, spec, dashboard, timestamp, {}, static_vars, session)
+        values[key], variable_provenance = _values_for_spec(config, key, spec, dashboard, timestamp, {}, static_vars, resolver)
         if variable_provenance:
             provenance[key] = variable_provenance
     return values, provenance
 
 
 def _values_for_spec(config: Any, key: str, spec: dict[str, Any], dashboard: dict[str, Any], timestamp: Any,
-                     context: dict[str, Any], static_vars: dict[str, Any], session: Any) -> tuple[list[str], dict[str, Any] | None]:
+                     context: dict[str, Any], static_vars: dict[str, Any], resolver: MatrixValueResolver) -> tuple[list[str], dict[str, Any] | None]:
     provenance = None
     if "values" in spec:
         values = _scalar_list(spec.get("values"))
     elif "values_by" in spec:
         values = _values_by_context(config.name, key, spec, context)
     else:
-        result = resolve_values_from(key, spec, dashboard, timestamp, _discovery_context(config.render_matrix, context), static_vars, session, config)
+        result = resolver.resolve(
+            key, spec, timestamp, _discovery_context(config.render_matrix, context), static_vars,
+        )
+        if not result.authoritative:
+            raise ConfigurationError(_discovery_failure(config.name, key, result.provenance))
         values, provenance = result.values, result.provenance
     values = _filtered_values(spec, values)
     return values, provenance
 
 
-def _validate_label_template(dashboard_name: str, matrix: dict[str, Any], variables: dict[str, Any]) -> None:
-    template = matrix.get("label_template")
-    if template in (None, ""):
-        return
-    if not isinstance(template, str):
-        raise ConfigurationError(_path(dashboard_name, "label_template") + ": expected string.")
-    allowed = set(variables) | {_alias(key, spec) for key, spec in variables.items()}
-    unknown = sorted({field for _, field, _, _ in Formatter().parse(template) if field and field not in allowed})
-    if unknown:
-        raise ConfigurationError(_path(dashboard_name, "label_template") + f": unknown placeholders {unknown}.")
+def _discovery_failure(dashboard_name: str, key: str, provenance: dict[str, Any]) -> str:
+    details = " ".join(
+        f"{name}={provenance.get(name)}"
+        for name in ("status", "source", "method", "timestamp_id", "from", "to", "context_vars")
+    )
+    return _path(dashboard_name, f"variables.{key}") + f": dynamic discovery did not resolve ({details})."
 
 
 def _extended_row(row: dict[str, Any], key: str, value: str, provenance: dict[str, Any] | None) -> dict[str, Any]:
@@ -384,15 +194,21 @@ def _extended_row(row: dict[str, Any], key: str, value: str, provenance: dict[st
 
 def _discovery_context(matrix: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
     public_context = {key: value for key, value in context.items() if not str(key).startswith("__")}
-    grafana_context = {_grafana_variable(key, matrix["variables"][key]): value for key, value in public_context.items()}
-    return {**public_context, **grafana_context}
+    return {_grafana_variable(key, matrix["variables"][key]): value for key, value in public_context.items()}
+
+
+def _close_browser_fallback(browser_fallback: BrowserMatrixFallback) -> None:
+    try:
+        browser_fallback.close()
+    except Exception as error:
+        logger.warning("Matrix planning browser cleanup failed error_type=%s", type(error).__name__)
 
 
 def _values_by_context(dashboard_name: str, key: str, spec: dict[str, Any], context: dict[str, str]) -> list[str]:
     mapping = spec.get("values_by")
     if not isinstance(mapping, dict):
         raise ConfigurationError(_path(dashboard_name, f"variables.{key}.values_by") + ": expected mapping.")
-    deps = _configured_dependencies(spec)
+    deps = spec.get("__resolved_dependencies__", configured_dependencies(spec))
     missing = [dependency for dependency in deps if dependency not in context]
     if missing:
         raise ConfigurationError(_path(dashboard_name, f"variables.{key}.depends_on") + f": unresolved dependencies {missing}.")
@@ -406,11 +222,11 @@ def _values_by_context(dashboard_name: str, key: str, spec: dict[str, Any], cont
 
 
 def _filtered_values(spec: dict[str, Any], values: list[str]) -> list[str]:
-    regex = _regex_value(spec)
+    regex = regex_value(spec)
     if regex:
         pattern = re.compile(str(regex))
         values = [value for value in values if pattern.search(value)]
-    return _dedupe(values)[:_max_values(spec)]
+    return _dedupe(values)[:max_values(spec)]
 
 
 def _zip_rows(values: dict[str, list[str]], dashboard_name: str) -> list[dict[str, str]]:
@@ -522,17 +338,6 @@ def _scalar_list(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     return [str(item) for item in value if item not in (None, "") and not isinstance(item, (dict, list))]
-
-
-def _regex_value(spec: dict[str, Any]) -> Any:
-    source = spec.get("values_from")
-    return source.get("regex") if isinstance(source, dict) and "regex" in source else spec.get("regex")
-
-
-def _max_values(spec: dict[str, Any]) -> int:
-    source = spec.get("values_from")
-    value = source.get("max_values") if isinstance(source, dict) and "max_values" in source else spec.get("max_values")
-    return value if value is not None else DEFAULT_MAX_MATRIX_VALUES
 
 
 def _alias(key: str, spec: dict[str, Any]) -> str:

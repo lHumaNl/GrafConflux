@@ -1,10 +1,11 @@
-"""Grafana-backed value discovery for render matrix variables."""
+"""Structured Grafana-backed discovery for render-matrix variables."""
 
 from __future__ import annotations
 
 import logging
 import re
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any
 from urllib.parse import quote
 
@@ -12,12 +13,99 @@ logger = logging.getLogger(__name__)
 
 ALL_SENTINELS = {"$__all", "__all", "all"}
 PROMETHEUS_DATASOURCE_TYPE = "prometheus"
+SAFE_LOG_VALUE_LIMIT = 5
+SAFE_LOG_VALUE_LENGTH = 64
+SENSITIVE_NAME_PATTERN = re.compile(r"(?:pass|secret|token|cookie|credential|authorization|api.?key)", re.I)
+SECRET_VALUE_PATTERN = re.compile(
+    r"(?:^Bearer\s+|^Basic\s+|(?:token|secret|password|api.?key)=|^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$|^[a-fA-F0-9]{32,}$)",
+    re.I,
+)
+
+
+class MatrixDiscoveryStatus(str, Enum):
+    RESOLVED = "resolved"
+    EMPTY = "empty"
+    UNSUPPORTED = "unsupported"
+    UNRESOLVED = "unresolved"
+    FAILED = "failed"
 
 
 @dataclass(frozen=True)
 class MatrixValueResult:
+    status: MatrixDiscoveryStatus
     values: list[str]
     provenance: dict[str, Any]
+
+    @property
+    def authoritative(self) -> bool:
+        return self.status in {MatrixDiscoveryStatus.RESOLVED, MatrixDiscoveryStatus.EMPTY}
+
+
+class MatrixValueResolver:
+    """Resolve dynamic values with timestamp/context-aware caching."""
+
+    def __init__(
+        self,
+        dashboard: dict[str, Any],
+        session: Any,
+        config: Any,
+        browser_fallback: Any = None,
+        dynamic_variable_names: set[str] | None = None,
+    ) -> None:
+        self.dashboard = dashboard
+        self.session = session
+        self.config = config
+        self.browser_fallback = browser_fallback
+        self.dynamic_variable_names = dynamic_variable_names or set()
+        self.cache: dict[tuple[Any, ...], MatrixValueResult] = {}
+
+    def resolve(
+        self,
+        key: str,
+        spec: dict[str, Any],
+        timestamp: Any,
+        context: dict[str, Any],
+        static_vars: dict[str, Any],
+    ) -> MatrixValueResult:
+        source_name = str(spec.get("grafana_variable") or key)
+        effective_context = self._effective_context(source_name, context, static_vars)
+        cache_key = _cache_key(source_name, timestamp, effective_context)
+        if cache_key in self.cache:
+            return self.cache[cache_key]
+        result = self._discover(source_name, timestamp, effective_context)
+        self.cache[cache_key] = result
+        _log_result(source_name, timestamp, result)
+        return result
+
+    def _effective_context(
+        self,
+        source_name: str,
+        context: dict[str, Any],
+        static_vars: dict[str, Any],
+    ) -> dict[str, Any]:
+        explicit = {**static_vars, **_public_context(context)}
+        defaults = _dashboard_current_context(
+            self.dashboard,
+            self.dynamic_variable_names | {source_name},
+        )
+        return {**defaults, **explicit}
+
+    def _discover(
+        self,
+        source_name: str,
+        timestamp: Any,
+        context: dict[str, Any],
+    ) -> MatrixValueResult:
+        variable = _dashboard_variable(self.dashboard, source_name)
+        api_result = _prometheus_result(
+            variable, source_name, timestamp, context, self.session, self.config, self.dashboard,
+        )
+        if api_result.authoritative or self.browser_fallback is None:
+            return api_result
+        fallback_result = self.browser_fallback.discover(source_name, variable, timestamp, context)
+        if fallback_result.authoritative:
+            return fallback_result
+        return _combined_failure(api_result, fallback_result)
 
 
 def resolve_values_from(
@@ -30,117 +118,184 @@ def resolve_values_from(
     session: Any = None,
     config: Any = None,
 ) -> MatrixValueResult:
-    source_name = _values_from_variable_name(spec.get("values_from"), spec, key)
-    public_context = _public_context(context)
-    explicit_context = {**static_vars, **public_context}
-    effective_context = {**_dashboard_current_context(dashboard, {source_name}), **explicit_context}
-    if source_name in explicit_context:
-        return _context_result(source_name, explicit_context[source_name], timestamp)
-    variable = _dashboard_variable(dashboard, source_name)
-    api_result = _api_values(variable, source_name, timestamp, effective_context, session, config, dashboard)
-    if api_result is not None:
-        return api_result
-    return _templating_result(variable, source_name, timestamp, effective_context)
+    """Compatibility wrapper for callers that do not need shared caching."""
+    return MatrixValueResolver(dashboard, session, config).resolve(
+        key, spec, timestamp, context, static_vars,
+    )
 
 
-def _api_values(variable: dict[str, Any] | None, source_name: str, timestamp: Any,
-                context: dict[str, Any], session: Any, config: Any,
-                dashboard: dict[str, Any]) -> MatrixValueResult | None:
-    request = _prometheus_request(variable, timestamp, context, config, dashboard)
-    if request is None or session is None:
-        return None
+def _prometheus_result(
+    variable: dict[str, Any] | None,
+    source_name: str,
+    timestamp: Any,
+    context: dict[str, Any],
+    session: Any,
+    config: Any,
+    dashboard: dict[str, Any],
+) -> MatrixValueResult:
+    parsed = _prometheus_query(variable, context, config, dashboard)
+    if parsed is None:
+        return _result(MatrixDiscoveryStatus.UNSUPPORTED, [], source_name, timestamp, context, "grafana_api", "no_supported_adapter")
+    metric, label, datasource_uid = parsed
+    if not datasource_uid:
+        return _result(MatrixDiscoveryStatus.UNRESOLVED, [], source_name, timestamp, context, "grafana_api", "datasource_unresolved")
+    if session is None:
+        return _result(MatrixDiscoveryStatus.UNRESOLVED, [], source_name, timestamp, context, "grafana_api", "session_unavailable")
+    method = "prometheus_series" if metric else "prometheus_label_values"
+    url = _prometheus_url(config.grafana_base_url, datasource_uid, label, bool(metric))
+    params = _prometheus_params(metric, timestamp)
     try:
-        response = session.get(request["url"], params=request["params"], timeout=getattr(config, "timeout", None))
-    except Exception as error:  # pragma: no cover - defensive logging only
-        logger.warning("Matrix values_from discovery failed variable=%s error=%s", source_name, error)
-        return MatrixValueResult([], _provenance(source_name, timestamp, context, "grafana_api", "request_failed"))
-    if getattr(response, "status_code", None) != 200:
-        logger.warning(
-            "Matrix values_from discovery returned non-200 status variable=%s status=%s",
-            source_name,
-            getattr(response, "status_code", None),
-        )
-    values = _response_values(response)
-    if values is None:
+        response = session.get(url, params=params, timeout=getattr(config, "timeout", None))
+    except Exception as error:
+        logger.warning("Matrix discovery request failed variable=%s error_type=%s", safe_discovery_variable(source_name), type(error).__name__)
+        return _result(MatrixDiscoveryStatus.FAILED, [], source_name, timestamp, context, "grafana_api", method)
+    return _prometheus_response_result(response, source_name, timestamp, context, method, label)
+
+
+def _prometheus_query(
+    variable: dict[str, Any] | None,
+    context: dict[str, Any],
+    config: Any,
+    dashboard: dict[str, Any],
+) -> tuple[str | None, str, str | None] | None:
+    if not isinstance(variable, dict) or variable.get("type") != "query" or config is None:
         return None
-    provenance = _provenance(source_name, timestamp, context, "grafana_api", "prometheus_label_values", request)
-    return MatrixValueResult(values, provenance)
-
-
-def _prometheus_request(variable: dict[str, Any] | None, timestamp: Any,
-                        context: dict[str, Any], config: Any,
-                        dashboard: dict[str, Any]) -> dict[str, Any] | None:
-    if not _is_prometheus_query_variable(variable, context, config, dashboard) or config is None:
+    datasource_type, datasource_uid = _resolved_datasource_type_uid(
+        variable.get("datasource"), context, config, dashboard,
+    )
+    if str(datasource_type).lower() != PROMETHEUS_DATASOURCE_TYPE:
         return None
     parsed = _prometheus_label_values_query(variable, context)
-    if parsed is None:
-        logger.debug(
-            "Matrix values_from discovery has no supported Prometheus label_values query variable=%s",
-            variable.get("name") if isinstance(variable, dict) else None,
-        )
-        return None
-    datasource_uid = _resolved_datasource_type_uid(variable.get("datasource"), context, config, dashboard)[1]
-    if not datasource_uid:
-        logger.warning(
-            "Matrix values_from discovery could not resolve datasource variable=%s context_vars=%s",
-            variable.get("name") if isinstance(variable, dict) else None,
-            sorted(str(key) for key in context),
-        )
-        return None
-    params = _prometheus_params(parsed[0], timestamp, variable, context)
-    return {"url": _prometheus_url(config.grafana_base_url, datasource_uid, parsed[1]), "params": params}
+    return None if parsed is None else (parsed[0], parsed[1], datasource_uid)
 
 
-def _prometheus_params(metric: str | None, timestamp: Any, variable: dict[str, Any], context: dict[str, Any]) -> dict[str, str]:
-    params = {"match[]": metric} if metric else {}
-    params.update({"start": str(timestamp.start_time_timestamp), "end": str(timestamp.end_time_timestamp)})
-    params.update({f"var-{_context_grafana_key(name, variable)}": str(value) for name, value in context.items()})
+def _prometheus_response_result(
+    response: Any,
+    source_name: str,
+    timestamp: Any,
+    context: dict[str, Any],
+    method: str,
+    label: str,
+) -> MatrixValueResult:
+    if getattr(response, "status_code", None) != 200:
+        return _result(MatrixDiscoveryStatus.FAILED, [], source_name, timestamp, context, "grafana_api", method)
+    try:
+        payload = response.json()
+    except Exception as error:
+        logger.warning("Matrix discovery returned invalid JSON variable=%s error_type=%s", safe_discovery_variable(source_name), type(error).__name__)
+        return _result(MatrixDiscoveryStatus.FAILED, [], source_name, timestamp, context, "grafana_api", method)
+    values = _prometheus_payload_values(payload, method, label)
+    if values is None:
+        return _result(MatrixDiscoveryStatus.UNRESOLVED, [], source_name, timestamp, context, "grafana_api", method)
+    status = MatrixDiscoveryStatus.RESOLVED if values else MatrixDiscoveryStatus.EMPTY
+    return _result(status, values, source_name, timestamp, context, "grafana_api", method)
+
+
+def _prometheus_payload_values(payload: Any, method: str, label: str) -> list[str] | None:
+    if not isinstance(payload, dict) or payload.get("status") != "success":
+        return None
+    data = payload.get("data")
+    if not isinstance(data, list):
+        return None
+    if method == "prometheus_series":
+        if not all(isinstance(item, dict) for item in data):
+            return None
+        values = [str(item[label]) for item in data if item.get(label) not in (None, "")]
+    else:
+        if any(isinstance(item, (dict, list, tuple, set)) for item in data):
+            return None
+        values = [str(item) for item in data if item not in (None, "")]
+    return _dedupe([value for value in values if value.lower() not in ALL_SENTINELS])
+
+
+def _prometheus_params(metric: str | None, timestamp: Any) -> dict[str, str]:
+    params = {
+        "start": _prometheus_seconds(timestamp.start_time_timestamp),
+        "end": _prometheus_seconds(timestamp.end_time_timestamp),
+    }
+    if metric:
+        params["match[]"] = metric
     return params
 
 
-def _context_grafana_key(name: str, variable: dict[str, Any]) -> str:
-    return str(name if name != variable.get("name") else variable.get("name"))
+def _prometheus_seconds(milliseconds: Any) -> str:
+    value = int(milliseconds)
+    return str(value // 1000) if value % 1000 == 0 else str(value / 1000)
 
 
-def _prometheus_url(base_url: str, datasource_uid: str, label: str) -> str:
-    return f"{base_url}/api/datasources/proxy/uid/{quote(str(datasource_uid), safe='')}/api/v1/label/{quote(label, safe='')}/values"
+def _prometheus_url(base_url: str, datasource_uid: str, label: str, series: bool) -> str:
+    proxy = f"{base_url}/api/datasources/proxy/uid/{quote(str(datasource_uid), safe='')}/api/v1"
+    return f"{proxy}/series" if series else f"{proxy}/label/{quote(label, safe='')}/values"
 
 
-def _response_values(response: Any) -> list[str] | None:
-    if getattr(response, "status_code", None) != 200:
-        return []
-    try:
-        payload = response.json()
-    except Exception as error:  # pragma: no cover - defensive logging only
-        logger.warning("Matrix values_from discovery returned invalid JSON error=%s", error)
-        return None
-    data = payload.get("data", []) if isinstance(payload, dict) else []
-    return [value for value in _normalize_values(data) if value.lower() not in ALL_SENTINELS]
+def _result(
+    status: MatrixDiscoveryStatus,
+    values: list[str],
+    variable: str,
+    timestamp: Any,
+    context: dict[str, Any],
+    source: str,
+    method: str,
+) -> MatrixValueResult:
+    provenance = {
+        "variable": variable,
+        "status": status.value,
+        "source": source,
+        "method": method,
+        "timestamp_id": timestamp.id_time,
+        "from": str(timestamp.start_time_timestamp),
+        "to": str(timestamp.end_time_timestamp),
+        "context_vars": sorted(str(key) for key in context),
+        "count": len(values),
+    }
+    return MatrixValueResult(status, values, provenance)
 
 
-def _templating_result(variable: dict[str, Any] | None, source_name: str, timestamp: Any,
-                       context: dict[str, Any]) -> MatrixValueResult:
-    values = _dashboard_variable_options(variable)
-    provenance = _provenance(source_name, timestamp, context, "templating_options", "no_safe_api_endpoint")
-    return MatrixValueResult([value for value in values if value.lower() not in ALL_SENTINELS], provenance)
+def _combined_failure(api_result: MatrixValueResult, fallback_result: MatrixValueResult) -> MatrixValueResult:
+    status = MatrixDiscoveryStatus.FAILED if MatrixDiscoveryStatus.FAILED in {
+        api_result.status, fallback_result.status,
+    } else MatrixDiscoveryStatus.UNRESOLVED
+    provenance = dict(fallback_result.provenance)
+    provenance.update({"status": status.value, "api_status": api_result.status.value})
+    return MatrixValueResult(status, [], provenance)
 
 
-def _context_result(source_name: str, value: Any, timestamp: Any) -> MatrixValueResult:
-    values = _normalize_values(value)
-    return MatrixValueResult(values, _provenance(source_name, timestamp, {source_name: value}, "configured_context", "static_or_parent"))
+def _log_result(variable: str, timestamp: Any, result: MatrixValueResult) -> None:
+    log = logger.info if result.authoritative else logger.warning
+    log(
+        "Matrix discovery variable=%s timestamp_id=%s range=%s..%s status=%s source=%s method=%s count=%s values=%s",
+        safe_discovery_variable(variable), timestamp.id_time, timestamp.start_time_timestamp,
+        timestamp.end_time_timestamp, result.status.value, result.provenance.get("source"),
+        result.provenance.get("method"), len(result.values), safe_discovery_values(variable, result.values),
+    )
 
 
-def _provenance(source_name: str, timestamp: Any, context: dict[str, Any], source: str,
-                method: str, request: dict[str, Any] | None = None) -> dict[str, Any]:
-    provenance = {"variable": source_name, "source": source, "method": method, "from": str(timestamp.start_time_timestamp),
-                  "to": str(timestamp.end_time_timestamp), "context_vars": sorted(str(key) for key in context)}
-    if request:
-        provenance["request"] = {"url": request["url"], "params": dict(request["params"])}
-    return provenance
+def safe_discovery_values(variable: str, values: list[str]) -> list[str]:
+    if SENSITIVE_NAME_PATTERN.search(variable):
+        return ["<redacted>"] if values else []
+    safe = [_safe_discovery_value(value) for value in values[:SAFE_LOG_VALUE_LIMIT]]
+    if len(values) > SAFE_LOG_VALUE_LIMIT:
+        safe.append(f"...(+{len(values) - SAFE_LOG_VALUE_LIMIT})")
+    return safe
 
 
-def _values_from_variable_name(source: Any, spec: dict[str, Any], key: str) -> str:
-    return str(spec.get("grafana_variable") or key)
+def _safe_discovery_value(value: str) -> str:
+    text = str(value)
+    if SECRET_VALUE_PATTERN.search(text):
+        return "<redacted>"
+    return text if len(text) <= SAFE_LOG_VALUE_LENGTH else text[:SAFE_LOG_VALUE_LENGTH] + "..."
+
+
+def safe_discovery_variable(variable: str) -> str:
+    return "<sensitive-variable>" if SENSITIVE_NAME_PATTERN.search(variable) else variable
+
+
+def _cache_key(source_name: str, timestamp: Any, context: dict[str, Any]) -> tuple[Any, ...]:
+    normalized_context = tuple(sorted((str(key), repr(value)) for key, value in context.items()))
+    return (
+        source_name, timestamp.id_time, timestamp.start_time_timestamp,
+        timestamp.end_time_timestamp, normalized_context,
+    )
 
 
 def _dashboard_variable(dashboard: dict[str, Any], variable_name: str) -> dict[str, Any] | None:
@@ -148,40 +303,23 @@ def _dashboard_variable(dashboard: dict[str, Any], variable_name: str) -> dict[s
     return next((item for item in variables if item.get("name") == variable_name), None)
 
 
-def _dashboard_variable_options(variable: dict[str, Any] | None) -> list[str]:
-    options = variable.get("options", []) if isinstance(variable, dict) else []
-    return _dedupe([value for option in options for value in _option_values(option)])
-
-
 def _dashboard_current_context(dashboard: dict[str, Any], exclude: set[str]) -> dict[str, str]:
-    variables = dashboard.get("templating", {}).get("list", [])
     context: dict[str, str] = {}
-    for variable in variables:
+    for variable in dashboard.get("templating", {}).get("list", []):
         name = variable.get("name") if isinstance(variable, dict) else None
-        if not name or name in exclude:
-            continue
         value = _dashboard_variable_current_value(variable)
-        if value is not None:
+        if name and name not in exclude and value is not None:
             context[str(name)] = value
     return context
 
 
 def _dashboard_variable_current_value(variable: dict[str, Any] | None) -> str | None:
-    if not isinstance(variable, dict):
+    current = variable.get("current") if isinstance(variable, dict) else None
+    if not isinstance(current, dict):
         return None
-    current = variable.get("current")
-    if isinstance(current, dict):
-        value = _context_scalar(current.get("value")) or _context_scalar(current.get("text"))
-        if value is not None:
-            return value
-    selected = [value for option in variable.get("options", []) or [] if isinstance(option, dict) and option.get("selected")
-                for value in _option_values(option)]
-    return _context_scalar(selected)
-
-
-def _option_values(option: Any) -> list[str]:
-    value = option.get("value", option.get("text")) if isinstance(option, dict) else option
-    return _normalize_values(value)
+    values = _normalize_values(current.get("value") or current.get("text"))
+    values = [value for value in values if value.lower() not in ALL_SENTINELS]
+    return None if not values else values[0] if len(values) == 1 else "|".join(values)
 
 
 def _normalize_values(value: Any) -> list[str]:
@@ -190,53 +328,38 @@ def _normalize_values(value: Any) -> list[str]:
     return [] if value in (None, "") or isinstance(value, (dict, tuple, set)) else [str(value)]
 
 
-def _context_scalar(value: Any) -> str | None:
-    values = [item for item in _normalize_values(value) if item.lower() not in ALL_SENTINELS]
-    if not values:
-        return None
-    if len(values) == 1:
-        return values[0]
-    return "|".join(values)
-
-
 def _substitute_query_vars(query: str, context: dict[str, Any]) -> str:
-    return re.sub(r"\$\{([^}]+)}|\$(\w+)", lambda match: str(context.get(match.group(1) or match.group(2), match.group(0))), query)
+    pattern = r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::[^}]+)?}|\$([A-Za-z_][A-Za-z0-9_]*)|\[\[([A-Za-z_][A-Za-z0-9_]*)]]"
+    return re.sub(pattern, lambda match: str(context.get(next(group for group in match.groups() if group), match.group(0))), query)
 
 
-def _parse_label_values(query: str) -> tuple[str | None, str] | None:
-    if not query.strip().startswith("label_values(") or not query.strip().endswith(")"):
-        return None
-    inner = query.strip()[len("label_values("):-1].strip()
-    metric, label = _split_label_values_args(inner)
-    return (metric, label) if _is_safe_prometheus_label(label) and _is_safe_prometheus_match(metric) else None
-
-
-def _prometheus_label_values_query(variable: dict[str, Any] | None, context: dict[str, Any]) -> tuple[str | None, str] | None:
-    if not isinstance(variable, dict):
-        return None
+def _prometheus_label_values_query(variable: dict[str, Any], context: dict[str, Any]) -> tuple[str | None, str] | None:
     query_config = variable.get("query")
-    parsed = _modern_prometheus_label_values_query(query_config, context)
-    if parsed is not None:
-        return parsed
+    modern = _modern_prometheus_label_values_query(query_config, context)
+    if modern is not None:
+        return modern
     for query in (_variable_query_text(query_config), variable.get("definition")):
-        if not isinstance(query, str):
-            continue
-        parsed = _parse_label_values(_substitute_query_vars(query, context))
-        if parsed is not None:
-            return parsed
+        if isinstance(query, str):
+            parsed = _parse_label_values(_substitute_query_vars(query, context))
+            if parsed is not None:
+                return parsed
     return None
 
 
 def _modern_prometheus_label_values_query(query_config: Any, context: dict[str, Any]) -> tuple[str | None, str] | None:
-    if not isinstance(query_config, dict):
-        return None
-    if query_config.get("queryType") != "label_values":
+    if not isinstance(query_config, dict) or query_config.get("queryType") != "label_values":
         return None
     label = _substitute_query_vars(str(query_config.get("label") or ""), context)
     metric = _substitute_query_vars(str(query_config.get("query") or ""), context) or None
-    if _is_safe_prometheus_label(label) and _is_safe_prometheus_match(metric):
-        return metric, label
-    return None
+    return (metric, label) if _is_safe_prometheus_label(label) and _is_safe_prometheus_match(metric) else None
+
+
+def _parse_label_values(query: str) -> tuple[str | None, str] | None:
+    stripped = query.strip()
+    if not stripped.startswith("label_values(") or not stripped.endswith(")"):
+        return None
+    metric, label = _split_label_values_args(stripped[len("label_values("):-1].strip())
+    return (metric, label) if _is_safe_prometheus_label(label) and _is_safe_prometheus_match(metric) else None
 
 
 def _split_label_values_args(inner: str) -> tuple[str | None, str]:
@@ -246,21 +369,14 @@ def _split_label_values_args(inner: str) -> tuple[str | None, str]:
     return metric.strip(), label.strip()
 
 
-def _is_prometheus_query_variable(variable: dict[str, Any] | None, context: dict[str, Any],
-                                  config: Any, dashboard: dict[str, Any]) -> bool:
-    datasource_type, datasource_uid = _resolved_datasource_type_uid(
-        variable.get("datasource") if variable else None, context, config, dashboard)
-    return bool(
-        variable and variable.get("type") == "query"
-        and str(datasource_type).lower() == PROMETHEUS_DATASOURCE_TYPE and datasource_uid
-    )
-
-
-def _resolved_datasource_type_uid(datasource: Any, context: dict[str, Any], config: Any,
-                                  dashboard: dict[str, Any]) -> tuple[str | None, str | None]:
+def _resolved_datasource_type_uid(
+    datasource: Any,
+    context: dict[str, Any],
+    config: Any,
+    dashboard: dict[str, Any],
+) -> tuple[str | None, str | None]:
     datasource_type, datasource_uid = _datasource_type_uid(datasource)
-    ref_name = _datasource_ref_name(datasource_type, datasource_uid, config) or _variable_reference_name(datasource_uid) \
-        or _variable_reference_name(datasource_type)
+    ref_name = _datasource_ref_name(datasource_type, datasource_uid, config) or _variable_reference_name(datasource_uid) or _variable_reference_name(datasource_type)
     if not ref_name:
         return _resolved_context_value(datasource_type, context), _resolved_context_value(datasource_uid, context)
     variable = _dashboard_variable(dashboard, ref_name)
@@ -288,19 +404,15 @@ def _resolved_context_value(value: Any, context: dict[str, Any]) -> str | None:
 def _variable_reference_name(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
-    match = re.fullmatch(r"\$\{([^}]+)}|\$(\w+)", value)
-    if not match:
-        return None
-    return match.group(1) or match.group(2)
+    match = re.fullmatch(r"\$\{([^}:]+)(?::[^}]+)?}|\$(\w+)", value)
+    return (match.group(1) or match.group(2)) if match else None
 
 
 def _datasource_variable_type(variable: dict[str, Any] | None) -> str | None:
     if not isinstance(variable, dict) or variable.get("type") != "datasource":
         return None
     query = variable.get("query")
-    if isinstance(query, str) and query:
-        return query
-    return query.get("type") if isinstance(query, dict) else None
+    return query if isinstance(query, str) and query else query.get("type") if isinstance(query, dict) else None
 
 
 def _variable_query_text(query_config: Any) -> str | None:
@@ -320,7 +432,7 @@ def _is_safe_prometheus_label(label: str) -> bool:
 
 
 def _is_safe_prometheus_match(metric: str | None) -> bool:
-    return metric is None or (0 < len(metric) <= 300 and not re.search(r"[$()\r\n]", metric))
+    return metric is None or (0 < len(metric) <= 2000 and not re.search(r"[$\r\n]", metric))
 
 
 def _public_context(context: dict[str, Any]) -> dict[str, Any]:

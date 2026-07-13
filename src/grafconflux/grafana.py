@@ -1179,7 +1179,16 @@ class GrafanaManager:
             )
             panels.append(panel)
             planner.append_panel_tasks(self._render_tasks, panel, descriptor, timestamps, rule)
-        self._render_tasks = append_matrix_tasks(self.config, dashboard, descriptors, panels, self._render_tasks, timestamps, self.session)
+        self._render_tasks = append_matrix_tasks(
+            self.config,
+            dashboard,
+            descriptors,
+            panels,
+            self._render_tasks,
+            timestamps,
+            self.session,
+            self._dashboard_public_url(),
+        )
         self._render_tasks = append_variant_tasks(self.config, dashboard, descriptors, panels, self._render_tasks, timestamps)
         return panels
 

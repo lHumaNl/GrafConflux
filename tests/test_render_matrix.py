@@ -3,13 +3,14 @@ import tempfile
 import textwrap
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from grafconflux._confluence.content import build_confluence_storage_content
 from grafconflux._confluence.content import _grouped_matrix_artifacts
 from grafconflux._orchestration.upload_merge import _shift_matrix_dashboard_links, transform_grafana_configs
 from grafconflux._shared.confluence_settings import ConfluenceRenderingSettings
 from grafconflux.args_parser import GrafanaTimeDownloader
+from grafconflux._grafana.matrix_discovery import MatrixDiscoveryStatus, MatrixValueResult
 from grafconflux.grafana import ConfigurationError, GrafanaConfigUploader, GrafanaManager, Panel
 
 
@@ -54,21 +55,29 @@ class TestRenderMatrixPlanning(unittest.TestCase):
         self.assertEqual(panels[0].artifacts[0]["matrix"]["group"], "Environment: prod")
         self.assertEqual(panels[0].artifacts[0]["display_title"], "Requests (Environment: prod, Service: api)")
 
-    def test_values_from_uses_dashboard_options_with_regex_and_max(self) -> None:
+    def test_values_from_uses_api_values_with_regex_and_max(self) -> None:
         grafana = self.manager_from_config(
             """
             dashboards:
               Demo:
                 grafana_url: https://grafana.example
                 dash_title: Demo
+                vars: {region: us, env: prod}
                 render_matrix:
                   service:
                     values_from:
                       regex: "^(api|worker|db)$"
                       max_values: 2
             """,
-            self.dashboard_with_variables(),
+            self.dashboard_with_prometheus_variable(),
         )
+        dashboard = self.dashboard_with_prometheus_variable()
+        grafana.session.get = Mock(side_effect=[
+            Mock(status_code=200, json=Mock(return_value={"dashboard": dashboard})),
+            Mock(status_code=200, json=Mock(return_value={"status": "success", "data": [
+                {"service": "api"}, {"service": "worker"}, {"service": "db"}, {"service": "cache"},
+            ]})),
+        ])
 
         grafana.get_panels([self.timestamp()])
 
@@ -93,22 +102,20 @@ class TestRenderMatrixPlanning(unittest.TestCase):
             self.dashboard_with_prometheus_variable(),
         )
         dashboard_response = Mock(status_code=200, json=Mock(return_value={"dashboard": self.dashboard_with_prometheus_variable()}))
-        values_response = Mock(status_code=200, json=Mock(return_value={"data": ["api", "worker"]}))
+        values_response = Mock(status_code=200, json=Mock(return_value={"status": "success", "data": [{"service": "api"}, {"service": "worker"}]}))
         grafana.session.get = Mock(side_effect=[dashboard_response, values_response])
 
         grafana.get_panels([self.timestamp()])
 
         self.assertEqual([task.variables["service"] for task in grafana.render_tasks], ["api", "worker"])
         api_call = grafana.session.get.call_args_list[1]
-        self.assertIn("/api/datasources/proxy/uid/prom/api/v1/label/service/values", api_call.args[0])
-        self.assertEqual(api_call.kwargs["params"]["start"], "1700000000000")
-        self.assertEqual(api_call.kwargs["params"]["end"], "1700003600000")
+        self.assertIn("/api/datasources/proxy/uid/prom/api/v1/series", api_call.args[0])
+        self.assertEqual(api_call.kwargs["params"]["start"], "1700000000")
+        self.assertEqual(api_call.kwargs["params"]["end"], "1700003600")
         self.assertEqual(api_call.kwargs["params"]["match[]"], 'up{region="us", env="prod"}')
-        self.assertEqual(api_call.kwargs["params"]["var-region"], "us")
-        self.assertEqual(api_call.kwargs["params"]["var-env"], "prod")
         discovery = grafana.config.render_matrix_rows_by_timestamp[0][0]["discovery"]["service"]
         self.assertEqual(discovery["source"], "grafana_api")
-        self.assertEqual(discovery["method"], "prometheus_label_values")
+        self.assertEqual(discovery["method"], "prometheus_series")
 
     def test_dependent_variable_without_source_uses_implicit_values_from(self) -> None:
         grafana = self.manager_from_config(
@@ -129,7 +136,7 @@ class TestRenderMatrixPlanning(unittest.TestCase):
             self.dashboard_with_prometheus_variable(),
         )
         dashboard_response = Mock(status_code=200, json=Mock(return_value={"dashboard": self.dashboard_with_prometheus_variable()}))
-        values_response = Mock(status_code=200, json=Mock(return_value={"data": ["api", "worker"]}))
+        values_response = Mock(status_code=200, json=Mock(return_value={"status": "success", "data": [{"service": "api"}, {"service": "worker"}]}))
         grafana.session.get = Mock(side_effect=[dashboard_response, values_response])
 
         grafana.get_panels([self.timestamp()])
@@ -138,7 +145,7 @@ class TestRenderMatrixPlanning(unittest.TestCase):
         self.assertEqual(service_spec["values_from"], {})
         self.assertEqual([task.variables["service"] for task in grafana.render_tasks], ["api", "worker"])
         api_call = grafana.session.get.call_args_list[1]
-        self.assertIn("/api/datasources/proxy/uid/prom/api/v1/label/service/values", api_call.args[0])
+        self.assertIn("/api/datasources/proxy/uid/prom/api/v1/series", api_call.args[0])
 
     def test_implicit_values_from_uses_modern_prometheus_query_with_dashboard_context(self) -> None:
         grafana = self.manager_from_config(
@@ -161,9 +168,9 @@ class TestRenderMatrixPlanning(unittest.TestCase):
         )
 
         def response_for(url, **kwargs):
-            if "/api/datasources/proxy/uid/prom-main/api/v1/label/pod/values" in url:
-                namespace = kwargs["params"].get("var-namespace")
-                return Mock(status_code=200, json=Mock(return_value={"data": [f"{namespace}-pod"]}))
+            if "/api/datasources/proxy/uid/prom-main/api/v1/series" in url:
+                namespace = "team-a" if 'namespace="team-a"' in kwargs["params"]["match[]"] else "team-b"
+                return Mock(status_code=200, json=Mock(return_value={"status": "success", "data": [{"pod": f"{namespace}-pod"}]}))
             return dashboard_response
 
         grafana.session.get = Mock(side_effect=response_for)
@@ -175,15 +182,66 @@ class TestRenderMatrixPlanning(unittest.TestCase):
             [("team-a", "team-a-pod"), ("team-b", "team-b-pod")],
         )
         first_values_call = grafana.session.get.call_args_list[1]
-        self.assertIn("/api/datasources/proxy/uid/prom-main/api/v1/label/pod/values", first_values_call.args[0])
+        self.assertIn("/api/datasources/proxy/uid/prom-main/api/v1/series", first_values_call.args[0])
         self.assertEqual(
             first_values_call.kwargs["params"]["match[]"],
             'kube_pod_info{cluster="prod", namespace="team-a", job="kube-state-metrics"}',
         )
-        self.assertEqual(first_values_call.kwargs["params"]["var-datasource"], "prom-main")
-        self.assertEqual(first_values_call.kwargs["params"]["var-cluster"], "prod")
-        self.assertEqual(first_values_call.kwargs["params"]["var-job"], "kube-state-metrics")
-        self.assertEqual(first_values_call.kwargs["params"]["var-namespace"], "team-a")
+
+    def test_automatic_dependencies_resolve_in_topological_order_for_each_timestamp(self) -> None:
+        dashboard = self.dashboard()
+        dashboard["templating"] = {"list": [
+            {
+                "name": "namespace", "type": "query",
+                "datasource": {"type": "prometheus", "uid": "prom"},
+                "query": 'label_values(kube_namespace_labels{cluster="$cluster"}, namespace)',
+            },
+            {
+                "name": "pod", "type": "query",
+                "datasource": {"type": "prometheus", "uid": "prom"},
+                "query": 'label_values(kube_pod_info{namespace="${namespace:regex}"}, pod)',
+            },
+        ]}
+        grafana = self.manager_from_config(
+            """
+            dashboards:
+              Demo:
+                grafana_url: https://grafana.example/grafana
+                dash_title: Demo
+                render_matrix:
+                  pod: {}
+                  namespace: {}
+                  cluster: {values: [prod]}
+            """,
+            dashboard,
+        )
+        dashboard_response = Mock(status_code=200, json=Mock(return_value={"dashboard": dashboard}))
+
+        def response_for(url, **kwargs):
+            if "/api/v1/series" not in url:
+                return dashboard_response
+            selector = kwargs["params"]["match[]"]
+            if selector.startswith("kube_namespace_labels"):
+                period = kwargs["params"]["start"]
+                namespace = "period-a" if period == "1700000000" else "period-b"
+                return Mock(status_code=200, json=Mock(return_value={"status": "success", "data": [{"namespace": namespace}]}))
+            namespace = "period-a" if 'namespace="period-a"' in selector else "period-b"
+            return Mock(status_code=200, json=Mock(return_value={"status": "success", "data": [{"pod": f"{namespace}-pod"}]}))
+
+        grafana.session.get = Mock(side_effect=response_for)
+
+        grafana.get_panels([self.timestamp(0), self.timestamp(1)])
+
+        self.assertEqual(
+            [(task.timestamp.id_time, task.variables["namespace"], task.variables["pod"]) for task in grafana.render_tasks],
+            [(0, "period-a", "period-a-pod"), (1, "period-b", "period-b-pod")],
+        )
+        discovery_calls = [call for call in grafana.session.get.call_args_list if "/api/v1/series" in call.args[0]]
+        self.assertEqual(len(discovery_calls), 4)
+        self.assertEqual(
+            [call.kwargs["params"]["start"] for call in discovery_calls],
+            ["1700000000", "1700000000", "1700000001", "1700000001"],
+        )
 
     def test_matrix_dashboard_links_include_static_and_matrix_vars(self) -> None:
         grafana = self.manager_from_config(
@@ -259,9 +317,9 @@ class TestRenderMatrixPlanning(unittest.TestCase):
         dashboard_response = Mock(status_code=200, json=Mock(return_value={"dashboard": dashboard}))
 
         def response_for(url, **kwargs):
-            if "/api/datasources/proxy/uid/prom/api/v1/label/service/values" in url:
-                value = "api" if kwargs["params"].get("var-env") == "prod" else None
-                return Mock(status_code=200, json=Mock(return_value={"data": [] if value is None else [value]}))
+            if "/api/datasources/proxy/uid/prom/api/v1/series" in url:
+                value = "api" if 'env="prod"' in kwargs["params"]["match[]"] else None
+                return Mock(status_code=200, json=Mock(return_value={"status": "success", "data": [] if value is None else [{"service": value}]}))
             return dashboard_response
 
         grafana.session.get = Mock(side_effect=response_for)
@@ -293,7 +351,7 @@ class TestRenderMatrixPlanning(unittest.TestCase):
         )
         dashboard = self.dashboard_with_prometheus_variable()
         dashboard_response = Mock(status_code=200, json=Mock(return_value={"dashboard": dashboard}))
-        empty_values_response = Mock(status_code=200, json=Mock(return_value={"data": []}))
+        empty_values_response = Mock(status_code=200, json=Mock(return_value={"status": "success", "data": []}))
         grafana.session.get = Mock(side_effect=[dashboard_response, empty_values_response])
 
         with self.assertRaisesRegex(ConfigurationError, "render_matrix.variables: no rows resolved"):
@@ -332,7 +390,7 @@ class TestRenderMatrixPlanning(unittest.TestCase):
 
         self.assertEqual(grafana.render_tasks[0].artifact["matrix"]["label"], "prod / prod")
 
-    def test_values_from_invalid_json_response_falls_back_to_dashboard_options(self) -> None:
+    def test_values_from_invalid_json_and_failed_browser_does_not_use_saved_options(self) -> None:
         dashboard = self.dashboard()
         dashboard["templating"] = {"list": [{
             "name": "service", "type": "query", "datasource": {"type": "prometheus", "uid": "prom"},
@@ -354,10 +412,21 @@ class TestRenderMatrixPlanning(unittest.TestCase):
         broken_values_response = Mock(status_code=200, json=Mock(side_effect=ValueError("bad json")))
         grafana.session.get = Mock(side_effect=[dashboard_response, broken_values_response])
 
-        with self.assertLogs("grafconflux._grafana.matrix_discovery", level="WARNING") as captured:
-            grafana.get_panels([self.timestamp()])
+        fallback_result = MatrixValueResult(
+            MatrixDiscoveryStatus.FAILED,
+            [],
+            {
+                "status": "failed", "source": "browser", "method": "test_failure", "timestamp_id": 0,
+                "from": "1700000000000", "to": "1700003600000", "context_vars": [],
+            },
+        )
+        with patch(
+            "grafconflux._grafana.matrix_browser_planning.BrowserMatrixFallback.discover",
+            return_value=fallback_result,
+        ), self.assertLogs("grafconflux._grafana.matrix_discovery", level="WARNING") as captured:
+            with self.assertRaisesRegex(ConfigurationError, "dynamic discovery did not resolve"):
+                grafana.get_panels([self.timestamp()])
 
-        self.assertEqual([task.variables["service"] for task in grafana.render_tasks], ["api", "worker"])
         self.assertIn("invalid JSON", "\n".join(captured.output))
 
     def test_absent_render_matrix_keeps_flat_task_filename(self) -> None:
@@ -485,9 +554,8 @@ class TestRenderMatrixPlanning(unittest.TestCase):
                           prod: [api]
             """))
 
-    def test_later_dependency_is_rejected(self) -> None:
-        with self.assertRaisesRegex(ValueError, "unknown or later dependencies"):
-            GrafanaManager.load_grafana_config(self.config_path("""
+    def test_later_explicit_dependency_is_accepted_for_topological_planning(self) -> None:
+        configs = GrafanaManager.load_grafana_config(self.config_path("""
                 dashboards:
                   Demo:
                     grafana_url: https://grafana.example
@@ -499,6 +567,8 @@ class TestRenderMatrixPlanning(unittest.TestCase):
                       pod:
                         values: [pod-a]
             """))
+
+        self.assertEqual(configs[0].render_matrix["variables"]["service"]["depends_on"], "pod")
 
     def test_values_from_variable_override_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "variables.service.values_from"):
@@ -540,15 +610,14 @@ class TestRenderMatrixPlanning(unittest.TestCase):
             self.dashboard_with_datasource_variable(),
         )
         dashboard_response = Mock(status_code=200, json=Mock(return_value={"dashboard": self.dashboard_with_datasource_variable()}))
-        values_response = Mock(status_code=200, json=Mock(return_value={"data": ["api"]}))
+        values_response = Mock(status_code=200, json=Mock(return_value={"status": "success", "data": [{"service": "api"}]}))
         grafana.session.get = Mock(side_effect=[dashboard_response, values_response])
 
         grafana.get_panels([self.timestamp()])
         grafana.config.full_links = grafana._GrafanaManager__get_full_links([self.timestamp()])
 
         api_call = grafana.session.get.call_args_list[1]
-        self.assertIn("/api/datasources/proxy/uid/Prometheus/api/v1/label/service/values", api_call.args[0])
-        self.assertEqual(api_call.kwargs["params"]["var-ds"], "Prometheus")
+        self.assertIn("/api/datasources/proxy/uid/Prometheus/api/v1/series", api_call.args[0])
         self.assertEqual(grafana.render_tasks[0].variables["ds"], "Prometheus")
         self.assertIn("var-ds=Prometheus", grafana.config.full_links[0])
 
