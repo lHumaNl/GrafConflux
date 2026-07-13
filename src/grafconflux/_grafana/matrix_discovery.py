@@ -9,6 +9,11 @@ from enum import Enum
 from typing import Any
 from urllib.parse import quote
 
+from grafconflux._grafana.matrix_context import (
+    dashboard_current_context,
+    dashboard_variable_current_value,
+)
+
 logger = logging.getLogger(__name__)
 
 ALL_SENTINELS = {"$__all", "__all", "all"}
@@ -68,11 +73,14 @@ class MatrixValueResolver:
         static_vars: dict[str, Any],
     ) -> MatrixValueResult:
         source_name = str(spec.get("grafana_variable") or key)
-        effective_context = self._effective_context(source_name, context, static_vars)
-        cache_key = _cache_key(source_name, timestamp, effective_context)
+        effective_context, default_sources = self._effective_context(
+            source_name, timestamp, context, static_vars,
+        )
+        cache_key = _cache_key(source_name, timestamp, effective_context, default_sources)
         if cache_key in self.cache:
             return self.cache[cache_key]
         result = self._discover(source_name, timestamp, effective_context)
+        result = _with_context_sources(result, default_sources)
         self.cache[cache_key] = result
         _log_result(source_name, timestamp, result)
         return result
@@ -80,15 +88,18 @@ class MatrixValueResolver:
     def _effective_context(
         self,
         source_name: str,
+        timestamp: Any,
         context: dict[str, Any],
         static_vars: dict[str, Any],
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], dict[str, str]]:
         explicit = {**static_vars, **_public_context(context)}
-        defaults = _dashboard_current_context(
+        defaults, default_sources = dashboard_current_context(
             self.dashboard,
             self.dynamic_variable_names | {source_name},
         )
-        return {**defaults, **explicit}
+        used_sources = {name: source for name, source in default_sources.items() if name not in explicit}
+        _log_empty_dashboard_defaults(self.dashboard, self.config, timestamp, defaults, used_sources)
+        return {**defaults, **explicit}, used_sources
 
     def _discover(
         self,
@@ -102,6 +113,11 @@ class MatrixValueResolver:
         )
         if api_result.authoritative or self.browser_fallback is None:
             return api_result
+        logger.info(
+            "Matrix discovery primary adapter did not resolve variable=%s timestamp_id=%s status=%s reason=%s; using browser fallback",
+            safe_discovery_variable(source_name), timestamp.id_time, api_result.status.value,
+            api_result.provenance.get("method"),
+        )
         fallback_result = self.browser_fallback.discover(source_name, variable, timestamp, context)
         if fallback_result.authoritative:
             return fallback_result
@@ -135,10 +151,11 @@ def _prometheus_result(
 ) -> MatrixValueResult:
     parsed = _prometheus_query(variable, context, config, dashboard)
     if parsed is None:
-        return _result(MatrixDiscoveryStatus.UNSUPPORTED, [], source_name, timestamp, context, "grafana_api", "no_supported_adapter")
+        method = _prometheus_adapter_failure(variable, context, config, dashboard)
+        return _result(MatrixDiscoveryStatus.UNSUPPORTED, [], source_name, timestamp, context, "grafana_api", method)
     metric, label, datasource_uid = parsed
     if not datasource_uid:
-        return _result(MatrixDiscoveryStatus.UNRESOLVED, [], source_name, timestamp, context, "grafana_api", "datasource_unresolved")
+        return _result(MatrixDiscoveryStatus.UNRESOLVED, [], source_name, timestamp, context, "grafana_api", "invalid_or_missing_context")
     if session is None:
         return _result(MatrixDiscoveryStatus.UNRESOLVED, [], source_name, timestamp, context, "grafana_api", "session_unavailable")
     method = "prometheus_series" if metric else "prometheus_label_values"
@@ -167,6 +184,41 @@ def _prometheus_query(
         return None
     parsed = _prometheus_label_values_query(variable, context)
     return None if parsed is None else (parsed[0], parsed[1], datasource_uid)
+
+
+def _prometheus_adapter_failure(
+    variable: dict[str, Any] | None,
+    context: dict[str, Any],
+    config: Any,
+    dashboard: dict[str, Any],
+) -> str:
+    if not isinstance(variable, dict) or variable.get("type") != "query" or config is None:
+        return "adapter_not_applicable"
+    datasource_type, datasource_uid = _resolved_datasource_type_uid(
+        variable.get("datasource"), context, config, dashboard,
+    )
+    if str(datasource_type).lower() != PROMETHEUS_DATASOURCE_TYPE:
+        return "adapter_not_applicable"
+    if not datasource_uid or _has_missing_context(variable, context):
+        return "invalid_or_missing_context"
+    return "unsupported_query"
+
+
+def _has_missing_context(variable: dict[str, Any], context: dict[str, Any]) -> bool:
+    relevant = (variable.get("datasource"), variable.get("query"), variable.get("definition"))
+    references = set(_variable_references(relevant))
+    return any(name not in context for name in references if not name.startswith("__"))
+
+
+def _variable_references(value: Any) -> list[str]:
+    if isinstance(value, str):
+        pattern = r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::[^}]+)?}|\$([A-Za-z_][A-Za-z0-9_]*)|\[\[([A-Za-z_][A-Za-z0-9_]*)]]"
+        return [next(group for group in match.groups() if group) for match in re.finditer(pattern, value)]
+    if isinstance(value, (list, tuple)):
+        return [name for item in value for name in _variable_references(item)]
+    if isinstance(value, dict):
+        return [name for item in value.values() for name in _variable_references(item)]
+    return []
 
 
 def _prometheus_response_result(
@@ -260,6 +312,11 @@ def _combined_failure(api_result: MatrixValueResult, fallback_result: MatrixValu
     return MatrixValueResult(status, [], provenance)
 
 
+def _with_context_sources(result: MatrixValueResult, sources: dict[str, str]) -> MatrixValueResult:
+    provenance = {**result.provenance, "dashboard_context_sources": dict(sorted(sources.items()))}
+    return MatrixValueResult(result.status, result.values, provenance)
+
+
 def _log_result(variable: str, timestamp: Any, result: MatrixValueResult) -> None:
     log = logger.info if result.authoritative else logger.warning
     log(
@@ -290,11 +347,16 @@ def safe_discovery_variable(variable: str) -> str:
     return "<sensitive-variable>" if SENSITIVE_NAME_PATTERN.search(variable) else variable
 
 
-def _cache_key(source_name: str, timestamp: Any, context: dict[str, Any]) -> tuple[Any, ...]:
+def _cache_key(
+    source_name: str,
+    timestamp: Any,
+    context: dict[str, Any],
+    context_sources: dict[str, str] | None = None,
+) -> tuple[Any, ...]:
     normalized_context = tuple(sorted((str(key), repr(value)) for key, value in context.items()))
     return (
         source_name, timestamp.id_time, timestamp.start_time_timestamp,
-        timestamp.end_time_timestamp, normalized_context,
+        timestamp.end_time_timestamp, normalized_context, tuple(sorted((context_sources or {}).items())),
     )
 
 
@@ -303,29 +365,21 @@ def _dashboard_variable(dashboard: dict[str, Any], variable_name: str) -> dict[s
     return next((item for item in variables if item.get("name") == variable_name), None)
 
 
-def _dashboard_current_context(dashboard: dict[str, Any], exclude: set[str]) -> dict[str, str]:
-    context: dict[str, str] = {}
-    for variable in dashboard.get("templating", {}).get("list", []):
-        name = variable.get("name") if isinstance(variable, dict) else None
-        value = _dashboard_variable_current_value(variable)
-        if name and name not in exclude and value is not None:
-            context[str(name)] = value
-    return context
-
-
-def _dashboard_variable_current_value(variable: dict[str, Any] | None) -> str | None:
-    current = variable.get("current") if isinstance(variable, dict) else None
-    if not isinstance(current, dict):
-        return None
-    values = _normalize_values(current.get("value") or current.get("text"))
-    values = [value for value in values if value.lower() not in ALL_SENTINELS]
-    return None if not values else values[0] if len(values) == 1 else "|".join(values)
-
-
-def _normalize_values(value: Any) -> list[str]:
-    if isinstance(value, list):
-        return [item for raw in value for item in _normalize_values(raw)]
-    return [] if value in (None, "") or isinstance(value, (dict, tuple, set)) else [str(value)]
+def _log_empty_dashboard_defaults(
+    dashboard: dict[str, Any],
+    config: Any,
+    timestamp: Any,
+    defaults: dict[str, str],
+    sources: dict[str, str],
+) -> None:
+    dashboard_name = dashboard.get("title") or getattr(config, "name", None) or "<unknown>"
+    for name, source in sources.items():
+        if defaults.get(name) == "":
+            logger.info(
+                "Using empty dashboard default dashboard=%s variable=%s timestamp_id=%s source=%s",
+                _safe_discovery_value(str(dashboard_name)), safe_discovery_variable(name),
+                timestamp.id_time, source,
+            )
 
 
 def _substitute_query_vars(query: str, context: dict[str, Any]) -> str:
@@ -381,7 +435,7 @@ def _resolved_datasource_type_uid(
         return _resolved_context_value(datasource_type, context), _resolved_context_value(datasource_uid, context)
     variable = _dashboard_variable(dashboard, ref_name)
     resolved_type = _datasource_variable_type(variable) or _resolved_context_value(datasource_type, context)
-    resolved_uid = _resolved_context_value(datasource_uid, context) or _dashboard_variable_current_value(variable)
+    resolved_uid = _resolved_context_value(datasource_uid, context) or dashboard_variable_current_value(variable)
     return resolved_type, resolved_uid
 
 

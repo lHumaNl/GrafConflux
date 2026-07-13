@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any, Callable
 from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
 from grafconflux._grafana.browser_session import GrafanaBrowserSession
+from grafconflux._grafana.matrix_browser_dom import open_variable_script, read_variable_options_script
 from grafconflux._grafana.matrix_discovery import (
     MatrixDiscoveryStatus,
     MatrixValueResult,
@@ -67,6 +69,10 @@ class BrowserMatrixFallback:
                 self._wait_for_response(browser, collector)
             if collector.result is not None:
                 return collector.result
+            logger.info(
+                "Matrix planning using DOM fallback variable=%s timestamp_id=%s network_diagnostics=%s",
+                safe_discovery_variable(variable_name), timestamp.id_time, collector.diagnostics(),
+            )
             values = self._dom_values(browser, variable_name)
         except Exception as error:
             logger.warning(
@@ -133,13 +139,13 @@ class BrowserMatrixFallback:
 
     @staticmethod
     def _dom_values(browser: Any, variable_name: str) -> list[str]:
-        scope = browser.page.evaluate(_open_variable_script(), variable_name)
+        scope = browser.page.evaluate(open_variable_script(), variable_name)
         if not isinstance(scope, dict):
             return []
         wait = getattr(browser.page, "wait_for_timeout", None)
         if callable(wait):
             wait(PLANNING_POLL_MS)
-        values = browser.page.evaluate(_read_variable_options_script(), scope)
+        values = browser.page.evaluate(read_variable_options_script(), scope)
         if not isinstance(values, list):
             return []
         return _dedupe([
@@ -192,12 +198,22 @@ class _PlanningResponseCollector:
         self.ds_query_signature = _ds_variable_query_signature(self.variable, self.query)
         self.ds_query_ref_id: str | None = None
         self.result: MatrixValueResult | None = None
+        self.rejections: set[str] = set()
+
+    def diagnostics(self) -> list[str]:
+        if not self.datasource_uid:
+            self.rejections.add("invalid_or_missing_context")
+        return sorted(self.rejections) or ["no_correlated_network_candidate"]
 
     def collect(self, page: Any) -> _ListenerScope:
         return _ListenerScope(page, self._record_response)
 
     def _record_response(self, response: Any) -> None:
-        if self.result is not None or getattr(response, "status", None) != 200:
+        if self.result is not None:
+            return
+        if getattr(response, "status", None) != 200:
+            if _is_metadata_candidate(response):
+                self.rejections.add("http_status")
             return
         method = self._correlated_method(response)
         if method is None:
@@ -205,6 +221,7 @@ class _PlanningResponseCollector:
         try:
             payload = response.json()
         except Exception:
+            self.rejections.add("invalid_response_payload")
             return
         if method in {"prometheus_label_values", "prometheus_series"} and not _successful_payload(payload):
             self.result = _result(
@@ -214,6 +231,7 @@ class _PlanningResponseCollector:
             return
         values = self._values(payload, method)
         if values is None:
+            self.rejections.add("invalid_response_payload")
             return
         status = MatrixDiscoveryStatus.RESOLVED if values else MatrixDiscoveryStatus.EMPTY
         self.result = _result(
@@ -221,18 +239,41 @@ class _PlanningResponseCollector:
         )
 
     def _correlated_method(self, response: Any) -> str | None:
-        path = urlparse(str(getattr(response, "url", ""))).path
-        if not self.datasource_uid:
-            return None
-        if path.endswith(f"/api/v1/label/{self.target_label}/values") and self._proxy_request_matches(response):
-            return "prometheus_label_values"
-        if path.endswith("/api/v1/series") and self._proxy_request_matches(response) and self._series_request_matches(response):
-            return "prometheus_series"
+        request_url = _response_request_url(response)
+        path = urlparse(request_url).path
+        route = _prometheus_metadata_route(request_url)
+        if route is not None:
+            return self._correlated_metadata_method(response, request_url, route)
+        if _is_metadata_candidate(response):
+            self.rejections.add("rejected_route")
         if path.endswith("/api/ds/query"):
             ref_id = self._ds_query_ref_id(response)
             if ref_id is not None:
                 self.ds_query_ref_id = ref_id
                 return "prometheus_ds_query"
+            self.rejections.add("query_correlation")
+        return None
+
+    def _correlated_metadata_method(
+        self, response: Any, request_url: str, route: tuple[str, str],
+    ) -> str | None:
+        datasource_uid, endpoint = route
+        request = getattr(response, "request", None)
+        checks = (
+            (str(getattr(request, "method", "")).upper() != "GET", "request_method_correlation"),
+            (not self.datasource_uid, "invalid_or_missing_context"),
+            (datasource_uid != self.datasource_uid, "datasource_correlation"),
+            (not _url_time_matches(request_url, self.timestamp), "time_correlation"),
+        )
+        for rejected, reason in checks:
+            if rejected:
+                self.rejections.add(reason)
+                return None
+        if endpoint == f"label/{self.target_label}/values":
+            return "prometheus_label_values"
+        if endpoint == "series" and self._series_request_matches(response):
+            return "prometheus_series"
+        self.rejections.add("selector_or_label_correlation")
         return None
 
     def _series_request_matches(self, response: Any) -> bool:
@@ -240,13 +281,6 @@ class _PlanningResponseCollector:
             return False
         request_url = str(getattr(getattr(response, "request", None), "url", ""))
         return self.query[0] in parse_qs(urlparse(request_url).query).get("match[]", [])
-
-    def _proxy_request_matches(self, response: Any) -> bool:
-        request_url = _response_request_url(response)
-        return (
-            _proxy_datasource_uid(request_url) == self.datasource_uid
-            and _url_time_matches(request_url, self.timestamp)
-        )
 
     def _ds_query_ref_id(self, response: Any) -> str | None:
         request = getattr(response, "request", None)
@@ -293,12 +327,23 @@ def _response_request_url(response: Any) -> str:
     return str(request_url or getattr(response, "url", ""))
 
 
-def _proxy_datasource_uid(url: str) -> str | None:
-    marker = "/api/datasources/proxy/uid/"
+def _prometheus_metadata_route(url: str) -> tuple[str, str] | None:
     path = urlparse(url).path
-    if marker not in path:
+    match = re.search(
+        r"/api/datasources/(?:proxy/uid/([^/]+)/api/v1|uid/([^/]+)/resources/api/v1)/"
+        r"(series|label/[A-Za-z_][A-Za-z0-9_]*/values)$",
+        path,
+    )
+    if match is None:
         return None
-    return unquote(path.split(marker, 1)[1].split("/", 1)[0])
+    return unquote(match.group(1) or match.group(2)), match.group(3)
+
+
+def _is_metadata_candidate(response: Any) -> bool:
+    path = urlparse(_response_request_url(response)).path
+    return "/api/datasources/" in path and (
+        path.endswith("/series") or "/label/" in path or path.endswith("/api/ds/query")
+    )
 
 
 def _url_time_matches(url: str, timestamp: Any) -> bool:
@@ -416,67 +461,3 @@ def _valid_frame_columns(fields: Any, columns: Any) -> bool:
     if len(fields) != len(columns) or not all(isinstance(column, list) for column in columns):
         return False
     return all(isinstance(field, dict) and isinstance(field.get("name"), str) for field in fields)
-
-
-def _open_variable_script() -> str:
-    return """
-    (name) => {
-      const normalize = (value) => (value || '').trim().toLowerCase();
-      const candidates = Array.from(document.querySelectorAll('button, [role="button"]'));
-      const expected = normalize(name);
-      const exactIdentities = new Set([
-        expected,
-        `dashboard variable ${expected}`,
-        `template-variable-${expected}`,
-        `variable-${expected}`,
-      ]);
-      const matches = candidates.filter((element) => {
-        if (element.offsetParent === null) return false;
-        const identities = ['data-variable', 'name', 'aria-label', 'data-testid']
-          .map((attribute) => normalize(element.getAttribute(attribute)));
-        const labelledBy = element.getAttribute('aria-labelledby');
-        const label = labelledBy ? document.getElementById(labelledBy) : null;
-        if (label) identities.push(normalize(label.textContent));
-        const containerLabel = element.closest('[data-variable]');
-        if (containerLabel) identities.push(normalize(containerLabel.getAttribute('data-variable')));
-        const wrapper = element.closest('[data-testid*="template-variable"]');
-        const wrapperLabel = wrapper && wrapper.querySelector('label, [data-testid*="label"]');
-        if (wrapperLabel) identities.push(normalize(wrapperLabel.textContent));
-        return identities.some((identity) => exactIdentities.has(identity));
-      });
-      if (matches.length !== 1) return null;
-      const target = matches[0];
-      target.click();
-      return {
-        popupId: target.getAttribute('aria-controls') || '',
-        controlId: target.id || '',
-      };
-    }
-    """
-
-
-def _read_variable_options_script() -> str:
-    return """
-    (scope) => {
-      const control = scope.controlId ? document.getElementById(scope.controlId) : null;
-      const popupId = (control && control.getAttribute('aria-controls')) || scope.popupId;
-      const roots = [];
-      if (popupId) {
-        const popup = document.getElementById(popupId);
-        if (popup && popup.offsetParent !== null) roots.push(popup);
-      }
-      if (!roots.length && scope.controlId) {
-        roots.push(...document.querySelectorAll(
-          `[role="listbox"][aria-labelledby="${CSS.escape(scope.controlId)}"], ` +
-          `[role="menu"][aria-labelledby="${CSS.escape(scope.controlId)}"]`
-        ));
-      }
-      if (roots.length !== 1) return [];
-      return Array.from(roots[0].querySelectorAll(
-        '[role="option"], [role="menuitem"], [data-testid*="variable-option"]'
-      ))
-        .filter((element) => element.offsetParent !== null)
-        .map((element) => (element.textContent || '').trim())
-        .filter(Boolean);
-    }
-    """

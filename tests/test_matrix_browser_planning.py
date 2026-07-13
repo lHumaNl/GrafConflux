@@ -11,6 +11,77 @@ from grafconflux._grafana.matrix_discovery import MatrixDiscoveryStatus
 
 
 class TestBrowserMatrixPlanningCorrelation(unittest.TestCase):
+    def test_resources_series_route_is_accepted_with_exact_correlation(self) -> None:
+        response = _metadata_response(
+            "resources",
+            datasource_uid="prom",
+            selector='kube_pod_info{namespace="app"}',
+        )
+
+        result = self.fallback([response]).discover(
+            "pod", _pod_variable(), _timestamp(), {"namespace": "app"},
+        )
+
+        self.assertEqual(result.status, MatrixDiscoveryStatus.RESOLVED)
+        self.assertEqual(result.values, ["api-1"])
+
+    def test_resources_label_route_is_accepted(self) -> None:
+        params = urlencode({"start": "1700000000", "end": "1700003600"})
+        url = (
+            "https://grafana.example/grafana/api/datasources/uid/prom/"
+            f"resources/api/v1/label/service/values?{params}"
+        )
+        variable = {
+            "name": "service", "type": "query",
+            "datasource": {"type": "prometheus", "uid": "prom"},
+            "query": "label_values(service)",
+        }
+
+        result = self.fallback([_response(url, {"status": "success", "data": ["api"]})]).discover(
+            "service", variable, _timestamp(), {},
+        )
+
+        self.assertEqual(result.values, ["api"])
+
+    def test_resources_series_route_keeps_uid_selector_and_time_strict(self) -> None:
+        candidates = (
+            _metadata_response("resources", datasource_uid="other"),
+            _metadata_response("resources", selector="up"),
+            _metadata_response("resources", end="1700003601"),
+        )
+
+        for response in candidates:
+            with self.subTest(url=response.url):
+                result = self.fallback([response]).discover(
+                    "pod", _pod_variable(), _timestamp(), {"namespace": "app"},
+                )
+
+                self.assertEqual(result.status, MatrixDiscoveryStatus.UNRESOLVED)
+
+    def test_rejected_network_candidates_are_logged_before_dom_fallback(self) -> None:
+        responses = [
+            _metadata_response("invalid"),
+            _metadata_response("resources", datasource_uid="other"),
+            _metadata_response("resources", selector="up"),
+            _metadata_response("resources", end="1700003601"),
+        ]
+
+        with self.assertLogs(
+            "grafconflux._grafana.matrix_browser_planning", level="INFO",
+        ) as logs:
+            result = self.fallback(responses).discover(
+                "pod", _pod_variable(), _timestamp(), {"namespace": "app"},
+            )
+
+        self.assertEqual(result.status, MatrixDiscoveryStatus.UNRESOLVED)
+        diagnostic = "\n".join(logs.output)
+        self.assertIn("DOM fallback", diagnostic)
+        self.assertIn("rejected_route", diagnostic)
+        self.assertIn("datasource_correlation", diagnostic)
+        self.assertIn("selector_or_label_correlation", diagnostic)
+        self.assertIn("time_correlation", diagnostic)
+        self.assertNotIn("https://", diagnostic)
+
     def test_series_response_requires_complete_period_boundaries(self) -> None:
         for missing_boundary in ("start", "end"):
             with self.subTest(missing_boundary=missing_boundary):
@@ -397,6 +468,23 @@ def _dom_fixture(link_target: bool) -> str:
 def _proxy_url(path: str, params: dict[str, str]) -> str:
     base = "https://grafana.example/grafana/api/datasources/proxy/uid/prom"
     return f"{base}{path}?{urlencode(params)}"
+
+
+def _metadata_response(
+    route: str,
+    datasource_uid: str = "prom",
+    selector: str = 'kube_pod_info{namespace="app"}',
+    end: str = "1700003600",
+) -> SimpleNamespace:
+    if route == "resources":
+        route_path = f"/api/datasources/uid/{datasource_uid}/resources/api/v1/series"
+    elif route == "proxy":
+        route_path = f"/api/datasources/proxy/uid/{datasource_uid}/api/v1/series"
+    else:
+        route_path = f"/api/datasources/uid/{datasource_uid}/api/v1/series"
+    params = {"match[]": selector, "start": "1700000000", "end": end}
+    url = f"https://grafana.example/grafana{route_path}?{urlencode(params)}"
+    return _response(url, {"status": "success", "data": [{"pod": "api-1"}]})
 
 
 def _response(url: str, payload: dict) -> SimpleNamespace:
