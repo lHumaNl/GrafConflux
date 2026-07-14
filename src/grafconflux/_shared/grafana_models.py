@@ -9,6 +9,7 @@ from grafconflux._shared.confluence_settings import (
     confluence_rendering_settings_from_metadata,
 )
 from grafconflux._shared.time import GrafanaTimeDownloader, GrafanaTimeUploader
+from grafconflux._shared.presentation import PRESENTATION_KEYS, default_hidden, display_value
 
 logger = logging.getLogger('grafconflux.grafana')
 
@@ -70,32 +71,119 @@ class ConfigurationError(ValueError):
     """Raised when a dashboard lookup configuration is invalid."""
 
 
-def _validated_vars(dashboard_name: str, config: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+def _validated_vars(
+    dashboard_name: str,
+    config: Dict[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any], Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]], Dict[str, str]]:
     raw_vars = config.get('vars')
     if raw_vars is None:
-        return None, {}
+        return None, {}, {}, {}, {}
     if not isinstance(raw_vars, dict):
         raise ConfigurationError(f'dashboards.{dashboard_name}.vars: expected mapping.')
     variables: Dict[str, Any] = {}
     datasource_vars: Dict[str, Any] = {}
+    presentation: Dict[str, Dict[str, Any]] = {}
+    lookups: Dict[str, Dict[str, Any]] = {}
+    datasource_names: Dict[str, str] = {}
     for name, value in raw_vars.items():
         if not isinstance(name, str) or not name:
             raise ConfigurationError(f'dashboards.{dashboard_name}.vars: variable keys must be non-empty strings.')
-        variables[name] = _validated_var_value(dashboard_name, name, value, datasource_vars)
-    return variables, datasource_vars
+        raw_value, metadata, lookup, datasource_name = _validated_var_value(dashboard_name, name, value, datasource_vars)
+        variables[name] = raw_value
+        presentation[name] = metadata
+        if lookup:
+            lookups[name] = lookup
+        if datasource_name:
+            datasource_names[name] = datasource_name
+    return variables, datasource_vars, presentation, lookups, datasource_names
 
 
-def _validated_var_value(dashboard_name: str, name: str, value: Any, datasource_vars: Dict[str, Any]) -> Any:
+def _validated_var_value(
+    dashboard_name: str,
+    name: str,
+    value: Any,
+    datasource_vars: Dict[str, Any],
+) -> Tuple[Any, Dict[str, Any], Optional[Dict[str, Any]], Optional[str]]:
     if not isinstance(value, dict):
-        return value
-    if set(value) - {'is_datasource', 'value'}:
+        return value, _var_presentation(name, value, {}), None, None
+    allowed_keys = {'is_datasource', 'lookup', 'value', 'name'} | PRESENTATION_KEYS
+    if set(value) - allowed_keys:
         raise ConfigurationError(f'dashboards.{dashboard_name}.vars.{name}: unknown static var object key.')
-    if value.get('is_datasource') is not True:
+    if 'is_datasource' in value and value.get('is_datasource') is not True:
         raise ConfigurationError(f'dashboards.{dashboard_name}.vars.{name}.is_datasource: expected true.')
-    if value.get('value') in (None, ''):
+    _validate_var_lookup(dashboard_name, name, value)
+    _validate_datasource_name(dashboard_name, name, value)
+    use_current = 'value' not in value and 'name' not in value
+    if use_current and not (value.get('lookup') and value.get('is_datasource') is True):
         raise ConfigurationError(f'dashboards.{dashboard_name}.vars.{name}.value: expected non-empty value.')
-    datasource_vars[name] = value['value']
-    return value['value']
+    if 'value' in value and value.get('value') in (None, ''):
+        raise ConfigurationError(f'dashboards.{dashboard_name}.vars.{name}.value: expected non-empty value.')
+    if 'value' in value and not _valid_var_object_value(value['value']):
+        raise ConfigurationError(f'dashboards.{dashboard_name}.vars.{name}.value: expected scalar or non-empty scalar list.')
+    _validate_var_presentation(dashboard_name, name, value)
+    raw_value = value.get('value')
+    if value.get('is_datasource') is True:
+        datasource_vars[name] = raw_value
+    lookup = None
+    if value.get('lookup'):
+        lookup = {
+            'lookup': value['lookup'],
+            'is_datasource': value.get('is_datasource') is True,
+            'use_current': use_current,
+        }
+    metadata = _var_presentation(name, raw_value, value)
+    if value.get('name'):
+        metadata['datasource_name'] = value['name']
+    return raw_value, metadata, lookup, value.get('name')
+
+
+def _validate_var_lookup(dashboard_name: str, name: str, spec: Dict[str, Any]) -> None:
+    if 'lookup' in spec and (not isinstance(spec['lookup'], str) or not spec['lookup']):
+        raise ConfigurationError(f'dashboards.{dashboard_name}.vars.{name}.lookup: expected non-empty string.')
+
+
+def _validate_datasource_name(dashboard_name: str, name: str, spec: Dict[str, Any]) -> None:
+    path = f'dashboards.{dashboard_name}.vars.{name}'
+    if 'name' in spec and (not isinstance(spec['name'], str) or not spec['name']):
+        raise ConfigurationError(f'{path}.name: expected non-empty string.')
+    if 'name' in spec and spec.get('is_datasource') is not True:
+        raise ConfigurationError(f'{path}.name: requires is_datasource: true.')
+    if 'name' in spec and 'value' in spec:
+        raise ConfigurationError(f'{path}: value and name are mutually exclusive.')
+
+
+def _valid_var_object_value(value: Any) -> bool:
+    if isinstance(value, list):
+        return bool(value) and all(item not in (None, '') and not isinstance(item, (dict, list)) for item in value)
+    return not isinstance(value, (dict, tuple, set))
+
+
+def _validate_var_presentation(dashboard_name: str, name: str, spec: Dict[str, Any]) -> None:
+    path = f'dashboards.{dashboard_name}.vars.{name}'
+    if 'hide' in spec and not isinstance(spec['hide'], bool):
+        raise ConfigurationError(f'{path}.hide: expected boolean.')
+    if 'display_name' in spec and (not isinstance(spec['display_name'], str) or not spec['display_name']):
+        raise ConfigurationError(f'{path}.display_name: expected non-empty string.')
+    _validate_value_aliases(path, spec.get('value_aliases', {}))
+
+
+def _validate_value_aliases(path: str, aliases: Any) -> None:
+    if not isinstance(aliases, dict):
+        raise ConfigurationError(f'{path}.value_aliases: expected mapping of non-empty strings.')
+    if not all(isinstance(key, str) and key and isinstance(item, str) and item for key, item in aliases.items()):
+        raise ConfigurationError(f'{path}.value_aliases: expected mapping of non-empty strings.')
+
+
+def _var_presentation(name: str, raw_value: Any, spec: Dict[str, Any]) -> Dict[str, Any]:
+    aliases = dict(spec.get('value_aliases') or {})
+    return {
+        'raw_value': raw_value,
+        'display_value': display_value(raw_value, aliases),
+        'display_name': spec.get('display_name', name),
+        'value_aliases': aliases,
+        'hide': spec.get('hide', default_hidden(raw_value, aliases)),
+        'hide_explicit': 'hide' in spec,
+    }
 
 
 @dataclass(frozen=True)
@@ -308,6 +396,8 @@ class GrafanaConfigBase(ABC):
         self.folder_title: Optional[str] = None
         self.matrix_dashboard_links: List[Dict[str, Any]] = []
         self.render_matrix: Optional[Dict[str, Any]] = None
+        self.vars_presentation: Dict[str, Dict[str, Any]] = {}
+        self.has_vars_presentation_metadata: bool = False
         self.confluence_rendering: ConfluenceRenderingSettings = ConfluenceRenderingSettings()
 
 
@@ -330,6 +420,8 @@ class GrafanaConfigUploader(GrafanaConfigBase):
         self.backup_dashboard_links: List[str] = config.get('backup_dashboard_links', []) or []
         self.matrix_dashboard_links: List[Dict[str, Any]] = config.get('matrix_dashboard_links', []) or []
         self.render_matrix: Optional[Dict[str, Any]] = config.get('render_matrix')
+        self.has_vars_presentation_metadata = 'vars_presentation' in config
+        self.vars_presentation = config.get('vars_presentation', {}) or {}
         self.confluence_rendering = confluence_rendering_settings_from_metadata(config)
         self.charts_path: str = config['charts_path']; self.timestamps: List[GrafanaTimeUploader] = []
         for timestamp in config['timestamps']:
@@ -402,7 +494,10 @@ class GrafanaConfigDownloader(GrafanaConfigBase):
         self.snapshot_store_dashboard_json: bool = _validated_bool_config(self.name, config, 'snapshot_store_dashboard_json', True)
         self.firefox_driver_preload_time: float = config.get('firefox_driver_preload_time', 2.5)
         self.timeout: int = config.get('timeout', 30); self.tz: Optional[str] = config.get('tz', None)
-        self.threads: int = config.get('threads', 4); self.vars, self.datasource_vars = _validated_vars(name, config)
+        self.threads: int = config.get('threads', 4)
+        self.vars, self.datasource_vars, self.vars_presentation, self.var_lookups, self.datasource_names = _validated_vars(name, config)
+        self._var_lookups_resolved: bool = False
+        self._datasource_names_resolved: bool = False
         self.playwright_browser: Optional[str] = config.get('playwright_browser', None)
         self.playwright_browser_channel: Optional[str] = config.get('playwright_browser_channel', None)
         self.playwright_browser_executable_path: Optional[str] = config.get('playwright_browser_executable_path', None)

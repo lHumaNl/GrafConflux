@@ -10,6 +10,7 @@ from string import Formatter
 from typing import Any
 
 from grafconflux._shared.grafana_models import ConfigurationError, Panel, PanelDescriptor, PanelRenderTask
+from grafconflux._shared.presentation import display_value
 
 DEFAULT_MAX_VARIANT_VALUES = 20
 PANEL_VARIANTS_KEY = "panel_variants"
@@ -326,9 +327,10 @@ def _effective_matrix_metadata(matrix: dict[str, Any], variant: dict[str, Any]) 
     effective = dict(matrix)
     effective["grafana_variables"] = _effective_grafana_variables(matrix, variant)
     effective["context_path"] = _effective_context_path(matrix, effective["grafana_variables"])
+    effective["raw_variables"] = _effective_raw_variables(effective["context_path"], matrix)
     effective["variables"] = _effective_alias_variables(effective["context_path"], matrix)
     effective["group"] = _context_group(matrix.get("group"), effective["context_path"])
-    effective["label"] = _context_label(effective["context_path"])
+    effective["label"] = _context_label(effective["context_path"]) or effective.get("neutral_label", "Matrix")
     return effective
 
 
@@ -339,24 +341,42 @@ def _effective_context_path(matrix: dict[str, Any], variables: dict[str, Any]) -
         grafana_variable = str(updated.get("grafana_variable") or updated.get("key") or "")
         key = str(updated.get("key") or "")
         if grafana_variable in variables:
-            updated["value"] = variables[grafana_variable]
+            _update_context_value(updated, variables[grafana_variable])
         elif key in variables:
-            updated["value"] = variables[key]
+            _update_context_value(updated, variables[key])
         context_path.append(updated)
     return context_path
 
 
 def _effective_alias_variables(context_path: list[dict[str, Any]], matrix: dict[str, Any]) -> dict[str, Any]:
     if context_path:
-        return {str(item.get("label") or item.get("key") or "Variable"): item.get("value") for item in context_path}
+        return {
+            str(item.get("label") or item.get("key") or "Variable"): item.get("display_value", item.get("value"))
+            for item in context_path
+            if item.get("hidden") is not True
+        }
     return dict(matrix.get("variables") or {})
+
+
+def _effective_raw_variables(context_path: list[dict[str, Any]], matrix: dict[str, Any]) -> dict[str, Any]:
+    if not context_path:
+        return dict(matrix.get("raw_variables") or {})
+    return {
+        str(item.get("key")): item.get("raw_value", item.get("value"))
+        for item in context_path
+        if item.get("key")
+    }
 
 
 def _context_group(current_group: Any, context_path: list[dict[str, Any]]) -> str | None:
     if not current_group or not context_path:
         return current_group
     group_parts = [part.strip() for part in str(current_group).split(",") if part.strip()]
-    by_label = {str(item.get("label") or item.get("key") or "Variable"): item.get("value") for item in context_path}
+    by_label = {
+        str(item.get("label") or item.get("key") or "Variable"): item.get("display_value", item.get("value"))
+        for item in context_path
+        if item.get("hidden") is not True
+    }
     updated_parts = []
     for part in group_parts:
         label, _, _ = part.partition(":")
@@ -366,7 +386,17 @@ def _context_group(current_group: Any, context_path: list[dict[str, Any]]) -> st
 
 
 def _context_label(context_path: list[dict[str, Any]]) -> str:
-    return ", ".join(f"{item.get('label') or item.get('key')}: {item.get('value')}" for item in context_path)
+    return ", ".join(
+        f"{item.get('label') or item.get('key')}: {item.get('display_value', item.get('value'))}"
+        for item in context_path
+        if item.get("hidden") is not True
+    )
+
+
+def _update_context_value(item: dict[str, Any], raw_value: Any) -> None:
+    item["value"] = raw_value
+    item["raw_value"] = raw_value
+    item["display_value"] = display_value(raw_value, item.get("value_aliases") or {})
 
 
 def _matrix_variant_display_title(panel_title: str, matrix: dict[str, Any], variant: dict[str, Any]) -> str:

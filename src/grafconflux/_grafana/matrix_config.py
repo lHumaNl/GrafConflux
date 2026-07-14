@@ -8,6 +8,7 @@ from typing import Any
 
 from grafconflux._grafana.matrix_dependencies import configured_dependencies
 from grafconflux._shared.grafana_models import ConfigurationError
+from grafconflux._shared.presentation import display_name, resolved_hidden
 
 RENDER_MATRIX_KEY = "render_matrix"
 DEFAULT_MAX_MATRIX_VALUES = 50
@@ -120,13 +121,15 @@ def _validate_group_by(dashboard_name: str, matrix: dict[str, Any], variables: d
 
 def _validate_variable_specs(dashboard_name: str, variables: dict[str, Any]) -> None:
     aliases: set[str] = set()
+    raw_keys = set(variables)
     for key, spec in variables.items():
         if not isinstance(key, str) or not key:
             raise ConfigurationError(_path(dashboard_name, "variables") + ": variable keys must be non-empty strings.")
         if not isinstance(spec, dict):
             raise ConfigurationError(_path(dashboard_name, f"variables.{key}") + ": expected mapping.")
         _validate_grafana_variable(dashboard_name, key, spec)
-        _validate_alias(dashboard_name, key, spec, aliases)
+        _validate_presentation(dashboard_name, key, spec)
+        _validate_alias(dashboard_name, key, spec, aliases, raw_keys)
         _validate_value_source(dashboard_name, key, spec)
         _validate_dependencies(dashboard_name, key, spec, variables)
 
@@ -141,6 +144,14 @@ def _validate_grafana_variable(dashboard_name: str, key: str, spec: dict[str, An
     value = spec.get("grafana_variable")
     if value not in (None, "") and not isinstance(value, str):
         raise ConfigurationError(_path(dashboard_name, f"variables.{key}.grafana_variable") + ": expected non-empty string.")
+    lookup = spec.get("lookup")
+    if lookup is not None and (not isinstance(lookup, str) or not lookup):
+        raise ConfigurationError(_path(dashboard_name, f"variables.{key}.lookup") + ": expected non-empty string.")
+    if lookup and value:
+        raise ConfigurationError(
+            _path(dashboard_name, f"variables.{key}.lookup")
+            + ": lookup and grafana_variable are mutually exclusive."
+        )
 
 
 def _validate_dependencies(
@@ -157,13 +168,43 @@ def _validate_dependencies(
         raise ConfigurationError(_path(dashboard_name, f"variables.{key}.depends_on") + f": unknown dependencies {unknown}.")
 
 
-def _validate_alias(dashboard_name: str, key: str, spec: dict[str, Any], aliases: set[str]) -> None:
-    alias = spec.get("alias", key)
+def _validate_alias(
+    dashboard_name: str,
+    key: str,
+    spec: dict[str, Any],
+    aliases: set[str],
+    raw_keys: set[str],
+) -> None:
+    if "alias" in spec and "display_name" in spec and spec["alias"] != spec["display_name"]:
+        raise ConfigurationError(
+            _path(dashboard_name, f"variables.{key}.alias")
+            + ": alias and display_name cannot have different values."
+        )
+    alias = spec.get("display_name", spec.get("alias", key))
     if not isinstance(alias, str) or not alias:
         raise ConfigurationError(_path(dashboard_name, f"variables.{key}.alias") + ": expected non-empty string.")
+    if alias in raw_keys and alias != key:
+        raise ConfigurationError(
+            _path(dashboard_name, f"variables.{key}.alias")
+            + f": display name '{alias}' collides with raw matrix variable '{alias}'."
+        )
     if alias in aliases:
         raise ConfigurationError(_path(dashboard_name, f"variables.{key}.alias") + ": duplicate metadata alias.")
     aliases.add(alias)
+
+
+def _validate_presentation(dashboard_name: str, key: str, spec: dict[str, Any]) -> None:
+    path = _path(dashboard_name, f"variables.{key}")
+    if "hide" in spec and not isinstance(spec["hide"], bool):
+        raise ConfigurationError(path + ".hide: expected boolean.")
+    if "display_name" in spec and (not isinstance(spec["display_name"], str) or not spec["display_name"]):
+        raise ConfigurationError(path + ".display_name: expected non-empty string.")
+    aliases = spec.get("value_aliases", {})
+    if not isinstance(aliases, dict) or not all(
+        isinstance(raw, str) and raw and isinstance(display, str) and display
+        for raw, display in aliases.items()
+    ):
+        raise ConfigurationError(path + ".value_aliases: expected mapping of non-empty strings.")
 
 
 def _validate_value_source(dashboard_name: str, key: str, spec: dict[str, Any]) -> None:
@@ -188,6 +229,8 @@ def _validate_source_shape(dashboard_name: str, key: str, spec: dict[str, Any], 
 
 def _valid_values_from(value: Any, key: str, spec: dict[str, Any]) -> bool:
     if isinstance(value, str) and value:
+        if spec.get("lookup"):
+            return False
         return value == str(spec.get("grafana_variable") or key)
     return isinstance(value, dict) and not set(value) - {"regex", "max_values"}
 
@@ -220,10 +263,29 @@ def _validate_label_template(dashboard_name: str, matrix: dict[str, Any], variab
         return
     if not isinstance(template, str):
         raise ConfigurationError(_path(dashboard_name, "label_template") + ": expected string.")
-    allowed = set(variables) | {str(spec.get("alias", key)) for key, spec in variables.items()}
-    unknown = sorted({field for _, field, _, _ in Formatter().parse(template) if field and field not in allowed})
+    fields = {field for _, field, _, _ in Formatter().parse(template) if field}
+    allowed = set(variables) | {display_name(key, spec) for key, spec in variables.items()}
+    unknown = sorted(fields - allowed)
     if unknown:
         raise ConfigurationError(_path(dashboard_name, "label_template") + f": unknown placeholders {unknown}.")
+    hidden = _known_hidden_template_names(variables)
+    hidden_fields = sorted(fields & hidden)
+    if hidden_fields:
+        raise ConfigurationError(
+            _path(dashboard_name, "label_template") + f": placeholders reference hidden variables {hidden_fields}."
+        )
+
+
+def _known_hidden_template_names(variables: dict[str, Any]) -> set[str]:
+    hidden: set[str] = set()
+    for key, spec in variables.items():
+        raw_values = spec.get("values") if "values" in spec else []
+        known = spec.get("hide") is True or (
+            "hide" not in spec and (bool(spec.get("value_aliases")) or "values" in spec and resolved_hidden(spec, raw_values))
+        )
+        if known:
+            hidden.update({key, display_name(key, spec)})
+    return hidden
 
 
 def regex_value(spec: dict[str, Any]) -> Any:

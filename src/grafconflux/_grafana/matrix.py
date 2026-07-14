@@ -17,7 +17,9 @@ from grafconflux._grafana.matrix_config import (
 )
 from grafconflux._grafana.matrix_dependencies import configured_dependencies, ordered_matrix_variables
 from grafconflux._grafana.matrix_discovery import MatrixValueResolver, safe_discovery_variable
+from grafconflux._grafana.variable_lookup import resolve_matrix_variable_lookups
 from grafconflux._shared.grafana_models import ConfigurationError, Panel, PanelDescriptor, PanelRenderTask
+from grafconflux._shared.presentation import display_name, display_value, resolved_hidden
 
 logger = logging.getLogger(__name__)
 
@@ -35,12 +37,13 @@ def append_matrix_tasks(
     matrix = getattr(config, "render_matrix", None)
     if not matrix:
         return render_tasks
-    planning_matrix = _planning_matrix(config.name, matrix, dashboard)
+    lookup_matrix = resolve_matrix_variable_lookups(config.name, matrix, dashboard)
+    planning_matrix = _planning_matrix(config.name, lookup_matrix, dashboard)
     browser_fallback = (
         BrowserMatrixFallback(config, session, dashboard_url, dashboard=dashboard)
         if dashboard_url else None
     )
-    dynamic_names = {_grafana_variable(key, spec) for key, spec in matrix["variables"].items()}
+    dynamic_names = {_grafana_variable(key, spec) for key, spec in planning_matrix["variables"].items()}
     resolver = MatrixValueResolver(dashboard, session, config, browser_fallback, dynamic_names)
     try:
         rows_by_time = _rows_by_timestamp(
@@ -67,6 +70,8 @@ def build_matrix_dashboard_links(config: Any, timestamps: list[Any], dashboard_u
                 "variables": row["variables"],
                 "grafana_variables": row["url_variables"],
                 "context_path": row["context_path"],
+                "index": row["index"],
+                "neutral_label": row["neutral_label"],
             })
     return links
 
@@ -112,13 +117,14 @@ def _rows_for_timestamp(config: Any, matrix: dict[str, Any], dashboard: dict[str
     values, provenance = _variable_values(config, matrix, dashboard, timestamp, static_vars, resolver)
     rows = _zip_rows(values, dashboard_name)
     _validate_row_limit(dashboard_name, matrix, len(rows))
-    rows = [{**row, "__discovery__": provenance} for row in rows]
+    presentation = _resolved_presentations(matrix, values)
+    rows = [{**row, "__discovery__": provenance, "__presentation__": presentation} for row in rows]
     return [_row_record(dashboard_name, matrix, index, row) for index, row in enumerate(rows)]
 
 
 def _product_rows(config: Any, matrix: dict[str, Any], dashboard: dict[str, Any],
                    timestamp: Any, static_vars: dict[str, Any], resolver: MatrixValueResolver) -> list[dict[str, Any]]:
-    rows: list[dict[str, str]] = [{}]
+    rows: list[dict[str, Any]] = [{}]
     for key, spec in matrix["variables"].items():
         rows = _extend_rows(config, matrix, key, spec, dashboard, timestamp, static_vars, rows, resolver)
     return rows
@@ -127,7 +133,7 @@ def _product_rows(config: Any, matrix: dict[str, Any], dashboard: dict[str, Any]
 def _extend_rows(config: Any, matrix: dict[str, Any], key: str, spec: dict[str, Any],
                  dashboard: dict[str, Any], timestamp: Any, static_vars: dict[str, Any],
                   rows: list[dict[str, Any]], resolver: MatrixValueResolver) -> list[dict[str, Any]]:
-    extended: list[dict[str, str]] = []
+    extended: list[dict[str, Any]] = []
     for row in rows:
         values, provenance = _values_for_spec(config, key, spec, dashboard, timestamp, row, static_vars, resolver)
         if not values:
@@ -142,8 +148,9 @@ def _extend_rows(config: Any, matrix: dict[str, Any], key: str, spec: dict[str, 
                 (provenance or {}).get("method"),
             )
             continue
+        presentation = _resolved_presentation(key, spec, values)
         for value in values:
-            extended.append(_extended_row(row, key, value, provenance))
+            extended.append(_extended_row(row, key, value, provenance, presentation))
             _validate_row_limit(config.name, matrix, len(extended))
     return extended
 
@@ -185,8 +192,15 @@ def _discovery_failure(dashboard_name: str, key: str, provenance: dict[str, Any]
     return _path(dashboard_name, f"variables.{key}") + f": dynamic discovery did not resolve ({details})."
 
 
-def _extended_row(row: dict[str, Any], key: str, value: str, provenance: dict[str, Any] | None) -> dict[str, Any]:
+def _extended_row(
+    row: dict[str, Any],
+    key: str,
+    value: str,
+    provenance: dict[str, Any] | None,
+    presentation: dict[str, Any],
+) -> dict[str, Any]:
     extended = {**row, key: value}
+    extended["__presentation__"] = {**row.get("__presentation__", {}), key: presentation}
     if provenance:
         extended["__discovery__"] = {**row.get("__discovery__", {}), key: provenance}
     return extended
@@ -240,48 +254,72 @@ def _validate_zip_lengths(values: dict[str, list[str]], dashboard_name: str) -> 
         raise ConfigurationError(_path(dashboard_name, "combination_mode") + ": zip variable lists must have equal length.")
 
 
-def _row_record(dashboard_name: str, matrix: dict[str, Any], index: int, row: dict[str, str]) -> dict[str, Any]:
-    aliases = _alias_variables(matrix, row)
+def _row_record(dashboard_name: str, matrix: dict[str, Any], index: int, row: dict[str, Any]) -> dict[str, Any]:
+    aliases = _alias_variables(row)
     url_variables = _url_variables(matrix, row)
-    row_hash = _stable_hash(dashboard_name, index, aliases)
+    raw_variables = {key: row[key] for key in matrix["variables"]}
+    row_hash = _stable_hash(dashboard_name, index, url_variables)
     context_path = _context_path(matrix, row)
-    return {"index": index, "hash": row_hash, "variables": aliases, "url_variables": url_variables,
-            "label": _row_label(matrix, aliases), "group": _row_group(matrix, aliases),
+    label = _row_label(dashboard_name, matrix, index, row, aliases)
+    return {"index": index, "hash": row_hash, "variables": aliases, "raw_variables": raw_variables,
+            "url_variables": url_variables, "label": label, "neutral_label": f"Variant {index + 1}",
+            "group": _row_group(matrix, row, aliases),
             "context_path": context_path, "discovery": row.get("__discovery__", {})}
 
 
-def _context_path(matrix: dict[str, Any], row: dict[str, str]) -> list[dict[str, str]]:
+def _context_path(matrix: dict[str, Any], row: dict[str, Any]) -> list[dict[str, Any]]:
     return [
-        {"key": key, "label": _alias(key, spec), "value": row[key], "grafana_variable": _grafana_variable(key, spec)}
+        _context_item(key, spec, row[key], row["__presentation__"][key])
         for key, spec in matrix["variables"].items()
     ]
 
 
-def _alias_variables(matrix: dict[str, Any], row: dict[str, str]) -> dict[str, str]:
-    return {_alias(key, spec): row[key] for key, spec in matrix["variables"].items()}
+def _alias_variables(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        presentation["display_name"]: display_value(row[key], presentation["value_aliases"])
+        for key, presentation in row["__presentation__"].items()
+        if not presentation["hidden"]
+    }
 
 
-def _url_variables(matrix: dict[str, Any], row: dict[str, str]) -> dict[str, str]:
+def _url_variables(matrix: dict[str, Any], row: dict[str, Any]) -> dict[str, str]:
     return {_grafana_variable(key, spec): row[key] for key, spec in matrix["variables"].items()}
 
 
-def _row_label(matrix: dict[str, Any], aliases: dict[str, str]) -> str:
+def _row_label(
+    dashboard_name: str,
+    matrix: dict[str, Any],
+    index: int,
+    row: dict[str, Any],
+    aliases: dict[str, Any],
+) -> str:
     template = matrix.get("label_template")
     if isinstance(template, str) and template:
-        return template.format(**_label_template_values(matrix, aliases))
-    return ", ".join(f"{key}: {value}" for key, value in aliases.items())
+        _reject_hidden_template_fields(dashboard_name, matrix, template, row)
+        return template.format(**_label_template_values(matrix, row, aliases))
+    label = ", ".join(f"{key}: {value}" for key, value in aliases.items())
+    return label or f"Variant {index + 1}"
 
 
-def _label_template_values(matrix: dict[str, Any], aliases: dict[str, str]) -> dict[str, str]:
+def _label_template_values(
+    matrix: dict[str, Any],
+    row: dict[str, Any],
+    aliases: dict[str, Any],
+) -> dict[str, Any]:
     values = dict(aliases)
-    for key, spec in matrix["variables"].items():
-        values[key] = aliases[_alias(key, spec)]
+    for key in matrix["variables"]:
+        presentation = row["__presentation__"][key]
+        values[key] = display_value(row[key], presentation["value_aliases"])
     return values
 
 
-def _row_group(matrix: dict[str, Any], aliases: dict[str, str]) -> str | None:
+def _row_group(matrix: dict[str, Any], row: dict[str, Any], aliases: dict[str, Any]) -> str | None:
     group_by = matrix.get("row_grouping", matrix.get("group_by", [])) or []
-    labels = [_alias(key, matrix["variables"][key]) for key in group_by]
+    labels = [
+        row["__presentation__"][key]["display_name"]
+        for key in group_by
+        if not row["__presentation__"][key]["hidden"]
+    ]
     return ", ".join(f"{label}: {aliases[label]}" for label in labels) if labels else None
 
 
@@ -319,7 +357,8 @@ def _matrix_artifact(dashboard_name: str, panel: Panel, timestamp: Any, row: dic
             "source_timestamp_id": timestamp.id_time, "display_title": _matrix_panel_title(panel.display_title, row),
             "repeat_var": source.get("repeat_var") if source else None,
             "matrix": {"index": row["index"], "hash": row["hash"], "variables": row["variables"],
-                        "grafana_variables": row["url_variables"], "label": row["label"], "group": row.get("group"),
+                        "raw_variables": row["raw_variables"], "grafana_variables": row["url_variables"],
+                        "label": row["label"], "neutral_label": row["neutral_label"], "group": row.get("group"),
                         "context_path": row["context_path"], "discovery": row.get("discovery", {})}}
 
 
@@ -340,8 +379,49 @@ def _scalar_list(value: Any) -> list[str]:
     return [str(item) for item in value if item not in (None, "") and not isinstance(item, (dict, list))]
 
 
-def _alias(key: str, spec: dict[str, Any]) -> str:
-    return str(spec.get("alias", key))
+def _resolved_presentations(matrix: dict[str, Any], values: dict[str, list[str]]) -> dict[str, dict[str, Any]]:
+    return {
+        key: _resolved_presentation(key, spec, values[key])
+        for key, spec in matrix["variables"].items()
+    }
+
+
+def _resolved_presentation(key: str, spec: dict[str, Any], values: list[str]) -> dict[str, Any]:
+    return {
+        "display_name": display_name(key, spec),
+        "value_aliases": dict(spec.get("value_aliases") or {}),
+        "hidden": resolved_hidden(spec, values),
+        "hide_explicit": "hide" in spec,
+    }
+
+
+def _context_item(key: str, spec: dict[str, Any], raw_value: str, presentation: dict[str, Any]) -> dict[str, Any]:
+    shown_value = display_value(raw_value, presentation["value_aliases"])
+    return {
+        "key": key, "label": presentation["display_name"], "display_name": presentation["display_name"],
+        "value": raw_value, "raw_value": raw_value, "display_value": shown_value,
+        "value_aliases": presentation["value_aliases"], "hidden": presentation["hidden"],
+        "hide_explicit": presentation["hide_explicit"], "grafana_variable": _grafana_variable(key, spec),
+    }
+
+
+def _reject_hidden_template_fields(
+    dashboard_name: str,
+    matrix: dict[str, Any],
+    template: str,
+    row: dict[str, Any],
+) -> None:
+    from string import Formatter
+
+    fields = {field for _, field, _, _ in Formatter().parse(template) if field}
+    hidden = {
+        name
+        for key, presentation in row["__presentation__"].items()
+        if presentation["hidden"]
+        for name in (key, presentation["display_name"])
+    }
+    if fields & hidden:
+        raise ConfigurationError(_path(dashboard_name, "label_template") + ": placeholders reference hidden variables.")
 
 
 def _grafana_variable(key: str, spec: dict[str, Any]) -> str:

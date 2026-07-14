@@ -213,6 +213,52 @@ class TestGrafanaConfigLoading(unittest.TestCase):
         self.assertEqual(config.vars, {"ds": "Prometheus", "region": "us"})
         self.assertEqual(config.datasource_vars, {"ds": "Prometheus"})
 
+    def test_static_var_objects_preserve_presentation_metadata(self):
+        config_path = self.write_config(
+            "dashboard:\n"
+            "  dash_title: Dashboard\n"
+            "  grafana_url: https://grafana.example\n"
+            "  vars:\n"
+            "    region:\n"
+            "      value: [us, eu]\n"
+            "      display_name: Region\n"
+            "      value_aliases: {us: United States}\n"
+            "    ds: {value: Prometheus, is_datasource: true, hide: true}\n"
+        )
+
+        config = GrafanaManager.load_grafana_config(config_path)[0]
+
+        self.assertEqual(config.vars, {"region": ["us", "eu"], "ds": "Prometheus"})
+        self.assertEqual(config.datasource_vars, {"ds": "Prometheus"})
+        self.assertEqual(config.vars_presentation["region"]["display_value"], ["United States", "eu"])
+        self.assertTrue(config.vars_presentation["region"]["hide"])
+        self.assertFalse(config.vars_presentation["region"]["hide_explicit"])
+        self.assertTrue(config.vars_presentation["ds"]["hide"])
+        self.assertTrue(config.vars_presentation["ds"]["hide_explicit"])
+
+    def test_static_var_presentation_validation_is_strict(self):
+        invalid_fields = (
+            ("hide: hidden", "vars.region.hide"),
+            ("display_name: ''", "vars.region.display_name"),
+            ("value_aliases: []", "vars.region.value_aliases"),
+            ("value_aliases: {us: 1}", "vars.region.value_aliases"),
+            ("is_datasource: false", "vars.region.is_datasource"),
+            ("unexpected: true", "unknown static var object key"),
+        )
+        for field, message in invalid_fields:
+            with self.subTest(field=field):
+                config_path = self.write_config(
+                    "dashboard:\n"
+                    "  dash_title: Dashboard\n"
+                    "  grafana_url: https://grafana.example\n"
+                    "  vars:\n"
+                    "    region:\n"
+                    "      value: us\n"
+                    f"      {field}\n"
+                )
+                with self.assertRaisesRegex(ConfigurationError, message):
+                    GrafanaManager.load_grafana_config(config_path)
+
     def test_static_var_object_requires_datasource_value(self):
         config_path = self.write_config(
             "dashboard:\n"
@@ -224,6 +270,23 @@ class TestGrafanaConfigLoading(unittest.TestCase):
 
         with self.assertRaisesRegex(ConfigurationError, "vars.ds.value"):
             GrafanaManager.load_grafana_config(config_path)
+
+    def test_static_datasource_name_requires_explicit_marker_and_no_value(self):
+        invalid_specs = (
+            ("name: Prometheus", "vars.ds.name: requires is_datasource"),
+            ("is_datasource: true, name: Prometheus, value: prom-main", "value and name are mutually exclusive"),
+        )
+        for spec, message in invalid_specs:
+            with self.subTest(spec=spec):
+                config_path = self.write_config(
+                    "dashboard:\n"
+                    "  dash_title: Dashboard\n"
+                    "  grafana_url: https://grafana.example\n"
+                    "  vars:\n"
+                    f"    ds: {{{spec}}}\n"
+                )
+                with self.assertRaisesRegex(ConfigurationError, message):
+                    GrafanaManager.load_grafana_config(config_path)
 
     def test_loads_dashboard_playwright_browser_options(self):
         config_path = self.write_config(

@@ -5,6 +5,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import yaml
+
 from grafconflux._confluence.content import build_confluence_storage_content
 from grafconflux._confluence.content import _grouped_matrix_artifacts
 from grafconflux._orchestration.upload_merge import _shift_matrix_dashboard_links, transform_grafana_configs
@@ -31,6 +33,7 @@ class TestRenderMatrixPlanning(unittest.TestCase):
                   row_grouping: [environment]
                   environment:
                     alias: Environment
+                    hide: false
                     grafana_variable: env
                     values: [prod, stage]
                   service:
@@ -43,7 +46,6 @@ class TestRenderMatrixPlanning(unittest.TestCase):
         )
 
         panels = grafana.get_panels([self.timestamp()])
-
         tasks = grafana.render_tasks
         self.assertEqual([task.variables["env"] for task in tasks], ["prod", "stage"])
         self.assertEqual([task.variables["service"] for task in tasks], ["api", "worker"])
@@ -52,6 +54,7 @@ class TestRenderMatrixPlanning(unittest.TestCase):
         self.assertTrue(all("matrix-" in task.file_name for task in tasks))
         self.assertEqual(panels[0].artifacts[0]["matrix"]["variables"], {"Environment": "prod", "Service": "api"})
         self.assertEqual(panels[0].artifacts[0]["matrix"]["grafana_variables"], {"env": "prod", "service": "api"})
+        self.assertFalse(panels[0].artifacts[0]["matrix"]["context_path"][1]["hidden"])
         self.assertEqual(panels[0].artifacts[0]["matrix"]["group"], "Environment: prod")
         self.assertEqual(panels[0].artifacts[0]["display_title"], "Requests (Environment: prod, Service: api)")
 
@@ -154,6 +157,7 @@ class TestRenderMatrixPlanning(unittest.TestCase):
               Demo:
                 grafana_url: https://grafana.example/grafana
                 dash_title: Demo
+                vars: {region: us, env: prod}
                 render_matrix:
                   namespace:
                     values: [team-a, team-b]
@@ -541,6 +545,260 @@ class TestRenderMatrixPlanning(unittest.TestCase):
                     render_matrix: {}
             """))
 
+    def test_matrix_presentation_fields_keep_raw_request_identity(self) -> None:
+        grafana = self.manager_from_config("""
+            dashboards:
+              Demo:
+                grafana_url: https://grafana.example
+                dash_title: Demo
+                render_matrix:
+                  variables:
+                    environment:
+                      grafana_variable: env
+                      display_name: Environment
+                      hide: false
+                      value_aliases: {prod: Production}
+                      values: [prod, stage]
+                    service:
+                      display_name: Service
+                      hide: true
+                      value_aliases: {api: Public API}
+                      values: [api]
+        """)
+
+        panels = grafana.get_panels([self.timestamp()])
+        grafana.config.full_links = grafana._GrafanaManager__get_full_links([self.timestamp()])
+        grafana.config.matrix_dashboard_links = grafana._GrafanaManager__get_matrix_full_links([self.timestamp()])
+
+        first_task = grafana.render_tasks[0]
+        matrix = panels[0].artifacts[0]["matrix"]
+        self.assertEqual(first_task.variables, {"env": "prod", "service": "api"})
+        self.assertEqual(matrix["raw_variables"], {"environment": "prod", "service": "api"})
+        self.assertEqual(matrix["variables"], {"Environment": "Production"})
+        self.assertEqual(matrix["label"], "Environment: Production")
+        self.assertEqual(matrix["context_path"][0]["raw_value"], "prod")
+        self.assertEqual(matrix["context_path"][0]["display_value"], "Production")
+        self.assertFalse(matrix["context_path"][0]["hidden"])
+        self.assertTrue(matrix["context_path"][1]["hidden"])
+        self.assertIn("var-env=prod", grafana.config.matrix_dashboard_links[0]["url"])
+        self.assertNotIn("Production", grafana.config.matrix_dashboard_links[0]["url"])
+
+    def test_matrix_default_hide_uses_effective_value_count_and_alias_presence(self) -> None:
+        grafana = self.manager_from_config("""
+            dashboards:
+              Demo:
+                grafana_url: https://grafana.example
+                dash_title: Demo
+                render_matrix:
+                  variables:
+                    single: {values: [one]}
+                    multiple: {values: [first, second]}
+                    aliased:
+                      values: [raw]
+                      value_aliases: {raw: Display}
+        """)
+
+        panels = grafana.get_panels([self.timestamp()])
+
+        first_matrix = panels[0].artifacts[0]["matrix"]
+        self.assertEqual(first_matrix["label"], "single: one")
+        self.assertEqual(
+            [item["hidden"] for item in first_matrix["context_path"]],
+            [False, True, True],
+        )
+        self.assertEqual(first_matrix["variables"], {"single": "one"})
+
+    def test_all_hidden_matrix_context_uses_neutral_variant_labels(self) -> None:
+        grafana = self.manager_from_config("""
+            dashboards:
+              Demo:
+                grafana_url: https://grafana.example
+                dash_title: Demo
+                render_matrix:
+                  options:
+                    layout: matrix_values_first
+                  variables:
+                    environment: {values: [prod, stage]}
+        """)
+
+        panels = grafana.get_panels([self.timestamp()])
+
+        artifacts = panels[0].artifacts
+        self.assertEqual([artifact["matrix"]["label"] for artifact in artifacts], ["Variant 1", "Variant 2"])
+        self.assertEqual([artifact["display_title"] for artifact in artifacts], [
+            "Requests (Variant 1)", "Requests (Variant 2)",
+        ])
+        grafana.config.full_links = grafana._GrafanaManager__get_full_links([self.timestamp()])
+        grafana.config.matrix_dashboard_links = grafana._GrafanaManager__get_matrix_full_links([self.timestamp()])
+        grafana.config.panels = panels
+        content = build_confluence_storage_content([grafana.config], [self.timestamp()], 600)
+        self.assertIn('ac:parameter ac:name="title">Panels</ac:parameter>', content)
+        self.assertIn('ac:parameter ac:name="title">Requests</ac:parameter>', content)
+        self.assertIn(">Variant 1</a>", content)
+        self.assertIn(">Variant 2</a>", content)
+        self.assertNotIn("Environment: prod", content)
+        self.assertNotIn("Environment: stage", content)
+        self.assertNotIn("environment:", content)
+
+    def test_matrix_presentation_does_not_change_hash_or_filename(self) -> None:
+        base = """
+            dashboards:
+              Demo:
+                grafana_url: https://grafana.example
+                dash_title: Demo
+                render_matrix:
+                  variables:
+                    environment:
+                      values: [prod]
+                      %s
+        """
+        plain = self.manager_from_config(base % "hide: false")
+        presented = self.manager_from_config(
+            base % "display_name: Environment\n                      value_aliases: {prod: Production}\n                      hide: false"
+        )
+
+        plain.get_panels([self.timestamp()])
+        presented.get_panels([self.timestamp()])
+
+        self.assertEqual(plain.render_tasks[0].file_name, presented.render_tasks[0].file_name)
+        self.assertEqual(
+            plain.render_tasks[0].artifact["matrix"]["hash"],
+            presented.render_tasks[0].artifact["matrix"]["hash"],
+        )
+
+    def test_matrix_alias_and_display_name_must_not_conflict(self) -> None:
+        with self.assertRaisesRegex(ValueError, "alias.*display_name.*different"):
+            GrafanaManager.load_grafana_config(self.config_path("""
+                dashboards:
+                  Demo:
+                    grafana_url: https://grafana.example
+                    dash_title: Demo
+                    render_matrix:
+                      variables:
+                        environment:
+                          alias: Environment
+                          display_name: Deployment
+                          values: [prod]
+            """))
+
+    def test_matrix_display_name_cannot_collide_with_another_raw_key(self) -> None:
+        with self.assertRaisesRegex(ValueError, "variables.environment.alias.*collides with raw matrix variable 'service'"):
+            GrafanaManager.load_grafana_config(self.config_path("""
+                dashboards:
+                  Demo:
+                    grafana_url: https://grafana.example
+                    dash_title: Demo
+                    render_matrix:
+                      variables:
+                        environment: {display_name: service, values: [prod]}
+                        service: {values: [api]}
+            """))
+
+    def test_hidden_matrix_alias_cannot_collide_with_another_raw_key(self) -> None:
+        with self.assertRaisesRegex(ValueError, "variables.environment.alias.*collides with raw matrix variable 'service'"):
+            GrafanaManager.load_grafana_config(self.config_path("""
+                dashboards:
+                  Demo:
+                    grafana_url: https://grafana.example
+                    dash_title: Demo
+                    render_matrix:
+                      variables:
+                        environment: {alias: service, hide: true, values: [prod]}
+                        service: {values: [api]}
+            """))
+
+    def test_matrix_rejects_template_reference_to_hidden_variable(self) -> None:
+        with self.assertRaisesRegex(ValueError, "label_template.*hidden"):
+            GrafanaManager.load_grafana_config(self.config_path("""
+                dashboards:
+                  Demo:
+                    grafana_url: https://grafana.example
+                    dash_title: Demo
+                    render_matrix:
+                      options:
+                        label_template: "Environment: {environment}"
+                      variables:
+                        environment: {values: [prod], hide: true}
+            """))
+
+    def test_matrix_presentation_validation_is_strict(self) -> None:
+        invalid_fields = (
+            ("hide: hidden", "variables.environment.hide"),
+            ("display_name: ''", "variables.environment.display_name"),
+            ("value_aliases: []", "variables.environment.value_aliases"),
+            ("value_aliases: {prod: 1}", "variables.environment.value_aliases"),
+        )
+        for field, message in invalid_fields:
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, message):
+                    GrafanaManager.load_grafana_config(self.config_path(f"""
+                        dashboards:
+                          Demo:
+                            grafana_url: https://grafana.example
+                            dash_title: Demo
+                            render_matrix:
+                              variables:
+                                environment:
+                                  values: [prod]
+                                  {field}
+                    """))
+
+    def test_dynamic_single_value_is_visible_when_hide_is_omitted(self) -> None:
+        grafana = self.manager_from_config("""
+            dashboards:
+              Demo:
+                grafana_url: https://grafana.example/grafana
+                dash_title: Demo
+                vars: {region: us, env: prod}
+                render_matrix:
+                  service: {values_from: {}}
+        """, self.dashboard_with_prometheus_variable())
+        dashboard_response = Mock(
+            status_code=200,
+            json=Mock(return_value={"dashboard": self.dashboard_with_prometheus_variable()}),
+        )
+        values_response = Mock(
+            status_code=200,
+            json=Mock(return_value={"status": "success", "data": [{"service": "api"}]}),
+        )
+        grafana.session.get = Mock(side_effect=[dashboard_response, values_response])
+
+        panels = grafana.get_panels([self.timestamp()])
+
+        matrix = panels[0].artifacts[0]["matrix"]
+        self.assertEqual(matrix["label"], "service: api")
+        self.assertFalse(matrix["context_path"][0]["hidden"])
+
+    def test_dynamic_default_hide_is_resolved_after_discovery(self) -> None:
+        grafana = self.manager_from_config(
+            """
+            dashboards:
+              Demo:
+                grafana_url: https://grafana.example/grafana
+                dash_title: Demo
+                vars: {region: us, env: prod}
+                render_matrix:
+                  service: {values_from: {}}
+            """,
+            self.dashboard_with_prometheus_variable(),
+        )
+        dashboard_response = Mock(
+            status_code=200,
+            json=Mock(return_value={"dashboard": self.dashboard_with_prometheus_variable()}),
+        )
+        values_response = Mock(
+            status_code=200,
+            json=Mock(return_value={"status": "success", "data": [{"service": "api"}, {"service": "worker"}]}),
+        )
+        grafana.session.get = Mock(side_effect=[dashboard_response, values_response])
+
+        panels = grafana.get_panels([self.timestamp()])
+
+        self.assertEqual(
+            [artifact["matrix"]["label"] for artifact in panels[0].artifacts],
+            ["Variant 1", "Variant 2"],
+        )
+
     def test_values_by_requires_previous_dependency(self) -> None:
         with self.assertRaisesRegex(ValueError, "depends_on.*required"):
             GrafanaManager.load_grafana_config(self.config_path("""
@@ -732,6 +990,73 @@ class TestRenderMatrixReplayAndConfluence(unittest.TestCase):
         self.assertEqual([link["timestamp_id"] for link in links], [0, 1])
         self.assertEqual([timestamp.id_time for timestamp in merged_configs[0].timestamps], [0, 1])
 
+    def test_upload_merge_accepts_identical_static_presentation_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            first_folder, second_folder = os.path.join(temp_dir, "first"), os.path.join(temp_dir, "second")
+            os.makedirs(os.path.join(first_folder, "Demo")); os.makedirs(os.path.join(second_folder, "Demo"))
+            presentation = {"region": {"display_name": "Region", "hide": False}}
+            configs = [
+                self.upload_config(first_folder, "prod", presentation),
+                self.upload_config(second_folder, "stage", presentation),
+            ]
+            args = SimpleNamespace(test_root_folder=temp_dir, test_id="merged", test_upload_folders=[first_folder, second_folder])
+
+            merged_configs, _ = transform_grafana_configs(configs, args)
+
+        self.assertEqual(merged_configs[0].vars_presentation, presentation)
+
+    def test_upload_merge_rejects_divergent_static_presentation_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            first_folder, second_folder = os.path.join(temp_dir, "first"), os.path.join(temp_dir, "second")
+            os.makedirs(os.path.join(first_folder, "Demo")); os.makedirs(os.path.join(second_folder, "Demo"))
+            configs = [
+                self.upload_config(first_folder, "prod", {"region": {"display_name": "Region"}}),
+                self.upload_config(second_folder, "stage", {"region": {"display_name": "Location"}}),
+            ]
+            args = SimpleNamespace(test_root_folder=temp_dir, test_id="merged", test_upload_folders=[first_folder, second_folder])
+
+            with self.assertRaisesRegex(ConfigurationError, "vars_presentation metadata differs across folders"):
+                transform_grafana_configs(configs, args)
+
+    def test_upload_merge_accepts_legacy_metadata_without_presentation_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            first_folder, second_folder = os.path.join(temp_dir, "first"), os.path.join(temp_dir, "second")
+            os.makedirs(os.path.join(first_folder, "Demo")); os.makedirs(os.path.join(second_folder, "Demo"))
+            presentation = {"region": {"display_name": "Region", "hide": False}}
+            configs = [self.upload_config(first_folder, "prod"), self.upload_config(second_folder, "stage", presentation)]
+            args = SimpleNamespace(test_root_folder=temp_dir, test_id="merged", test_upload_folders=[first_folder, second_folder])
+
+            merged_configs, _ = transform_grafana_configs(configs, args)
+
+        self.assertEqual(merged_configs[0].vars_presentation, presentation)
+
+    def test_upload_merge_legacy_metadata_remains_compatible_with_later_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            first_folder, second_folder = os.path.join(temp_dir, "first"), os.path.join(temp_dir, "second")
+            snapshot_folder = os.path.join(temp_dir, "snapshot")
+            for folder in (first_folder, second_folder, snapshot_folder):
+                os.makedirs(os.path.join(folder, "Demo"))
+            legacy_args = SimpleNamespace(
+                test_root_folder=temp_dir, test_id="legacy", test_upload_folders=[first_folder, second_folder]
+            )
+            _, legacy_output = transform_grafana_configs(
+                [self.upload_config(first_folder, "prod"), self.upload_config(second_folder, "stage")], legacy_args
+            )
+            with open(os.path.join(legacy_output, "Demo.yaml"), encoding="utf-8") as metadata_file:
+                legacy_metadata = yaml.safe_load(metadata_file)
+            self.assertNotIn("vars_presentation", legacy_metadata)
+
+            snapshot = {"region": {"display_name": "Region", "hide": False}}
+            final_args = SimpleNamespace(
+                test_root_folder=temp_dir, test_id="final", test_upload_folders=[legacy_output, snapshot_folder]
+            )
+            final_configs, _ = transform_grafana_configs(
+                [GrafanaConfigUploader("Demo", legacy_metadata), self.upload_config(snapshot_folder, "dev", snapshot)],
+                final_args,
+            )
+
+        self.assertEqual(final_configs[0].vars_presentation, snapshot)
+
     def test_uploader_replays_matrix_metadata_and_nested_confluence_groups(self) -> None:
         config = {
             "name": "Demo",
@@ -770,9 +1095,50 @@ class TestRenderMatrixReplayAndConfluence(unittest.TestCase):
         self.assertIn("Demo__17__matrix-000-deadbeef__0.png", content)
         self.assertIn("ac:structured-macro ac:name=\"expand\"", content)
 
+    def test_uploader_replays_hidden_and_aliased_presentation_snapshot(self) -> None:
+        config = {
+            "charts_path": "unused",
+            "full_links": [],
+            "matrix_dashboard_links": [{
+                "label": "Region: United States",
+                "url": "https://grafana.example/d/demo?var-region=us&var-service=api",
+                "context_path": [
+                    {"key": "region", "label": "Region", "value": "us", "raw_value": "us",
+                     "display_value": "United States", "hidden": False},
+                    {"key": "service", "label": "Service", "value": "api", "raw_value": "api",
+                     "display_value": "Public API", "hidden": True},
+                ],
+            }],
+            "timestamps": [{"time_tag": "smoke", "id_time": 0, "start_time_timestamp": 1,
+                            "end_time_timestamp": 2, "start_time_human": "start", "end_time_human": "end"}],
+            "panels": [{
+                "panel_id": 17, "type": "timeseries", "title": "Requests", "links": [],
+                "artifacts": [{
+                    "artifact_type": "matrix", "render_status": "rendered", "png_file": "matrix.png",
+                    "matrix": {
+                        "label": "Region: United States",
+                        "context_path": [
+                            {"key": "region", "label": "Region", "value": "us", "raw_value": "us",
+                             "display_value": "United States", "hidden": False},
+                            {"key": "service", "label": "Service", "value": "api", "raw_value": "api",
+                             "display_value": "Public API", "hidden": True},
+                        ],
+                    },
+                }],
+            }],
+            "render_matrix": {"layout": "dashboard_first"},
+        }
+
+        uploader = GrafanaConfigUploader("Demo", config)
+        content = build_confluence_storage_content([uploader], uploader.timestamps, 900)
+
+        self.assertIn("Demo (Region: United States)", content)
+        self.assertNotIn("Service: Public API", content)
+        self.assertIn("var-region=us&amp;var-service=api", content)
+
     @staticmethod
-    def upload_config(folder: str, environment: str) -> GrafanaConfigUploader:
-        return GrafanaConfigUploader("Demo", {
+    def upload_config(folder: str, environment: str, vars_presentation: dict | None = None) -> GrafanaConfigUploader:
+        config = {
             "charts_path": os.path.join(folder, "Demo"),
             "full_links": [f"https://grafana.example/d?var-env={environment}"],
             "matrix_dashboard_links": [{"timestamp_id": 0, "label": f"Environment: {environment}",
@@ -781,7 +1147,10 @@ class TestRenderMatrixReplayAndConfluence(unittest.TestCase):
             "timestamps": [{"time_tag": environment, "id_time": 0, "start_time_timestamp": 1,
                             "end_time_timestamp": 2, "start_time_human": "start", "end_time_human": "end"}],
             "panels": [],
-        })
+        }
+        if vars_presentation is not None:
+            config["vars_presentation"] = vars_presentation
+        return GrafanaConfigUploader("Demo", config)
 
     def test_confluence_default_render_matrix_layout_is_panel_first(self) -> None:
         panel = Panel(17, "timeseries", "Requests", 1, ["https://grafana.example/panel/17"])
@@ -845,10 +1214,10 @@ class TestRenderMatrixReplayAndConfluence(unittest.TestCase):
             'ac:parameter ac:name="title">Test times</ac:parameter>',
             '<h2>Demo</h2>',
             'ac:parameter ac:name="title">Demo</ac:parameter>',
-            '<h3>Service: api</h3>',
-            'https://grafana.example/d?var-service=api',
             'ac:parameter ac:name="title">Panels</ac:parameter>',
             'ac:parameter ac:name="title">Requests</ac:parameter>',
+            'https://grafana.example/d?var-service=api',
+            '>Service: api</a>',
             'Demo__17__matrix-000-hash__0.png',
         ]
         indexes = [content.index(fragment) for fragment in expected_order]
@@ -858,7 +1227,7 @@ class TestRenderMatrixReplayAndConfluence(unittest.TestCase):
         self.assertNotIn('<p>Panels</p>', content)
         self.assertNotIn('<p>Dashboard links</p>', content)
         self.assertNotIn('ac:parameter ac:name="title">Service: api</ac:parameter>', content)
-        self.assertIn("<h3>Service: api</h3>", content)
+        self.assertNotIn("<h3>Service: api</h3>", content)
         self.assertIn("https://grafana.example/panel/17", content)
         self.assertIn("https://grafana.example/d?var-service=api", content)
 
@@ -884,13 +1253,14 @@ class TestRenderMatrixReplayAndConfluence(unittest.TestCase):
         expected_order = [
             '<h3>DC: prod</h3>',
             'ac:parameter ac:name="title">DC: prod</ac:parameter>',
-            '<h3>Host: app-01</h3>',
-            'https://grafana.example/d?var-host=app-01',
             'ac:parameter ac:name="title">Panels</ac:parameter>',
             'ac:parameter ac:name="title">Requests</ac:parameter>',
+            'https://grafana.example/d?var-host=app-01',
+            '>Host: app-01</a>',
         ]
         indexes = [content.index(fragment) for fragment in expected_order]
         self.assertEqual(indexes, sorted(indexes))
+        self.assertNotIn('<h3>Host: app-01</h3>', content)
         self.assertNotIn('ac:parameter ac:name="title">Host: app-01</ac:parameter>', content)
         self.assertNotIn('<p>Dashboard links</p>', content)
 
@@ -910,7 +1280,8 @@ class TestRenderMatrixReplayAndConfluence(unittest.TestCase):
         content = build_confluence_storage_content([config], timestamps, 600)
 
         self.assertNotIn("<p>Dashboard links</p>", content)
-        self.assertIn("<h3>Service: api</h3>", content)
+        self.assertIn("Service: api (Grafana link unavailable)", content)
+        self.assertNotIn("<h3>Service: api</h3>", content)
 
     def test_matrix_dashboard_link_without_context_does_not_match_matrix_section(self) -> None:
         panel = Panel(17, "timeseries", "Requests", 1, [])
@@ -984,12 +1355,14 @@ class TestRenderMatrixReplayAndConfluence(unittest.TestCase):
 
         content = build_confluence_storage_content([config], timestamps, 600)
 
-        leaf_heading = '<h3>Service: api</h3>'
-        self.assertIn(leaf_heading, content)
+        leaf_link = '>Service: api</a>'
+        self.assertIn(leaf_link, content)
+        self.assertNotIn('<h3>Service: api</h3>', content)
         self.assertNotIn('ac:parameter ac:name="title">Service: api</ac:parameter>', content)
         self.assertNotIn('<p>Dashboard links</p>', content)
-        self.assertLess(content.index(leaf_heading), content.index('https://grafana.example/d?var-service=api'))
-        self.assertLess(content.index('https://grafana.example/d?var-service=api'), content.index('ac:parameter ac:name="title">Panels</ac:parameter>'))
+        self.assertLess(content.index('ac:parameter ac:name="title">Panels</ac:parameter>'), content.index('ac:parameter ac:name="title">Requests</ac:parameter>'))
+        self.assertLess(content.index('ac:parameter ac:name="title">Requests</ac:parameter>'), content.index('https://grafana.example/d?var-service=api'))
+        self.assertLess(content.index('https://grafana.example/d?var-service=api'), content.index(leaf_link))
 
     def test_confluence_groups_same_panel_artifacts_under_one_expand_per_row(self) -> None:
         panel = Panel(17, "timeseries", "Requests", 1, ["https://grafana.example/panel/17"], row_title="Pods")

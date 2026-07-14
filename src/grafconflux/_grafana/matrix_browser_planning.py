@@ -9,18 +9,14 @@ from urllib.parse import urlencode, urlparse
 from grafconflux._grafana.browser_session import GrafanaBrowserSession
 from grafconflux._grafana.matrix_browser_correlation import (
     candidate_endpoint as _candidate_endpoint,
-    correlation_record as _build_correlation_record,
-    datasource_representation as _datasource_representation,
     ds_query_values as _ds_query_values,
     ds_variable_query_signature as _ds_variable_query_signature,
     endpoint_label as _endpoint_label,
     endpoint_match_state as _endpoint_match_state,
-    evaluation_record as _evaluation_record,
     is_metadata_candidate as _is_metadata_candidate,
     is_prometheus_metadata_candidate as _is_prometheus_metadata_candidate,
     metadata_rejection as _metadata_rejection,
-    metadata_candidate_diagnostic as _metadata_candidate_diagnostic,
-    navigation_diagnostic as _navigation_diagnostic,
+    navigation_telemetry as _navigation_telemetry,
     observed_selector as _observed_selector,
     payload_time_matches as _payload_time_matches,
     prometheus_datasource_uid as _prometheus_datasource_uid,
@@ -30,7 +26,6 @@ from grafconflux._grafana.matrix_browser_correlation import (
     request_json as _request_json,
     required_match_state as _required_match_state,
     response_request_url as _response_request_url,
-    response_schema_classification as _response_schema_classification,
     successful_payload as _successful_payload,
     url_time_matches as _url_time_matches,
 )
@@ -44,8 +39,6 @@ from grafconflux._grafana.matrix_discovery import (
     _result,
     safe_discovery_variable,
 )
-from grafconflux._grafana.matrix_prometheus import datasource_resolution
-from grafconflux._grafana.matrix_diagnostics import diagnostic_block
 from grafconflux._grafana.rendering import build_dashboard_url_params
 
 logger = logging.getLogger(__name__)
@@ -53,7 +46,6 @@ logger = logging.getLogger(__name__)
 PLANNING_POLL_MS = 100
 PLANNING_MAX_WAIT_MS = 5_000
 ALL_DISPLAY_VALUES = {"all", "$__all", "__all"}
-MAX_METADATA_CANDIDATE_DIAGNOSTICS = 10
 
 
 class BrowserMatrixFallback:
@@ -93,10 +85,18 @@ class BrowserMatrixFallback:
             with collector.collect(browser.page):
                 navigation_response = browser.get(self._navigation_url(timestamp, context))
                 self._wait_for_response(browser, collector)
-            logger.info("Matrix planning navigation\n%s", _navigation_diagnostic(navigation_response, browser.page))
+            status, route = _navigation_telemetry(navigation_response, browser.page)
+            logger.info(
+                "Matrix planning navigation variable=%s timestamp_id=%s status=%s route=%s",
+                safe_discovery_variable(variable_name), timestamp.id_time, status, route,
+            )
             if collector.result is not None:
                 return collector.result
-            logger.info("Matrix planning using DOM fallback\n%s", collector.fallback_diagnostic())
+            logger.info(
+                "Matrix planning DOM fallback variable=%s timestamp_id=%s candidates=%s rejections=%s",
+                safe_discovery_variable(variable_name), timestamp.id_time,
+                collector.candidate_count, collector.rejection_summary(),
+            )
             values = self._dom_values(browser, variable_name)
         except Exception as error:
             logger.warning(
@@ -219,29 +219,14 @@ class _PlanningResponseCollector:
         self.query = _prometheus_label_values_query(self.variable, context) if self.variable else None
         self.target_label = self.query[1] if self.query is not None else variable_name
         self.datasource_uid = _prometheus_datasource_uid(self.variable, context, config, dashboard)
-        resolution = datasource_resolution(self.variable.get("datasource"), context, config, dashboard)
-        self.datasource_present = resolution["uid_status"] == "resolved"
-        self.datasource_source = resolution["uid_source"]
-        self.datasource_representation = _datasource_representation(self.variable.get("datasource"))
         self.ds_query_signature = _ds_variable_query_signature(self.variable, self.query)
         self.ds_query_ref_id: str | None = None
         self.result: MatrixValueResult | None = None
         self.rejections: set[str] = set()
-        self.candidate_diagnostic_count = 0
-        self.candidate_diagnostic_overflow = 0
+        self.candidate_count = 0
 
-    def fallback_diagnostic(self) -> str:
-        rejections = ",".join(sorted(self.rejections)) or "no_correlated_network_candidate"
-        return diagnostic_block("MATRIX PLANNING DOM FALLBACK", (
-            ("variable", safe_discovery_variable(self.variable_name)),
-            ("timestamp_id", self.timestamp.id_time),
-            ("datasource_present", self.datasource_present),
-            ("datasource_source", self.datasource_source),
-            ("datasource_representation", self.datasource_representation),
-            ("candidate_diagnostics_emitted", self.candidate_diagnostic_count),
-            ("candidate_diagnostics_truncated", self.candidate_diagnostic_overflow),
-            ("rejections", rejections),
-        ))
+    def rejection_summary(self) -> str:
+        return ",".join(sorted(self.rejections)) or "no_correlated_network_candidate"
 
     def collect(self, page: Any) -> _ListenerScope:
         return _ListenerScope(page, self._record_response)
@@ -252,7 +237,7 @@ class _PlanningResponseCollector:
         evaluation = self._metadata_evaluation(response) if _is_prometheus_metadata_candidate(response) else None
         if getattr(response, "status", None) != 200:
             if _is_metadata_candidate(response):
-                self._reject_candidate(response, "http_status", _evaluation_record(evaluation))
+                self._reject_candidate("http_status")
             return
         method = self._correlated_method(response, evaluation)
         if method is None:
@@ -260,15 +245,10 @@ class _PlanningResponseCollector:
         try:
             payload = response.json()
         except Exception:
-            self._reject_candidate(
-                response, "invalid_response_payload", _evaluation_record(evaluation), "invalid_json",
-            )
+            self._reject_candidate("invalid_response_payload")
             return
         if method in {"prometheus_label_values", "prometheus_series"} and not _successful_payload(payload):
-            self._emit_candidate(
-                response, _evaluation_record(evaluation), "prometheus_status_not_success",
-                _response_schema_classification(payload, method),
-            )
+            self._emit_candidate()
             self.result = _result(
                 MatrixDiscoveryStatus.UNRESOLVED, [], self.variable_name, self.timestamp,
                 self.context, "browser_network", method,
@@ -276,15 +256,9 @@ class _PlanningResponseCollector:
             return
         values = self._values(payload, method)
         if values is None:
-            self._reject_candidate(
-                response, "invalid_response_payload", _evaluation_record(evaluation),
-                _response_schema_classification(payload, method),
-            )
+            self._reject_candidate("invalid_response_payload")
             return
-        self._emit_candidate(
-            response, _evaluation_record(evaluation), "none",
-            _response_schema_classification(payload, method),
-        )
+        self._emit_candidate()
         status = MatrixDiscoveryStatus.RESOLVED if values else MatrixDiscoveryStatus.EMPTY
         self.result = _result(
             status, values, self.variable_name, self.timestamp, self.context, "browser_network", method,
@@ -296,17 +270,17 @@ class _PlanningResponseCollector:
         request_url = _response_request_url(response)
         path = urlparse(request_url).path
         if evaluation is not None:
-            method, rejection, record = evaluation
+            method, rejection, _states = evaluation
             if method is not None:
                 return method
-            self._reject_candidate(response, rejection, record)
+            self._reject_candidate(rejection)
             return None
         if path.endswith("/api/ds/query"):
             ref_id = self._ds_query_ref_id(response)
             if ref_id is not None:
                 self.ds_query_ref_id = ref_id
                 return "prometheus_ds_query"
-            self._reject_candidate(response, "query_correlation")
+            self._reject_candidate("query_correlation")
         return None
 
     def _metadata_evaluation(
@@ -327,54 +301,18 @@ class _PlanningResponseCollector:
             "time_match": "match" if _url_time_matches(request_url, self.timestamp) else "mismatch",
             "target_label_match": _endpoint_match_state(endpoint, "label/", self.target_label, observed_label),
         }
-        record = self._correlation_record(
-            response, states, datasource_uid, expected_selector, observed_selector, observed_label,
-        )
         rejection = _metadata_rejection(states, bool(self.datasource_uid))
         if rejection != "none":
-            return None, rejection, record
+            return None, rejection, states
         method = "prometheus_series" if endpoint == "series" else "prometheus_label_values"
-        return method, "none", record
+        return method, "none", states
 
-    def _correlation_record(
-        self, response: Any, states: dict[str, str], observed_uid: str | None,
-        expected_selector: str | None, observed_selector: str | None, observed_label: str | None,
-    ) -> dict[str, Any]:
-        return _build_correlation_record(
-            response, states, self.datasource_uid, observed_uid, expected_selector,
-            observed_selector, self.target_label, observed_label, self.datasource_present,
-            self.datasource_source,
-        )
-
-    def _reject_candidate(
-        self, response: Any, rejection: str, record: dict[str, Any] | None = None,
-        schema: str = "not_inspected",
-    ) -> None:
+    def _reject_candidate(self, rejection: str) -> None:
         self.rejections.add(rejection)
-        safe_record = record or self._generic_rejection_record(response)
-        self._emit_candidate(response, safe_record, rejection, schema)
+        self._emit_candidate()
 
-    def _emit_candidate(
-        self, response: Any, record: dict[str, Any] | None, rejection: str, schema: str,
-    ) -> None:
-        if self.candidate_diagnostic_count >= MAX_METADATA_CANDIDATE_DIAGNOSTICS:
-            self.candidate_diagnostic_overflow += 1
-            return
-        states = record or self._generic_rejection_record(response)
-        self.candidate_diagnostic_count += 1
-        block = _metadata_candidate_diagnostic(
-            self.candidate_diagnostic_count, response, self.timestamp, self.datasource_uid,
-            self.query[0] if self.query and self.query[0] else None, self.target_label,
-            states, rejection, schema,
-        )
-        logger.info("Matrix browser metadata candidate\n%s", block)
-
-    def _generic_rejection_record(self, response: Any) -> dict[str, Any]:
-        states = {name: "unavailable" for name in (
-            "route_match", "method_match", "datasource_match", "selector_match",
-            "time_match", "target_label_match",
-        )}
-        return self._correlation_record(response, states, None, None, None, None)
+    def _emit_candidate(self) -> None:
+        self.candidate_count += 1
 
     def _ds_query_ref_id(self, response: Any) -> str | None:
         request = getattr(response, "request", None)

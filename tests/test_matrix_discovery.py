@@ -9,7 +9,6 @@ from grafconflux._grafana.matrix_dependencies import ordered_matrix_variables
 from grafconflux._grafana.matrix_discovery import (
     MatrixDiscoveryStatus,
     MatrixValueResolver,
-    safe_discovery_values,
 )
 from grafconflux._shared.grafana_models import ConfigurationError
 
@@ -127,11 +126,11 @@ class TestMatrixValueResolver(unittest.TestCase):
         self.assertIn("/api/datasources/proxy/uid/prom/api/v1/series", proxy_call.args[0])
         self.assertIn("/api/datasources/uid/prom/resources/api/v1/series", resources_call.args[0])
         self.assertEqual(resources_call.kwargs, proxy_call.kwargs)
-        attempts = [line for line in logs.output if "primary_adapter_attempt" in line]
+        attempts = [line for line in logs.output if "Matrix discovery adapter" in line]
         self.assertEqual(len(attempts), 2)
-        self.assertIn("route_family=proxy_uid", attempts[0])
-        self.assertIn("http_status=404", attempts[0])
-        self.assertIn("route_family=uid_resources", attempts[1])
+        self.assertIn("route=proxy_uid", attempts[0])
+        self.assertIn("status=404", attempts[0])
+        self.assertIn("route=uid_resources", attempts[1])
         self.assertIn("outcome=success_nonempty", attempts[1])
 
     def test_series_404_resources_success_can_be_authoritatively_empty(self) -> None:
@@ -263,7 +262,7 @@ class TestMatrixValueResolver(unittest.TestCase):
         self.assertEqual(result.status, MatrixDiscoveryStatus.FAILED)
         self.assertEqual(result.values, [])
 
-    def test_series_failure_logs_detailed_multiline_primary_diagnostic(self) -> None:
+    def test_series_failure_logs_concise_primary_diagnostic(self) -> None:
         session = Mock()
         session.get.return_value = Mock(
             status_code=503,
@@ -275,26 +274,16 @@ class TestMatrixValueResolver(unittest.TestCase):
         with self.assertLogs("grafconflux._grafana.matrix_discovery", level="WARNING") as logs:
             resolver.resolve("pod", {"values_from": {}}, self.timestamp, {"namespace": "private"}, {})
 
-        events = [line for line in logs.output if "primary_adapter_attempt" in line]
+        events = [line for line in logs.output if "Matrix discovery adapter" in line]
         self.assertEqual(len(events), 1)
         diagnostic = events[0]
-        self.assertIn("--- BEGIN MATRIX DISCOVERY PRIMARY ADAPTER ATTEMPT ---\n", diagnostic)
-        self.assertIn("request_url=https://grafana.example/grafana/api/datasources/proxy/uid/prom/api/v1/series?", diagnostic)
-        self.assertIn("request_path_query=/grafana/api/datasources/proxy/uid/prom/api/v1/series?", diagnostic)
-        self.assertIn("match%5B%5D=up%7Bnamespace%3D%22private%22%7D", diagnostic)
-        self.assertIn("route_family=proxy_uid", diagnostic)
-        self.assertIn("http_status=503", diagnostic)
-        self.assertIn("response_content_type=application/json", diagnostic)
-        self.assertIn('response_preview={"status":"error","error":"upstream unavailable"}', diagnostic)
-        self.assertIn("response_classification=non_json", diagnostic)
+        self.assertIn("route=proxy_uid", diagnostic)
+        self.assertIn("status=503", diagnostic)
         self.assertIn("outcome=http_non_2xx", diagnostic)
-        self.assertIn("datasource_uid_source=direct", diagnostic)
-        self.assertIn("datasource_uid=prom", diagnostic)
-        self.assertIn('normalized_selector=up{namespace="private"}', diagnostic)
-        self.assertIn("target_label=pod", diagnostic)
-        self.assertIn("start=1700000000", diagnostic)
-        self.assertIn("end=1700003600", diagnostic)
-        self.assertIn("--- END MATRIX DISCOVERY PRIMARY ADAPTER ATTEMPT ---", diagnostic)
+        self.assertIn("datasource_source=direct", diagnostic)
+        self.assertNotIn("request_url", diagnostic)
+        self.assertNotIn("private", diagnostic)
+        self.assertNotIn("datasource_uid", diagnostic)
 
     def test_primary_exception_diagnostic_redacts_credentials_and_secret_query_values(self) -> None:
         session = Mock()
@@ -309,8 +298,8 @@ class TestMatrixValueResolver(unittest.TestCase):
 
         self.assertEqual(result.status, MatrixDiscoveryStatus.FAILED)
         diagnostic = "\n".join(logs.output)
-        self.assertIn("exception_class=ConnectionError", diagnostic)
-        self.assertIn("exception_message=GET https://grafana.example/grafana/api?token=<redacted>", diagnostic)
+        self.assertIn("error_type=ConnectionError", diagnostic)
+        self.assertNotIn("https://", diagnostic)
         self.assertNotIn("alice", diagnostic)
         self.assertNotIn("password", diagnostic)
         self.assertNotIn("private", diagnostic)
@@ -404,13 +393,6 @@ class TestMatrixValueResolver(unittest.TestCase):
                 self.assertFalse(result.authoritative)
                 self.assertNotEqual(result.status, MatrixDiscoveryStatus.EMPTY)
 
-    def test_safe_values_redact_sensitive_names_and_secret_like_content(self) -> None:
-        self.assertEqual(safe_discovery_values("api_token", ["plain"]), ["<redacted>"])
-        values = safe_discovery_values("service", ["api", "Bearer abcdefghijklmnopqrstuvwxyz", "x" * 100])
-        self.assertEqual(values[0], "api")
-        self.assertEqual(values[1], "<redacted>")
-        self.assertTrue(values[2].endswith("..."))
-
     def resolver(self, session: Mock, query: str, options: list[dict] | None = None) -> MatrixValueResolver:
         dashboard = {
             "templating": {"list": [{
@@ -503,12 +485,10 @@ class TestBrowserMatrixFallback(unittest.TestCase):
 
         self.assertEqual(result.status, MatrixDiscoveryStatus.UNRESOLVED)
         diagnostic = "\n".join(logs.output)
-        self.assertIn("datasource_present=True", diagnostic)
-        self.assertIn("datasource_source=direct", diagnostic)
-        self.assertIn("route_category=proxy_uid", diagnostic)
-        self.assertIn("rejection_reason=datasource_correlation", diagnostic)
-        self.assertIn('expected_selector=kube_pod_info{namespace="private"}', diagnostic)
-        self.assertIn("request_url=https://grafana.example/grafana/", diagnostic)
+        self.assertIn("candidates=2", diagnostic)
+        self.assertIn("rejections=datasource_correlation,time_correlation", diagnostic)
+        self.assertNotIn("private", diagnostic)
+        self.assertNotIn("request_url", diagnostic)
 
     def test_label_response_rejects_same_label_from_another_datasource(self) -> None:
         page = _FakePlanningPage()

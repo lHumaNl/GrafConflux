@@ -113,6 +113,19 @@ def dashboard_variable_current_value(variable: dict[str, Any] | None) -> str | N
     return None
 
 
+def dashboard_variable_current_raw_value(variable: dict[str, Any] | None) -> Any | None:
+    """Return the usable scalar `current.value` without display-text fallback."""
+    current = variable.get("current") if isinstance(variable, dict) else None
+    if not isinstance(current, dict) or "value" not in current:
+        return None
+    value = current["value"]
+    if not isinstance(value, (str, int, float, bool)) or value == "":
+        return None
+    if isinstance(value, str) and value.lower() in ALL_SENTINELS:
+        return None
+    return value
+
+
 def _dashboard_variable_context_value(variable: dict[str, Any] | None) -> tuple[str | None, str]:
     current = variable.get("current") if isinstance(variable, dict) else None
     if isinstance(current, dict):

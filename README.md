@@ -427,8 +427,13 @@ dashboards:
     grafana_url: https://grafana.example.com/grafana
     dash_title: Operations Overview
     vars:
-      region: us
-      ds: {is_datasource: true, value: Prometheus}
+      region:
+        value: us
+        display_name: Region
+      metrics_source:
+        lookup: Metrics source
+        is_datasource: true
+        name: ICAPMock
     render_matrix:
       options:
         row_grouping: [environment]
@@ -436,11 +441,14 @@ dashboards:
         layout: matrix_values_first
       variables:
         environment:
-          alias: Environment
-          grafana_variable: env
+          display_name: Environment
+          hide: false
+          lookup: Environment selector
           values: [prod, stage]
         service:
-          alias: Service
+          display_name: Service
+          hide: false
+          value_aliases: {api: Public API}
           depends_on: environment
           values_by:
             prod: [api, worker]
@@ -450,14 +458,21 @@ dashboards:
 - `values`: explicit list.
 - `values_by`: map dependent values by previously resolved matrix variables. It requires `depends_on`; with multiple dependencies, keys are joined as `value1|value2`.
 - `values_from`: pull options from the Grafana variable named by `grafana_variable` or by the matrix key. Use an object with optional `regex` and `max_values`. A dependent variable with `depends_on` and no explicit value source is treated as `values_from: {}`.
-- `alias`: metadata and Confluence label name. Default is the matrix key.
-- `grafana_variable`: actual Grafana URL variable name. Default is the matrix key.
-- `label_template`: optional row label built from variable keys or aliases, for example `{environment} / {Service}`.
+- `display_name`: user-facing variable name. Matrix `alias` remains supported as a legacy synonym; configuring both with different values is an error.
+- `lookup`: explicit, dashboard-scoped lookup identifier for a Grafana variable. It matches exactly and case-sensitively against the variable's technical `name`, `label`, or `description`. Exactly one variable must match; zero or multiple matches are configuration errors. `lookup` and `grafana_variable` are mutually exclusive.
+- `value_aliases`: exact raw-to-display mappings. Unknown values fall back to their raw string, and list values are mapped element by element.
+- `hide`: presentation-only exclusion from automatically generated matrix/Confluence labels, headings, and suffixes. It never removes a variable from Grafana requests, discovery, dependencies, metadata, filenames, or technical identity.
+- `grafana_variable`: actual Grafana URL variable name. Default is the matrix key. Use this for an explicit technical override, or use `lookup` when configuration should not contain the raw URI variable name.
+- `label_template`: optional row label built from variable keys or display names, for example `{environment} / {Service}`. Templates cannot reference hidden variables.
 - `combination_mode`: `product` (default) or `zip`.
-- `options.layout`: optional Confluence matrix layout. The default is `panel_first`, which renders dashboard -> dashboard expand -> panel expands with the matrix artifacts inside each panel. Use `matrix_values_first` for the Test times -> dashboard -> matrix grouping expands -> leaf dashboard links -> `Panels` expand -> panel-expand hierarchy. Use `dashboard_first` to preserve the context-first matrix hierarchy explicitly.
+- `options.layout`: optional Confluence matrix layout. The default is `panel_first`, which renders dashboard -> dashboard expand -> panel expands with the matrix artifacts inside each panel. `matrix_values_first` reserves the deepest matrix dimension for leaves below each panel: dashboard -> every preceding matrix dimension -> `Panels` -> panel -> deepest value link/image. `dashboard_first` preserves the older context-first section hierarchy explicitly.
 - `max_rows`: optional hard limit for resolved matrix rows. Default is 500.
-- Static dashboard `vars` are kept and merged with matrix variables in panel and dashboard links. Datasource variables can use `{is_datasource: true, value: ...}` when the Grafana datasource variable is not named `datasource`.
-- Matrix filenames use stable hashes, not raw variable values.
+- Static dashboard `vars` are kept and merged with matrix variables in panel and dashboard links. Scalar/list shorthand remains valid. Object form accepts `value`, `lookup`, `hide`, `display_name`, and `value_aliases`, plus optional `is_datasource: true`. Datasource objects also accept `name`.
+- A static `lookup` resolves the configuration entry to the matched variable's raw technical name. `value` remains required for generic variables. For `lookup` plus `is_datasource: true`, `value` may be omitted; GrafConflux then uses the matched datasource variable's saved raw current value (normally its datasource UID). If no usable current value exists, configuration fails safely.
+- For `is_datasource: true`, `name` explicitly resolves an exact, case-sensitive Grafana datasource name to its UID after authentication. `name` and `value` are mutually exclusive; no UID-or-name inference is performed. A missing or ambiguous datasource is a safe configuration error.
+- `is_datasource: true` remains an explicit technical datasource priority hint and restricts lookup matching to datasource variables. It is independent of `hide`; hiding a variable does not change datasource resolution.
+- `display_name` never participates in lookup. Lookup identifiers, display names, and configuration keys are never sent to Grafana after lookup resolution; URLs and discovery use only matched technical names and raw values.
+- Presentation names and aliases never alter Grafana URLs. Matrix filenames and hashes use raw technical variable identity, not presentation fields or raw values in filenames.
 
 `values_from` example:
 
@@ -476,13 +491,18 @@ dashboards:
 Behavior notes:
 
 - Default `combination_mode` is `product`; `zip` is also supported and requires equal-length value lists.
+- Explicit `hide` always wins. When omitted, a variable is visible only when its effective raw value set has exactly one value and `value_aliases` is empty. Multiple values or any non-empty alias mapping default to hidden.
+- For `values_from` and context-dependent `values_by`, the omitted-`hide` default is resolved after each effective value set is discovered. This can differ by timestamp or dependency branch and is deterministic for the resolved ordered values.
+- If every matrix context variable is hidden, generated output uses deterministic neutral labels (`Variant 1`, `Variant 2`, and so on).
+- In `matrix_values_first`, one dimension produces dashboard -> `Panels` -> panel -> value leaves. Two dimensions produce dashboard -> first-dimension groups -> `Panels` -> panel -> second-dimension leaves. Additional dimensions add grouping layers in declared/topological order before `Panels`. Hidden dimensions remain part of grouping identity; hidden grouping layers use deterministic neutral `Group N` labels instead of exposing hidden names or values.
 - Grafana `All` options (`$__all`, `__all`, `all`) are excluded from `values_from` resolution.
 - Use `render_matrix.options` for renderer options and `render_matrix.variables` for matrix variables.
 - Top-level `render_matrix.layout` is not supported; put layout under `render_matrix.options.layout`. Existing flat variable keys without top-level layout remain accepted for older configs.
 - `row_grouping` (alias: `group_by`) groups matrix artifacts in Confluence expand sections using the grouped variable aliases, for example `Environment: prod`.
 - In child-page mode, grouped matrix sections are rendered on the child page; the parent page only gets include/expand content when its `%%%graphs%%%` marker exists.
 - Matrix runs also add a `Matrix dashboard links` section with one dashboard link per matrix row.
-- Upload-only replay preserves matrix labels, grouping, and order from saved metadata and `manifest.yaml` when present.
+- Matrix discovery logs contain concise resolution status, source, count, and bounded raw-safe values. Request URLs, datasource UIDs, selectors, response bodies, headers, cookies, and credentials are not emitted by matrix fallback diagnostics.
+- Upload-only replay preserves raw context plus its display-name, display-value, hidden-state snapshot, grouping, and order from saved metadata and `manifest.yaml` when present.
 
 ### Composite images
 

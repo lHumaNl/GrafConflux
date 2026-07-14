@@ -13,6 +13,7 @@ from typing import List
 import yaml
 
 from grafconflux._shared.grafana_models import GrafanaConfigUploader, Panel
+from grafconflux._shared.grafana_models import ConfigurationError
 from grafconflux._orchestration.manifest import assign_artifact_order, write_run_manifest
 from grafconflux._orchestration.paths import build_run_folder_name
 
@@ -27,6 +28,8 @@ class _UploadMergeState:
     backup_dashboard_links: dict[str, list] = field(default_factory=dict)
     confluence_rendering: dict[str, dict] = field(default_factory=dict)
     render_matrix: dict[str, dict | None] = field(default_factory=dict)
+    vars_presentation: dict[str, dict] = field(default_factory=dict)
+    has_vars_presentation_metadata: dict[str, bool] = field(default_factory=dict)
     timestamps: dict[str, list] = field(default_factory=dict)
     panels: dict[str, list] = field(default_factory=dict)
 
@@ -40,6 +43,8 @@ class _UploadMergeState:
         self.backup_dashboard_links[grafana_config.name] = list(grafana_config.backup_dashboard_links)
         self.confluence_rendering[grafana_config.name] = grafana_config.confluence_rendering.to_metadata()
         self.render_matrix[grafana_config.name] = getattr(grafana_config, 'render_matrix', None)
+        self.vars_presentation[grafana_config.name] = getattr(grafana_config, 'vars_presentation', {})
+        self.has_vars_presentation_metadata[grafana_config.name] = _has_vars_presentation_metadata(grafana_config)
         self.timestamps[grafana_config.name] = []
         self.panels[grafana_config.name] = []
 
@@ -86,6 +91,7 @@ def _merge_upload_config(
 ) -> None:
     _append_config_name_once(merge_state, grafana_config.name)
     merge_state.ensure_config(grafana_config)
+    _merge_vars_presentation(merge_state, grafana_config)
     merge_state.snapshot_urls[grafana_config.name].extend(grafana_config.snapshot_urls)
     merge_state.full_links[grafana_config.name].extend(grafana_config.full_links)
     merge_state.matrix_dashboard_links[grafana_config.name].extend(
@@ -97,6 +103,24 @@ def _merge_upload_config(
 def _append_config_name_once(merge_state: _UploadMergeState, config_name: str) -> None:
     if config_name not in merge_state.config_names:
         merge_state.config_names.append(config_name)
+
+
+def _merge_vars_presentation(merge_state: _UploadMergeState, grafana_config: GrafanaConfigUploader) -> None:
+    config_name = grafana_config.name
+    if not _has_vars_presentation_metadata(grafana_config):
+        return
+    if not merge_state.has_vars_presentation_metadata[config_name]:
+        merge_state.vars_presentation[config_name] = grafana_config.vars_presentation
+        merge_state.has_vars_presentation_metadata[config_name] = True
+        return
+    if merge_state.vars_presentation[config_name] != grafana_config.vars_presentation:
+        raise ConfigurationError(
+            f"upload merge for dashboard '{config_name}': vars_presentation metadata differs across folders."
+        )
+
+
+def _has_vars_presentation_metadata(grafana_config: GrafanaConfigUploader) -> bool:
+    return getattr(grafana_config, 'has_vars_presentation_metadata', True)
 
 
 def _merge_upload_panel_data(
@@ -173,7 +197,7 @@ def _merged_upload_config_dict(
     new_folder_graphs: str,
     config_name: str,
 ) -> dict:
-    return {
+    config_dict = {
         'manifest': {'dashboard_order_index': merge_state.config_names.index(config_name)},
         'snapshot_urls': merge_state.snapshot_urls[config_name],
         'full_links': merge_state.full_links[config_name],
@@ -185,6 +209,9 @@ def _merged_upload_config_dict(
         'panels': merge_state.panels[config_name],
         'charts_path': os.path.join(new_folder_graphs, config_name),
     }
+    if merge_state.has_vars_presentation_metadata[config_name]:
+        config_dict['vars_presentation'] = merge_state.vars_presentation[config_name]
+    return config_dict
 
 
 def _write_merged_upload_config_file(new_folder_graphs: str, config_name: str, config_dict: dict) -> None:

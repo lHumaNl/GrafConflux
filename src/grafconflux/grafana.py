@@ -104,6 +104,10 @@ from grafconflux._grafana.composites import generate_composites
 from grafconflux._grafana.credentials import resolve_dashboard_configs
 from grafconflux._grafana.variants import append_variant_tasks
 from grafconflux._grafana.matrix import append_matrix_tasks, build_matrix_dashboard_links
+from grafconflux._grafana.variable_lookup import (
+    resolve_configured_datasource_names,
+    resolve_dashboard_variable_lookups,
+)
 from grafconflux._orchestration.manifest import assign_artifact_order, dashboard_manifest_metadata
 from grafconflux._grafana.rendering import (
     _append_grafana_variables as _append_grafana_variables,
@@ -1063,6 +1067,8 @@ class GrafanaManager:
 
         if self.config.render_matrix:
             save_data.update({'render_matrix': self.config.render_matrix})
+        if self.config.vars_presentation:
+            save_data.update({'vars_presentation': self.config.vars_presentation})
 
         if self.config.snapshot_urls:
             save_data.update({'snapshot_urls': self.config.snapshot_urls})
@@ -1152,6 +1158,8 @@ class GrafanaManager:
 
         dashboard = response.json()['dashboard']
         self.dashboard_model = dashboard
+        resolve_dashboard_variable_lookups(self.config, dashboard)
+        resolve_configured_datasource_names(self.config, self.session, self._grafana_url('/api/datasources'))
         raw_panels = self.extract_panels(dashboard['panels'])
         descriptors = [PanelDescriptor.from_raw_panel(raw_panel) for raw_panel in raw_panels]
         descriptors = apply_disabled_graph_type_filter(descriptors, self.config.disable_graph_types)

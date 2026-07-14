@@ -80,7 +80,8 @@ class TestBrowserMatrixPlanningCorrelation(unittest.TestCase):
         self.assertIn("datasource_correlation", diagnostic)
         self.assertIn("selector_or_label_correlation", diagnostic)
         self.assertIn("time_correlation", diagnostic)
-        self.assertIn("--- BEGIN MATRIX BROWSER METADATA CANDIDATE ---", diagnostic)
+        self.assertIn("candidates=4", diagnostic)
+        self.assertNotIn("request_url", diagnostic)
 
     def test_uid_mismatch_logs_exact_authorized_correlation_evidence_without_headers_or_bodies(self) -> None:
         expected_uid = "expected-uid"
@@ -109,21 +110,11 @@ class TestBrowserMatrixPlanningCorrelation(unittest.TestCase):
 
         self.assertEqual(result.status, MatrixDiscoveryStatus.UNRESOLVED)
         diagnostic = "\n".join(logs.output)
-        self.assertIn("candidate_index=1", diagnostic)
-        self.assertIn("route_category=uid_resources", diagnostic)
-        self.assertIn(f"observed_datasource_uid={observed_uid}", diagnostic)
-        self.assertIn(f"expected_datasource_uid={expected_uid}", diagnostic)
-        self.assertIn("datasource_comparison=mismatch", diagnostic)
-        self.assertIn(f"observed_selector={selector}", diagnostic)
-        self.assertIn(f"expected_selector={selector}", diagnostic)
-        self.assertIn("selector_comparison=match", diagnostic)
-        self.assertIn("observed_start=1700000000", diagnostic)
-        self.assertIn("expected_start=1700000000", diagnostic)
-        self.assertIn("observed_end=1700003600", diagnostic)
-        self.assertIn("time_comparison=match", diagnostic)
-        self.assertIn("response_content_type=application/json", diagnostic)
-        self.assertIn("response_schema=not_inspected", diagnostic)
-        self.assertIn("rejection_reason=datasource_correlation", diagnostic)
+        self.assertIn("candidates=1", diagnostic)
+        self.assertIn("rejections=datasource_correlation", diagnostic)
+        self.assertNotIn(observed_uid, diagnostic)
+        self.assertNotIn(expected_uid, diagnostic)
+        self.assertNotIn(selector, diagnostic)
         self.assertNotIn("response-token-secret", diagnostic)
         self.assertNotIn("response-body-secret", diagnostic)
         self.assertNotIn("session-cookie-secret", diagnostic)
@@ -143,8 +134,8 @@ class TestBrowserMatrixPlanningCorrelation(unittest.TestCase):
             )
 
         diagnostic = "\n".join(logs.output)
-        self.assertEqual(diagnostic.count("--- BEGIN MATRIX BROWSER METADATA CANDIDATE ---"), 10)
-        self.assertIn("candidate_diagnostics_truncated=20", diagnostic)
+        self.assertNotIn("MATRIX BROWSER METADATA CANDIDATE", diagnostic)
+        self.assertIn("candidates=30", diagnostic)
         self.assertNotIn("other-29", diagnostic)
 
     def test_candidate_url_redacts_userinfo_and_secret_query_values(self) -> None:
@@ -160,8 +151,8 @@ class TestBrowserMatrixPlanningCorrelation(unittest.TestCase):
             self.fallback([response]).discover("pod", _pod_variable(), _timestamp(), {"namespace": "app"})
 
         diagnostic = "\n".join(logs.output)
-        self.assertIn("request_url=https://grafana.example/grafana/api/datasources/uid/other/", diagnostic)
-        self.assertIn("token=<redacted>", diagnostic)
+        self.assertNotIn("request_url", diagnostic)
+        self.assertNotIn("https://", diagnostic)
         self.assertNotIn("alice", diagnostic)
         self.assertNotIn("password", diagnostic)
         self.assertNotIn("hidden", diagnostic)
@@ -175,10 +166,10 @@ class TestBrowserMatrixPlanningCorrelation(unittest.TestCase):
             )
 
         diagnostic = "\n".join(logs.output)
-        self.assertIn("--- BEGIN MATRIX PLANNING NAVIGATION ---", diagnostic)
-        self.assertIn("final_page_url=https://grafana.example/grafana/d/uid/dashboard", diagnostic)
-        self.assertIn("http_status=200", diagnostic)
-        self.assertIn("route_classification=dashboard", diagnostic)
+        self.assertIn("navigation variable=pod", diagnostic)
+        self.assertIn("status=200", diagnostic)
+        self.assertIn("route=dashboard", diagnostic)
+        self.assertNotIn("https://", diagnostic)
 
     def test_dom_fallback_logs_safe_login_navigation_telemetry(self) -> None:
         with self.assertLogs(
@@ -189,9 +180,9 @@ class TestBrowserMatrixPlanningCorrelation(unittest.TestCase):
             )
 
         diagnostic = "\n".join(logs.output)
-        self.assertIn("final_page_url=https://identity.example/login", diagnostic)
-        self.assertIn("http_status=302", diagnostic)
-        self.assertIn("route_classification=login_like", diagnostic)
+        self.assertIn("status=302", diagnostic)
+        self.assertIn("route=login_like", diagnostic)
+        self.assertNotIn("https://", diagnostic)
 
     def test_navigation_url_redacts_userinfo_and_secret_query_values(self) -> None:
         navigation_url = (
@@ -207,10 +198,9 @@ class TestBrowserMatrixPlanningCorrelation(unittest.TestCase):
             )
 
         diagnostic = "\n".join(logs.output)
-        self.assertIn(
-            "final_page_url=https://grafana.example/grafana/d/uid/dashboard?from=1700000000000&token=<redacted>",
-            diagnostic,
-        )
+        self.assertIn("status=200", diagnostic)
+        self.assertIn("route=dashboard", diagnostic)
+        self.assertNotIn("https://", diagnostic)
         self.assertNotIn("alice", diagnostic)
         self.assertNotIn("password", diagnostic)
         self.assertNotIn("hidden", diagnostic)
@@ -224,8 +214,8 @@ class TestBrowserMatrixPlanningCorrelation(unittest.TestCase):
             )
 
         diagnostic = "\n".join(logs.output)
-        self.assertIn("http_status=unavailable", diagnostic)
-        self.assertIn("route_classification=other", diagnostic)
+        self.assertIn("status=unavailable", diagnostic)
+        self.assertIn("route=other", diagnostic)
 
     def test_series_response_requires_complete_period_boundaries(self) -> None:
         for missing_boundary in ("start", "end"):

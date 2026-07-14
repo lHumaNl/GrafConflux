@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import re
-import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -13,7 +12,7 @@ from grafconflux._grafana.matrix_context import (
     DiscoveryContextAssembly,
     assemble_discovery_context,
 )
-from grafconflux._grafana.matrix_diagnostics import datasource_diagnostic, primary_adapter_attempt_block, variable_diagnostic
+from grafconflux._grafana.matrix_diagnostics import datasource_diagnostic, variable_diagnostic
 from grafconflux._grafana.matrix_prometheus import (
     datasource_resolution as _datasource_resolution,
     prometheus_label_values_query as _prometheus_label_values_query,
@@ -32,13 +31,7 @@ from grafconflux._grafana.matrix_prometheus_metadata import (
 logger = logging.getLogger(__name__)
 
 PROMETHEUS_DATASOURCE_TYPE = "prometheus"
-SAFE_LOG_VALUE_LIMIT = 5
-SAFE_LOG_VALUE_LENGTH = 64
 SENSITIVE_NAME_PATTERN = re.compile(r"(?:pass|secret|token|cookie|credential|authorization|api.?key)", re.I)
-SECRET_VALUE_PATTERN = re.compile(
-    r"(?:^Bearer\s+|^Basic\s+|(?:token|secret|password|api.?key)=|^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$|^[a-fA-F0-9]{32,}$)",
-    re.I,
-)
 
 
 class MatrixDiscoveryStatus(str, Enum):
@@ -201,19 +194,12 @@ def _prometheus_request(
     route_family: str,
 ) -> tuple[Any, Exception | None]:
     url = _prometheus_url(config.grafana_base_url, datasource_uid, label, series, route_family)
-    started = time.monotonic()
     try:
         response = session.get(url, params=params, timeout=getattr(config, "timeout", None))
     except Exception as error:
-        _log_primary_adapter_attempt(
-            route_family, diagnostics, source_name, label, started, None, error,
-            url, params, datasource_uid,
-        )
+        _log_primary_adapter_attempt(route_family, diagnostics, source_name, None, error)
         return None, error
-    _log_primary_adapter_attempt(
-        route_family, diagnostics, source_name, label, started, response, None,
-        url, params, datasource_uid,
-    )
+    _log_primary_adapter_attempt(route_family, diagnostics, source_name, response, None)
     return response, None
 
 
@@ -347,23 +333,23 @@ def _prometheus_response_result(
 
 
 def _log_primary_adapter_attempt(
-    route_family: str, diagnostics: dict[str, Any], variable: str, label: str,
-    started: float, response: Any, error: Exception | None, url: str,
-    params: dict[str, str], datasource_uid: str,
+    route_family: str,
+    diagnostics: dict[str, Any],
+    variable: str,
+    response: Any,
+    error: Exception | None,
 ) -> None:
-    """Emit one bounded diagnostic block for a primary metadata adapter attempt."""
-    classification, prometheus_status, data_count, outcome = _series_attempt_outcome(response, error)
+    """Emit a concise adapter outcome without request traffic details."""
+    _, _, data_count, outcome = _series_attempt_outcome(response, error)
     resolution = diagnostics["datasource_resolution"]
     log = logger.info if outcome in {"success_empty", "success_nonempty"} else logger.warning
-    block = primary_adapter_attempt_block(
-        url=url, params=params, method="GET", route_family=route_family,
-        datasource_uid=datasource_uid, datasource_uid_source=resolution["uid_source"],
-        target_label=label, variable=variable,
-        duration_ms=round((time.monotonic() - started) * 1000), response=response, error=error,
-        classification=classification, prometheus_status=prometheus_status,
-        data_count=data_count, outcome=outcome,
+    log(
+        "Matrix discovery adapter variable=%s route=%s status=%s outcome=%s count=%s "
+        "datasource_source=%s error_type=%s",
+        safe_discovery_variable(variable), route_family,
+        getattr(response, "status_code", "unavailable"), outcome, data_count,
+        resolution["uid_source"], type(error).__name__ if error else "none",
     )
-    log("Matrix discovery primary_adapter_attempt\n%s", block)
 
 
 def _result(
@@ -414,27 +400,12 @@ def _with_context_assembly(
 def _log_result(variable: str, timestamp: Any, result: MatrixValueResult) -> None:
     log = logger.info if result.authoritative else logger.warning
     log(
-        "Matrix discovery variable=%s timestamp_id=%s range=%s..%s status=%s source=%s reason=%s value_count=%s",
+        "Matrix discovery variable=%s timestamp_id=%s range=%s..%s status=%s source=%s reason=%s "
+        "value_count=%s",
         safe_discovery_variable(variable), timestamp.id_time, timestamp.start_time_timestamp,
         timestamp.end_time_timestamp, result.status.value, result.provenance.get("source"),
         result.provenance.get("method"), len(result.values),
     )
-
-
-def safe_discovery_values(variable: str, values: list[str]) -> list[str]:
-    if SENSITIVE_NAME_PATTERN.search(variable):
-        return ["<redacted>"] if values else []
-    safe = [_safe_discovery_value(value) for value in values[:SAFE_LOG_VALUE_LIMIT]]
-    if len(values) > SAFE_LOG_VALUE_LIMIT:
-        safe.append(f"...(+{len(values) - SAFE_LOG_VALUE_LIMIT})")
-    return safe
-
-
-def _safe_discovery_value(value: str) -> str:
-    text = str(value)
-    if SECRET_VALUE_PATTERN.search(text):
-        return "<redacted>"
-    return text if len(text) <= SAFE_LOG_VALUE_LENGTH else text[:SAFE_LOG_VALUE_LENGTH] + "..."
 
 
 def safe_discovery_variable(variable: str) -> str:

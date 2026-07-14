@@ -7,49 +7,9 @@ import re
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
-from grafconflux._grafana.matrix_diagnostics import (
-    correlation_fingerprint,
-    diagnostic_block,
-    diagnostic_path_query,
-    response_content_type,
-    sanitize_diagnostic_url,
-)
 from grafconflux._grafana.matrix_discovery import _dedupe
 from grafconflux._grafana.matrix_prometheus import resolved_datasource_type_uid
 from grafconflux._grafana.matrix_prometheus_metadata import prometheus_seconds
-
-DATASOURCE_FINGERPRINT_DOMAIN = "matrix-correlation-datasource-uid"
-SELECTOR_FINGERPRINT_DOMAIN = "matrix-correlation-selector"
-LABEL_FINGERPRINT_DOMAIN = "matrix-correlation-label"
-
-
-def correlation_record(
-    response: Any, states: dict[str, str], expected_uid: str | None, observed_uid: str | None,
-    expected_selector: str | None, observed_selector: str | None,
-    expected_label: str, observed_label: str | None, datasource_present: bool,
-    datasource_source: str,
-) -> dict[str, Any]:
-    route, extraction = candidate_route(response)
-    request = getattr(response, "request", None)
-    return {
-        "route_family": route, "method": str(getattr(request, "method", "")).upper() or "none",
-        "status": getattr(response, "status", None), "datasource_extraction_source": extraction,
-        "expected_datasource_present": str(datasource_present).lower(),
-        "expected_datasource_source": datasource_source, **states,
-        "expected_datasource_fingerprint": correlation_fingerprint(DATASOURCE_FINGERPRINT_DOMAIN, expected_uid),
-        "observed_datasource_fingerprint": correlation_fingerprint(DATASOURCE_FINGERPRINT_DOMAIN, observed_uid),
-        "expected_selector_fingerprint": correlation_fingerprint(SELECTOR_FINGERPRINT_DOMAIN, expected_selector),
-        "observed_selector_fingerprint": correlation_fingerprint(SELECTOR_FINGERPRINT_DOMAIN, observed_selector),
-        "expected_label_fingerprint": correlation_fingerprint(LABEL_FINGERPRINT_DOMAIN, expected_label),
-        "observed_label_fingerprint": correlation_fingerprint(LABEL_FINGERPRINT_DOMAIN, observed_label),
-    }
-
-
-def evaluation_record(
-    evaluation: tuple[str | None, str, dict[str, Any]] | None,
-) -> dict[str, Any] | None:
-    return evaluation[2] if evaluation is not None else None
-
 
 def required_match_state(expected: Any, observed: Any) -> str:
     if expected in (None, ""):
@@ -138,110 +98,6 @@ def navigation_telemetry(response: Any, page: Any) -> tuple[int | str, str]:
     status = getattr(response, "status", None)
     safe_status = status if isinstance(status, int) and not isinstance(status, bool) else "unavailable"
     return safe_status, _navigation_route(getattr(page, "url", ""))
-
-
-def navigation_diagnostic(response: Any, page: Any) -> str:
-    """Build the authorized planning navigation block without page content."""
-    status, route = navigation_telemetry(response, page)
-    page_url = sanitize_diagnostic_url(getattr(page, "url", "")) or "unavailable"
-    return diagnostic_block("MATRIX PLANNING NAVIGATION", (
-        ("final_page_url", page_url),
-        ("final_page_path_query", diagnostic_path_query(page_url)),
-        ("http_status", status),
-        ("route_classification", route),
-    ))
-
-
-def metadata_candidate_diagnostic(
-    index: int, response: Any, timestamp: Any, expected_uid: str | None,
-    expected_selector: str | None, expected_label: str, states: dict[str, str],
-    rejection: str, schema: str,
-) -> str:
-    """Build one bounded browser metadata candidate diagnostic block."""
-    url = response_request_url(response)
-    observed_uid, endpoint = _candidate_identity(url)
-    observed_start, observed_end, expected_start, expected_end = _candidate_times(
-        response, timestamp,
-    )
-    observed_match = (observed_selector(url, expected_selector) or "").replace("\0", " | ") or None
-    fields = _candidate_fields(
-        index, response, url, observed_uid, expected_uid, observed_match,
-        expected_selector, observed_start, expected_start, observed_end, expected_end,
-        endpoint, expected_label, states, rejection, schema,
-    )
-    return diagnostic_block("MATRIX BROWSER METADATA CANDIDATE", fields)
-
-
-def response_schema_classification(payload: Any, method: str | None) -> str:
-    """Classify only the parsed response shape; never include response values."""
-    if method in {"prometheus_label_values", "prometheus_series"}:
-        if not isinstance(payload, dict):
-            return "prometheus_schema_invalid"
-        if payload.get("status") != "success":
-            return "prometheus_status_not_success"
-        return "prometheus_success_list" if isinstance(payload.get("data"), list) else "prometheus_schema_invalid"
-    if method == "prometheus_ds_query":
-        return "grafana_ds_results" if isinstance(payload, dict) and isinstance(payload.get("results"), dict) else "grafana_ds_schema_invalid"
-    return "json_unclassified"
-
-
-def _candidate_identity(url: str) -> tuple[str | None, str | None]:
-    route = prometheus_metadata_route(url)
-    return route if route is not None else (None, candidate_endpoint(url))
-
-
-def _candidate_times(response: Any, timestamp: Any) -> tuple[Any, Any, str, str]:
-    request = getattr(response, "request", None)
-    if str(getattr(request, "method", "")).upper() == "POST":
-        payload = request_json(request)
-        observed = payload if isinstance(payload, dict) else {}
-        return (
-            observed.get("from", "unavailable"), observed.get("to", "unavailable"),
-            str(timestamp.start_time_timestamp), str(timestamp.end_time_timestamp),
-        )
-    query = parse_qs(urlparse(response_request_url(response)).query)
-    return (
-        _single_query_value(query, "start"), _single_query_value(query, "end"),
-        prometheus_seconds(timestamp.start_time_timestamp),
-        prometheus_seconds(timestamp.end_time_timestamp),
-    )
-
-
-def _single_query_value(query: dict[str, list[str]], name: str) -> str:
-    values = query.get(name, [])
-    return values[0] if len(values) == 1 else "unavailable"
-
-
-def _candidate_fields(
-    index: int, response: Any, url: str, observed_uid: str | None, expected_uid: str | None,
-    observed_match: str | None, expected_match: str | None, observed_start: Any,
-    expected_start: Any, observed_end: Any, expected_end: Any, endpoint: str | None,
-    expected_label: str, states: dict[str, str], rejection: str, schema: str,
-) -> tuple[tuple[str, Any], ...]:
-    request = getattr(response, "request", None)
-    safe_url = sanitize_diagnostic_url(url)
-    return (
-        ("candidate_index", index), ("request_url", safe_url),
-        ("request_path_query", diagnostic_path_query(safe_url)),
-        ("method", str(getattr(request, "method", "")).upper() or "unavailable"),
-        ("http_status", getattr(response, "status", "unavailable")),
-        ("observed_datasource_uid", observed_uid or "unavailable"),
-        ("expected_datasource_uid", expected_uid or "unavailable"),
-        ("datasource_comparison", states.get("datasource_match", "unavailable")),
-        ("observed_selector", observed_match or "unavailable"),
-        ("expected_selector", expected_match or "unavailable"),
-        ("selector_comparison", states.get("selector_match", "unavailable")),
-        ("observed_start", observed_start), ("expected_start", expected_start),
-        ("observed_end", observed_end), ("expected_end", expected_end),
-        ("time_comparison", states.get("time_match", "unavailable")),
-        ("route_category", candidate_route(response)[0]),
-        ("route_comparison", states.get("route_match", "unavailable")),
-        ("observed_target_label", endpoint_label(endpoint) or "unavailable"),
-        ("expected_target_label", expected_label),
-        ("target_label_comparison", states.get("target_label_match", "unavailable")),
-        ("response_content_type", response_content_type(response)),
-        ("response_schema", schema), ("rejection_reason", rejection),
-    )
 
 
 def _navigation_route(url: Any) -> str:
