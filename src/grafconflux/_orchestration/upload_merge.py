@@ -14,6 +14,7 @@ import yaml
 
 from grafconflux._shared.grafana_models import GrafanaConfigUploader, Panel
 from grafconflux._shared.grafana_models import ConfigurationError
+from grafconflux._shared.matrix_layout import DEFAULT_MATRIX_LAYOUT, validated_metadata_layout
 from grafconflux._orchestration.manifest import assign_artifact_order, write_run_manifest
 from grafconflux._orchestration.paths import build_run_folder_name
 
@@ -28,6 +29,7 @@ class _UploadMergeState:
     backup_dashboard_links: dict[str, list] = field(default_factory=dict)
     confluence_rendering: dict[str, dict] = field(default_factory=dict)
     render_matrix: dict[str, dict | None] = field(default_factory=dict)
+    matrix_schemas: dict[str, frozenset[tuple[tuple[str, str, str, bool, bool], ...]] | None] = field(default_factory=dict)
     vars_presentation: dict[str, dict] = field(default_factory=dict)
     has_vars_presentation_metadata: dict[str, bool] = field(default_factory=dict)
     timestamps: dict[str, list] = field(default_factory=dict)
@@ -43,6 +45,7 @@ class _UploadMergeState:
         self.backup_dashboard_links[grafana_config.name] = list(grafana_config.backup_dashboard_links)
         self.confluence_rendering[grafana_config.name] = grafana_config.confluence_rendering.to_metadata()
         self.render_matrix[grafana_config.name] = getattr(grafana_config, 'render_matrix', None)
+        self.matrix_schemas[grafana_config.name] = _matrix_schema_fingerprints(grafana_config.panels)
         self.vars_presentation[grafana_config.name] = getattr(grafana_config, 'vars_presentation', {})
         self.has_vars_presentation_metadata[grafana_config.name] = _has_vars_presentation_metadata(grafana_config)
         self.timestamps[grafana_config.name] = []
@@ -91,6 +94,7 @@ def _merge_upload_config(
 ) -> None:
     _append_config_name_once(merge_state, grafana_config.name)
     merge_state.ensure_config(grafana_config)
+    _merge_render_matrix(merge_state, grafana_config)
     _merge_vars_presentation(merge_state, grafana_config)
     merge_state.snapshot_urls[grafana_config.name].extend(grafana_config.snapshot_urls)
     merge_state.full_links[grafana_config.name].extend(grafana_config.full_links)
@@ -98,6 +102,85 @@ def _merge_upload_config(
         _shift_matrix_dashboard_links(grafana_config.matrix_dashboard_links, timestamp_offset)
     )
     _merge_upload_panel_data(merge_state, grafana_config, timestamp_offset)
+
+
+def _merge_render_matrix(merge_state: _UploadMergeState, grafana_config: GrafanaConfigUploader) -> None:
+    config_name = grafana_config.name
+    current = merge_state.render_matrix[config_name]
+    incoming = getattr(grafana_config, 'render_matrix', None)
+    if current is None:
+        merge_state.render_matrix[config_name] = copy.deepcopy(incoming)
+        return
+    if incoming is None:
+        return
+    current_layout = _upload_matrix_layout(config_name, current)
+    incoming_layout = _upload_matrix_layout(config_name, incoming)
+    if current_layout != incoming_layout:
+        raise ConfigurationError(
+            f"upload merge for dashboard '{config_name}': render_matrix layouts differ across folders "
+            f"({current_layout} != {incoming_layout})."
+        )
+    _validate_matrix_schema_compatibility(
+        config_name,
+        current_layout,
+        merge_state.matrix_schemas[config_name],
+        _matrix_schema_fingerprints(grafana_config.panels),
+    )
+
+
+def _upload_matrix_layout(config_name: str, matrix: object) -> str:
+    if not isinstance(matrix, dict):
+        raise ConfigurationError(
+            f"upload merge for dashboard '{config_name}': invalid render_matrix layout metadata."
+        )
+    return validated_metadata_layout(matrix.get('layout'))
+
+
+def _validate_matrix_schema_compatibility(
+    config_name: str,
+    layout: str,
+    current_schema: frozenset[tuple[tuple[str, str, str, bool, bool], ...]] | None,
+    incoming_schema: frozenset[tuple[tuple[str, str, str, bool, bool], ...]] | None,
+) -> None:
+    if layout != DEFAULT_MATRIX_LAYOUT:
+        return
+    if current_schema and incoming_schema and current_schema != incoming_schema:
+        raise ConfigurationError(
+            f"upload merge for dashboard '{config_name}': matrix dimension schemas differ across folders."
+        )
+
+
+def _matrix_schema_fingerprints(panels: list[Panel] | None) -> frozenset[tuple[tuple[str, str, str, bool, bool], ...]] | None:
+    """Fingerprint complete matrix context schemas without recording raw dimension values."""
+    artifacts = [
+        artifact
+        for panel in panels or []
+        for artifact in getattr(panel, 'artifacts', []) or []
+        if artifact.get('artifact_type') == 'matrix'
+    ]
+    if not artifacts:
+        return None
+    schemas = [_context_schema(artifact) for artifact in artifacts]
+    return frozenset(schemas) if all(schema is not None for schema in schemas) else None
+
+
+def _context_schema(artifact: dict) -> tuple[tuple[str, str, str, bool, bool], ...] | None:
+    context = (artifact.get('matrix') or {}).get('context_path')
+    if not isinstance(context, list) or not context:
+        return None
+    dimensions = [_context_dimension(item) for item in context]
+    return tuple(dimensions) if all(dimension is not None for dimension in dimensions) else None
+
+
+def _context_dimension(item: object) -> tuple[str, str, str, bool, bool] | None:
+    if not isinstance(item, dict):
+        return None
+    key = item.get('key')
+    variable = item.get('grafana_variable')
+    label = item.get('label')
+    if not all(isinstance(value, str) and value for value in (key, variable, label)):
+        return None
+    return key, variable, label, item.get('hidden') is True, item.get('hide_explicit') is True
 
 
 def _append_config_name_once(merge_state: _UploadMergeState, config_name: str) -> None:

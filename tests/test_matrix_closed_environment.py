@@ -34,9 +34,9 @@ class TestEmptyDashboardContextDefaults(unittest.TestCase):
         )
         diagnostic = "\n".join(logs.output)
         self.assertIn("variable=pod", diagnostic)
-        self.assertIn("timestamp_id=9", diagnostic)
-        self.assertIn("cluster:empty_string:dashboard.current.value", diagnostic)
-        self.assertNotIn("None", diagnostic)
+        self.assertIn("period=1700000000000..1700003600000", diagnostic)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("matrix_discovery variable=pod period=1700000000000..1700003600000 count=1 values=['api-1']", diagnostic)
 
     def test_empty_saved_default_is_used_when_current_is_absent(self) -> None:
         session = self.successful_session()
@@ -124,14 +124,10 @@ class TestEmptyDashboardContextDefaults(unittest.TestCase):
             "uid_source": "direct",
         })
         diagnostic = "\n".join(logs.output)
-        self.assertIn("cluster:empty_string:dashboard.current.value", diagnostic)
-        self.assertIn("namespace:scalar_string:resolved_parent", diagnostic)
-        self.assertIn("pod:saved_current_excluded_matrix", diagnostic)
-        self.assertIn("datasource_source=direct", diagnostic)
-        self.assertNotIn("datasource_uid", diagnostic)
-        self.assertNotIn("normalized_selector", diagnostic)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("matrix_discovery variable=pod period=1700000000000..1700003600000 count=1 values=['api-1']", diagnostic)
 
-    def test_info_diagnostics_are_value_free_and_include_resolution_state(self) -> None:
+    def test_unresolved_discovery_logs_one_safe_final_warning(self) -> None:
         dashboard = {"templating": {"list": [{
             "name": "pod",
             "type": "query",
@@ -140,18 +136,13 @@ class TestEmptyDashboardContextDefaults(unittest.TestCase):
         }]}}
         resolver = MatrixValueResolver(dashboard, Mock(), self.config, dynamic_variable_names={"pod"})
 
-        with self.assertLogs("grafconflux._grafana.matrix_discovery", level="INFO") as logs:
+        with self.assertLogs("grafconflux._grafana.matrix_discovery", level="WARNING") as logs:
             result = resolver.resolve("pod", {"values_from": {}}, self.timestamp, {}, {})
 
         diagnostic = "\n".join(logs.output)
         self.assertEqual(result.status, MatrixDiscoveryStatus.UNSUPPORTED)
-        self.assertIn("dashboard_variable=found", diagnostic)
-        self.assertIn("variable_type=query", diagnostic)
-        self.assertIn("current=missing", diagnostic)
-        self.assertIn("default=missing", diagnostic)
-        self.assertIn("'shape': 'mapping'", diagnostic)
-        self.assertIn("'uid_present': True", diagnostic)
-        self.assertIn("missing_references=['cluster']", diagnostic)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("matrix_discovery variable=pod period=1700000000000..1700003600000 status=unsupported", diagnostic)
         self.assertIn("reason=invalid_or_missing_context", diagnostic)
         self.assertNotIn("fake-uid-should-not-log", diagnostic)
         self.assertNotIn("fake-query-secret", diagnostic)

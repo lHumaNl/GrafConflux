@@ -10,6 +10,7 @@ from grafconflux._shared.confluence_settings import (
 )
 from grafconflux._shared.time import GrafanaTimeDownloader, GrafanaTimeUploader
 from grafconflux._shared.presentation import PRESENTATION_KEYS, default_hidden, display_value
+from grafconflux._shared.matrix_layout import resolved_metadata_matrix
 
 logger = logging.getLogger('grafconflux.grafana')
 
@@ -419,7 +420,7 @@ class GrafanaConfigUploader(GrafanaConfigBase):
         self.full_links: Optional[List[str]] = config['full_links']; self.snapshot_urls: Optional[List[str]] = config.get('snapshot_urls', [])
         self.backup_dashboard_links: List[str] = config.get('backup_dashboard_links', []) or []
         self.matrix_dashboard_links: List[Dict[str, Any]] = config.get('matrix_dashboard_links', []) or []
-        self.render_matrix: Optional[Dict[str, Any]] = config.get('render_matrix')
+        self.render_matrix: Optional[Dict[str, Any]] = resolved_metadata_matrix(config.get('render_matrix'), self.panels)
         self.has_vars_presentation_metadata = 'vars_presentation' in config
         self.vars_presentation = config.get('vars_presentation', {}) or {}
         self.confluence_rendering = confluence_rendering_settings_from_metadata(config)

@@ -1152,7 +1152,7 @@ class TestRenderMatrixReplayAndConfluence(unittest.TestCase):
             config["vars_presentation"] = vars_presentation
         return GrafanaConfigUploader("Demo", config)
 
-    def test_confluence_default_render_matrix_layout_is_panel_first(self) -> None:
+    def test_confluence_default_render_matrix_layout_is_grouped_panels(self) -> None:
         panel = Panel(17, "timeseries", "Requests", 1, ["https://grafana.example/panel/17"])
         panel.artifacts = [{
             "artifact_type": "matrix", "render_status": "rendered", "png_file": "Demo__17__matrix-000-hash__0.png",
@@ -1175,8 +1175,9 @@ class TestRenderMatrixReplayAndConfluence(unittest.TestCase):
         ]
         indexes = [content.index(fragment) for fragment in expected_order]
         self.assertEqual(indexes, sorted(indexes))
-        self.assertIn("Requests (Service: api)", content)
-        self.assertNotIn('ac:parameter ac:name="title">Panels</ac:parameter>', content)
+        self.assertIn(">Service: api</a>", content)
+        self.assertNotIn("Requests (Service: api)", content)
+        self.assertIn('ac:parameter ac:name="title">Panels</ac:parameter>', content)
         self.assertNotIn("Demo (Service: api)", content)
 
     def test_confluence_explicit_dashboard_first_preserves_context_hierarchy(self) -> None:

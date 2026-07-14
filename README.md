@@ -438,7 +438,7 @@ dashboards:
       options:
         row_grouping: [environment]
         label_template: "{Environment} / {Service}"
-        layout: matrix_values_first
+        layout: matrix_grouped_panels
       variables:
         environment:
           display_name: Environment
@@ -465,7 +465,7 @@ dashboards:
 - `grafana_variable`: actual Grafana URL variable name. Default is the matrix key. Use this for an explicit technical override, or use `lookup` when configuration should not contain the raw URI variable name.
 - `label_template`: optional row label built from variable keys or display names, for example `{environment} / {Service}`. Templates cannot reference hidden variables.
 - `combination_mode`: `product` (default) or `zip`.
-- `options.layout`: optional Confluence matrix layout. The default is `panel_first`, which renders dashboard -> dashboard expand -> panel expands with the matrix artifacts inside each panel. `matrix_values_first` reserves the deepest matrix dimension for leaves below each panel: dashboard -> every preceding matrix dimension -> `Panels` -> panel -> deepest value link/image. `dashboard_first` preserves the older context-first section hierarchy explicitly.
+- `options.layout`: optional Confluence matrix layout. The default is `matrix_grouped_panels`: dashboard -> every prefix dimension except the last -> unique final-context dashboard links -> `Panels` -> panel -> final-dimension panel link/image leaves. `matrix_values_first` is the explicit legacy A layout with the same prefix/panel hierarchy but keeps each matching dashboard link inside every panel leaf. Explicit `panel_first` and `dashboard_first` retain their existing structures.
 - `max_rows`: optional hard limit for resolved matrix rows. Default is 500.
 - Static dashboard `vars` are kept and merged with matrix variables in panel and dashboard links. Scalar/list shorthand remains valid. Object form accepts `value`, `lookup`, `hide`, `display_name`, and `value_aliases`, plus optional `is_datasource: true`. Datasource objects also accept `name`.
 - A static `lookup` resolves the configuration entry to the matched variable's raw technical name. `value` remains required for generic variables. For `lookup` plus `is_datasource: true`, `value` may be omitted; GrafConflux then uses the matched datasource variable's saved raw current value (normally its datasource UID). If no usable current value exists, configuration fails safely.
@@ -494,15 +494,16 @@ Behavior notes:
 - Explicit `hide` always wins. When omitted, a variable is visible only when its effective raw value set has exactly one value and `value_aliases` is empty. Multiple values or any non-empty alias mapping default to hidden.
 - For `values_from` and context-dependent `values_by`, the omitted-`hide` default is resolved after each effective value set is discovered. This can differ by timestamp or dependency branch and is deterministic for the resolved ordered values.
 - If every matrix context variable is hidden, generated output uses deterministic neutral labels (`Variant 1`, `Variant 2`, and so on).
-- In `matrix_values_first`, one dimension produces dashboard -> `Panels` -> panel -> value leaves. Two dimensions produce dashboard -> first-dimension groups -> `Panels` -> panel -> second-dimension leaves. Additional dimensions add grouping layers in declared/topological order before `Panels`. Hidden dimensions remain part of grouping identity; hidden grouping layers use deterministic neutral `Group N` labels instead of exposing hidden names or values.
+- In default `matrix_grouped_panels` (B), one dimension produces dashboard -> unique dashboard links -> `Panels` -> panel -> value leaves. Two dimensions produce dashboard -> first-dimension groups -> unique final-dimension dashboard links -> `Panels` -> panel -> second-dimension leaves. Additional dimensions add prefix grouping layers in declared/topological order. Prefix groups use raw context identity and never mix, even when display aliases are equal.
+- B renders each dashboard link once per final raw context and timestamp before `Panels`; panel leaves contain only the final variable display name/value, panel link, and image. The panel title appears only on its parent panel expand. In explicit `matrix_values_first` (A), dashboard links remain inside panel leaves exactly as before.
+- B treats omitted `hide` differently from the legacy layouts: automatically hidden values remain visible as structural prefix/leaf labels. Explicit `hide: true` remains private and uses deterministic neutral `Group N`/`Variant N` labels. A, `panel_first`, and `dashboard_first` retain their existing hide behavior. Raw values still determine grouping, URL, dependency, and artifact identity in every layout.
 - Grafana `All` options (`$__all`, `__all`, `all`) are excluded from `values_from` resolution.
 - Use `render_matrix.options` for renderer options and `render_matrix.variables` for matrix variables.
 - Top-level `render_matrix.layout` is not supported; put layout under `render_matrix.options.layout`. Existing flat variable keys without top-level layout remain accepted for older configs.
 - `row_grouping` (alias: `group_by`) groups matrix artifacts in Confluence expand sections using the grouped variable aliases, for example `Environment: prod`.
 - In child-page mode, grouped matrix sections are rendered on the child page; the parent page only gets include/expand content when its `%%%graphs%%%` marker exists.
-- Matrix runs also add a `Matrix dashboard links` section with one dashboard link per matrix row.
 - Matrix discovery logs contain concise resolution status, source, count, and bounded raw-safe values. Request URLs, datasource UIDs, selectors, response bodies, headers, cookies, and credentials are not emitted by matrix fallback diagnostics.
-- Upload-only replay preserves raw context plus its display-name, display-value, hidden-state snapshot, grouping, and order from saved metadata and `manifest.yaml` when present.
+- Upload-only replay preserves raw context plus its display-name, display-value, hidden-state snapshot, grouping, and order from saved metadata and `manifest.yaml` when present. Metadata without a layout migrates to B, including old upload-only metadata; newly written metadata stores the resolved `matrix_grouped_panels` layout. Merging upload folders rejects different resolved layouts instead of silently choosing one.
 
 ### Composite images
 

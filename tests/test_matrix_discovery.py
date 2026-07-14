@@ -126,12 +126,8 @@ class TestMatrixValueResolver(unittest.TestCase):
         self.assertIn("/api/datasources/proxy/uid/prom/api/v1/series", proxy_call.args[0])
         self.assertIn("/api/datasources/uid/prom/resources/api/v1/series", resources_call.args[0])
         self.assertEqual(resources_call.kwargs, proxy_call.kwargs)
-        attempts = [line for line in logs.output if "Matrix discovery adapter" in line]
-        self.assertEqual(len(attempts), 2)
-        self.assertIn("route=proxy_uid", attempts[0])
-        self.assertIn("status=404", attempts[0])
-        self.assertIn("route=uid_resources", attempts[1])
-        self.assertIn("outcome=success_nonempty", attempts[1])
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("matrix_discovery variable=pod period=period count=1 values=['api-1']", logs.output[0])
 
     def test_series_404_resources_success_can_be_authoritatively_empty(self) -> None:
         session = Mock()
@@ -262,7 +258,7 @@ class TestMatrixValueResolver(unittest.TestCase):
         self.assertEqual(result.status, MatrixDiscoveryStatus.FAILED)
         self.assertEqual(result.values, [])
 
-    def test_series_failure_logs_concise_primary_diagnostic(self) -> None:
+    def test_series_failure_logs_one_concise_final_diagnostic(self) -> None:
         session = Mock()
         session.get.return_value = Mock(
             status_code=503,
@@ -274,13 +270,9 @@ class TestMatrixValueResolver(unittest.TestCase):
         with self.assertLogs("grafconflux._grafana.matrix_discovery", level="WARNING") as logs:
             resolver.resolve("pod", {"values_from": {}}, self.timestamp, {"namespace": "private"}, {})
 
-        events = [line for line in logs.output if "Matrix discovery adapter" in line]
-        self.assertEqual(len(events), 1)
-        diagnostic = events[0]
-        self.assertIn("route=proxy_uid", diagnostic)
-        self.assertIn("status=503", diagnostic)
-        self.assertIn("outcome=http_non_2xx", diagnostic)
-        self.assertIn("datasource_source=direct", diagnostic)
+        self.assertEqual(len(logs.output), 1)
+        diagnostic = logs.output[0]
+        self.assertIn("matrix_discovery variable=pod period=period status=failed reason=prometheus_series", diagnostic)
         self.assertNotIn("request_url", diagnostic)
         self.assertNotIn("private", diagnostic)
         self.assertNotIn("datasource_uid", diagnostic)
@@ -334,13 +326,15 @@ class TestMatrixValueResolver(unittest.TestCase):
         )
         resolver = self.resolver(session, 'label_values(up{namespace="$namespace"}, service)')
 
-        resolver.resolve("service", {"values_from": {}}, self.timestamp, {"namespace": "a"}, {})
-        resolver.resolve("service", {"values_from": {}}, self.timestamp, {"namespace": "a"}, {})
-        resolver.resolve("service", {"values_from": {}}, self.timestamp, {"namespace": "b"}, {})
-        later = SimpleNamespace(**{**vars(self.timestamp), "id_time": 8, "end_time_timestamp": 1_700_007_200_000})
-        resolver.resolve("service", {"values_from": {}}, later, {"namespace": "a"}, {})
+        with self.assertLogs("grafconflux._grafana.matrix_discovery", level="INFO") as logs:
+            resolver.resolve("service", {"values_from": {}}, self.timestamp, {"namespace": "a"}, {})
+            resolver.resolve("service", {"values_from": {}}, self.timestamp, {"namespace": "a"}, {})
+            resolver.resolve("service", {"values_from": {}}, self.timestamp, {"namespace": "b"}, {})
+            later = SimpleNamespace(**{**vars(self.timestamp), "id_time": 8, "end_time_timestamp": 1_700_007_200_000})
+            resolver.resolve("service", {"values_from": {}}, later, {"namespace": "a"}, {})
 
         self.assertEqual(session.get.call_count, 3)
+        self.assertEqual(len(logs.output), 3)
 
     def test_logical_key_does_not_replace_distinct_dashboard_variable(self) -> None:
         session = Mock()

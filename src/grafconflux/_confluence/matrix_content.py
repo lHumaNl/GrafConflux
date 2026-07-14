@@ -12,6 +12,7 @@ from grafconflux._shared.confluence_settings import (
     DESCRIPTION_PANELS,
 )
 from grafconflux._confluence.row_groups import group_entries_by_row, row_group_title
+from grafconflux._shared.matrix_layout import DEFAULT_MATRIX_LAYOUT, validated_metadata_layout
 
 
 def has_matrix_artifacts(grafana_config: Any) -> bool:
@@ -22,6 +23,10 @@ def render_matrix_dashboard(grafana_config: Any, graph_width: int,
                             settings: ConfluenceRenderingSettings | None = None) -> str:
     settings = settings or _settings_for_config(grafana_config)
     layout = _matrix_layout(grafana_config)
+    if layout == "matrix_grouped_panels":
+        from grafconflux._confluence.grouped_matrix_content import render_grouped_panels_dashboard
+
+        return render_grouped_panels_dashboard(grafana_config, graph_width, settings)
     if layout == "matrix_values_first":
         return _render_matrix_values_first_dashboard(grafana_config, graph_width, settings)
     if layout == "panel_first":
@@ -316,7 +321,8 @@ def _full_context_key(context: list[dict[str, str]]) -> str:
 
 def _matrix_layout(grafana_config: Any) -> str:
     matrix = getattr(grafana_config, "render_matrix", None) or {}
-    return str(matrix.get("layout", "panel_first")) if isinstance(matrix, dict) else "panel_first"
+    layout = matrix.get("layout", DEFAULT_MATRIX_LAYOUT) if isinstance(matrix, dict) else DEFAULT_MATRIX_LAYOUT
+    return validated_metadata_layout(layout)
 
 
 def _artifact_title(panel: Any, artifact: dict[str, Any]) -> str:

@@ -12,7 +12,6 @@ from grafconflux._grafana.matrix_context import (
     DiscoveryContextAssembly,
     assemble_discovery_context,
 )
-from grafconflux._grafana.matrix_diagnostics import datasource_diagnostic, variable_diagnostic
 from grafconflux._grafana.matrix_prometheus import (
     datasource_resolution as _datasource_resolution,
     prometheus_label_values_query as _prometheus_label_values_query,
@@ -25,7 +24,6 @@ from grafconflux._grafana.matrix_prometheus_metadata import (
     prometheus_payload_values as _prometheus_payload_values,
     prometheus_seconds as _prometheus_seconds,
     prometheus_url as _prometheus_url,
-    series_attempt_outcome as _series_attempt_outcome,
 )
 
 logger = logging.getLogger(__name__)
@@ -105,7 +103,6 @@ class MatrixValueResolver:
             _public_context(context),
             _public_context(static_vars),
         )
-        _log_context_assembly(source_name, timestamp, assembly, self.dashboard)
         return assembly
 
     def _discover(
@@ -120,11 +117,6 @@ class MatrixValueResolver:
         )
         if api_result.authoritative or self.browser_fallback is None:
             return api_result
-        logger.info(
-            "Matrix discovery primary adapter did not resolve variable=%s timestamp_id=%s status=%s reason=%s; using browser fallback",
-            safe_discovery_variable(source_name), timestamp.id_time, api_result.status.value,
-            api_result.provenance.get("method"),
-        )
         fallback_result = self.browser_fallback.discover(source_name, variable, timestamp, context)
         if fallback_result.authoritative:
             return fallback_result
@@ -171,35 +163,36 @@ def _prometheus_result(
     params = _prometheus_params(metric, timestamp)
     response, error = _prometheus_request(
         session, config, datasource_uid, label, bool(metric), params,
-        diagnostics, source_name, PROXY_UID_ROUTE,
+        PROXY_UID_ROUTE,
     )
     if error is not None:
         result = _result(MatrixDiscoveryStatus.FAILED, [], source_name, timestamp, context, "grafana_api", method)
-        return _with_adapter_diagnostics(result, diagnostics, "request_failed")
+        return _with_adapter_diagnostics(
+            result, {**diagnostics, "error_type": type(error).__name__}, "request_failed",
+        )
     if method == "prometheus_series" and getattr(response, "status_code", None) == 404:
         response, error = _prometheus_request(
             session, config, datasource_uid, label, True, params,
-            diagnostics, source_name, UID_RESOURCES_ROUTE,
+            UID_RESOURCES_ROUTE,
         )
         if error is not None:
             result = _result(MatrixDiscoveryStatus.FAILED, [], source_name, timestamp, context, "grafana_api", method)
-            return _with_adapter_diagnostics(result, diagnostics, "request_failed")
+            return _with_adapter_diagnostics(
+                result, {**diagnostics, "error_type": type(error).__name__}, "request_failed",
+            )
     result = _prometheus_response_result(response, source_name, timestamp, context, method, label)
     return _with_adapter_diagnostics(result, diagnostics)
 
 
 def _prometheus_request(
     session: Any, config: Any, datasource_uid: str, label: str, series: bool,
-    params: dict[str, str], diagnostics: dict[str, Any], source_name: str,
-    route_family: str,
+    params: dict[str, str], route_family: str,
 ) -> tuple[Any, Exception | None]:
     url = _prometheus_url(config.grafana_base_url, datasource_uid, label, series, route_family)
     try:
         response = session.get(url, params=params, timeout=getattr(config, "timeout", None))
     except Exception as error:
-        _log_primary_adapter_attempt(route_family, diagnostics, source_name, None, error)
         return None, error
-    _log_primary_adapter_attempt(route_family, diagnostics, source_name, response, None)
     return response, None
 
 
@@ -332,26 +325,6 @@ def _prometheus_response_result(
     return _result(status, values, source_name, timestamp, context, "grafana_api", method)
 
 
-def _log_primary_adapter_attempt(
-    route_family: str,
-    diagnostics: dict[str, Any],
-    variable: str,
-    response: Any,
-    error: Exception | None,
-) -> None:
-    """Emit a concise adapter outcome without request traffic details."""
-    _, _, data_count, outcome = _series_attempt_outcome(response, error)
-    resolution = diagnostics["datasource_resolution"]
-    log = logger.info if outcome in {"success_empty", "success_nonempty"} else logger.warning
-    log(
-        "Matrix discovery adapter variable=%s route=%s status=%s outcome=%s count=%s "
-        "datasource_source=%s error_type=%s",
-        safe_discovery_variable(variable), route_family,
-        getattr(response, "status_code", "unavailable"), outcome, data_count,
-        resolution["uid_source"], type(error).__name__ if error else "none",
-    )
-
-
 def _result(
     status: MatrixDiscoveryStatus,
     values: list[str],
@@ -398,14 +371,27 @@ def _with_context_assembly(
 
 
 def _log_result(variable: str, timestamp: Any, result: MatrixValueResult) -> None:
-    log = logger.info if result.authoritative else logger.warning
-    log(
-        "Matrix discovery variable=%s timestamp_id=%s range=%s..%s status=%s source=%s reason=%s "
-        "value_count=%s",
-        safe_discovery_variable(variable), timestamp.id_time, timestamp.start_time_timestamp,
-        timestamp.end_time_timestamp, result.status.value, result.provenance.get("source"),
-        result.provenance.get("method"), len(result.values),
+    if result.authoritative:
+        log = logger.warning if result.status is MatrixDiscoveryStatus.EMPTY else logger.info
+        log(
+            "matrix_discovery variable=%s period=%s count=%s values=%s",
+            safe_discovery_variable(variable), _period_identifier(timestamp), len(result.values), result.values,
+        )
+        return
+    error_type = result.provenance.get("error_type")
+    suffix = " error_type=%s" if error_type else ""
+    logger.warning(
+        f"matrix_discovery variable=%s period=%s status=%s reason=%s{suffix}",
+        safe_discovery_variable(variable), _period_identifier(timestamp), result.status.value,
+        result.provenance.get("method"), *([error_type] if error_type else []),
     )
+
+
+def _period_identifier(timestamp: Any) -> str:
+    time_tag = getattr(timestamp, "time_tag", None)
+    if time_tag not in (None, ""):
+        return str(time_tag)
+    return f"{timestamp.start_time_timestamp}..{timestamp.end_time_timestamp}"
 
 
 def safe_discovery_variable(variable: str) -> str:
@@ -431,35 +417,6 @@ def _dashboard_variable(dashboard: dict[str, Any], variable_name: str) -> dict[s
         item for item in variables
         if isinstance(item, dict) and item.get("name") == variable_name
     ), None)
-
-
-def _log_context_assembly(
-    source_name: str,
-    timestamp: Any,
-    assembly: DiscoveryContextAssembly,
-    dashboard: dict[str, Any],
-) -> None:
-    variable = variable_diagnostic(
-        _dashboard_variable(dashboard, source_name), assembly.values, _variable_references,
-    )
-    included = [
-        f"{safe_discovery_variable(name)}:{assembly.value_kinds[name]}:{assembly.sources[name]}"
-        for name in sorted(assembly.values)
-    ]
-    excluded = [
-        f"{safe_discovery_variable(name)}:{reason}"
-        for name, reason in assembly.exclusions
-    ]
-    logger.info(
-        "Matrix discovery diagnostics variable=%s timestamp_id=%s dashboard_variable=%s "
-        "variable_type=%s current=%s default=%s datasource=%s references=%s missing_references=%s "
-        "included=%s excluded=%s",
-        safe_discovery_variable(source_name), timestamp.id_time,
-        variable["found"], variable["type"], variable["current"], variable["default"],
-        datasource_diagnostic(_dashboard_variable(dashboard, source_name), assembly.values),
-        [safe_discovery_variable(name) for name in variable["references"]],
-        [safe_discovery_variable(name) for name in variable["missing_references"]], included, excluded,
-    )
 
 
 def _public_context(context: dict[str, Any]) -> dict[str, Any]:

@@ -8,14 +8,13 @@ from typing import Any
 
 from grafconflux._grafana.matrix_dependencies import configured_dependencies
 from grafconflux._shared.grafana_models import ConfigurationError
+from grafconflux._shared.matrix_layout import DEFAULT_MATRIX_LAYOUT, MATRIX_LAYOUTS
 from grafconflux._shared.presentation import display_name, resolved_hidden
 
 RENDER_MATRIX_KEY = "render_matrix"
 DEFAULT_MAX_MATRIX_VALUES = 50
 DEFAULT_MAX_MATRIX_ROWS = 500
 MATRIX_MODES = {"product", "zip"}
-DEFAULT_MATRIX_LAYOUT = "panel_first"
-MATRIX_LAYOUTS = {"dashboard_first", "matrix_values_first", "panel_first"}
 MATRIX_NESTED_OPTION_KEYS = {
     "enabled", "row_grouping", "group_by", "combination_mode", "label_template", "max_rows", "layout",
 }
@@ -42,6 +41,7 @@ def _normalized_matrix(dashboard_name: str, value: dict[str, Any]) -> dict[str, 
     variables = matrix.pop("variables", None)
     normalized = _flat_options(matrix)
     normalized.update(_nested_options(dashboard_name, nested_options))
+    normalized.setdefault("layout", DEFAULT_MATRIX_LAYOUT)
     normalized_variables = variables if variables is not None else _legacy_variables(matrix)
     if normalized_variables:
         normalized["variables"] = _variables_with_automatic_sources(normalized_variables)
