@@ -608,7 +608,7 @@ class TestRenderMatrixPlanning(unittest.TestCase):
         )
         self.assertEqual(first_matrix["variables"], {"single": "one"})
 
-    def test_all_hidden_matrix_context_uses_neutral_variant_labels(self) -> None:
+    def test_implicit_hide_renders_matrix_values_first_context(self) -> None:
         grafana = self.manager_from_config("""
             dashboards:
               Demo:
@@ -634,11 +634,10 @@ class TestRenderMatrixPlanning(unittest.TestCase):
         content = build_confluence_storage_content([grafana.config], [self.timestamp()], 600)
         self.assertIn('ac:parameter ac:name="title">Panels</ac:parameter>', content)
         self.assertIn('ac:parameter ac:name="title">Requests</ac:parameter>', content)
-        self.assertIn(">Variant 1</a>", content)
-        self.assertIn(">Variant 2</a>", content)
-        self.assertNotIn("Environment: prod", content)
-        self.assertNotIn("Environment: stage", content)
-        self.assertNotIn("environment:", content)
+        self.assertNotIn(">Variant 1</a>", content)
+        self.assertNotIn(">Variant 2</a>", content)
+        self.assertIn("environment: prod", content)
+        self.assertIn("environment: stage", content)
 
     def test_matrix_presentation_does_not_change_hash_or_filename(self) -> None:
         base = """
@@ -1216,7 +1215,6 @@ class TestRenderMatrixReplayAndConfluence(unittest.TestCase):
             '<h2>Demo</h2>',
             'ac:parameter ac:name="title">Demo</ac:parameter>',
             '<h3>Service: api</h3>',
-            'ac:parameter ac:name="title">Service: api</ac:parameter>',
             'https://grafana.example/d?var-service=api',
             '>Service: api</a>',
             'ac:parameter ac:name="title">Panels</ac:parameter>',
@@ -1229,7 +1227,7 @@ class TestRenderMatrixReplayAndConfluence(unittest.TestCase):
         self.assertNotIn('<h5>Requests', content)
         self.assertNotIn('<p>Panels</p>', content)
         self.assertNotIn('<p>Dashboard links</p>', content)
-        self.assertIn('ac:parameter ac:name="title">Service: api</ac:parameter>', content)
+        self.assertNotIn('ac:parameter ac:name="title">Service: api</ac:parameter>', content)
         self.assertIn("<h3>Service: api</h3>", content)
         self.assertIn("https://grafana.example/panel/17", content)
         self.assertIn("https://grafana.example/d?var-service=api", content)
@@ -1257,7 +1255,6 @@ class TestRenderMatrixReplayAndConfluence(unittest.TestCase):
             '<h3>DC: prod</h3>',
             'ac:parameter ac:name="title">DC: prod</ac:parameter>',
             '<h3>Host: app-01</h3>',
-            'ac:parameter ac:name="title">Host: app-01</ac:parameter>',
             'https://grafana.example/d?var-host=app-01',
             'ac:parameter ac:name="title">Panels</ac:parameter>',
             'ac:parameter ac:name="title">Requests</ac:parameter>',
@@ -1266,7 +1263,7 @@ class TestRenderMatrixReplayAndConfluence(unittest.TestCase):
         indexes = [content.index(fragment) for fragment in expected_order]
         self.assertEqual(indexes, sorted(indexes))
         self.assertIn('<h3>Host: app-01</h3>', content)
-        self.assertIn('ac:parameter ac:name="title">Host: app-01</ac:parameter>', content)
+        self.assertNotIn('ac:parameter ac:name="title">Host: app-01</ac:parameter>', content)
         self.assertNotIn('<p>Dashboard links</p>', content)
 
     def test_confluence_matrix_values_first_skips_empty_leaf_dashboard_links_label(self) -> None:
@@ -1344,7 +1341,7 @@ class TestRenderMatrixReplayAndConfluence(unittest.TestCase):
         self.assertIn("https://grafana.example/d?var-service=api", content)
         self.assertNotIn("<p>Dashboard links</p>", content)
 
-    def test_confluence_matrix_values_first_places_links_in_final_value_expand(self) -> None:
+    def test_confluence_matrix_values_first_places_links_under_final_heading(self) -> None:
         panel = Panel(17, "timeseries", "Requests", 1, ["https://grafana.example/panel/17"])
         context_path = [{"key": "service", "label": "Service", "value": "api"}]
         panel.artifacts = [{
@@ -1363,7 +1360,7 @@ class TestRenderMatrixReplayAndConfluence(unittest.TestCase):
         leaf_link = '>Service: api</a>'
         self.assertIn(leaf_link, content)
         self.assertIn('<h3>Service: api</h3>', content)
-        self.assertIn('ac:parameter ac:name="title">Service: api</ac:parameter>', content)
+        self.assertNotIn('ac:parameter ac:name="title">Service: api</ac:parameter>', content)
         self.assertNotIn('<p>Dashboard links</p>', content)
         self.assertLess(content.index('https://grafana.example/d?var-service=api'), content.index('ac:parameter ac:name="title">Panels</ac:parameter>'))
         self.assertLess(content.index('ac:parameter ac:name="title">Panels</ac:parameter>'), content.index('ac:parameter ac:name="title">Requests</ac:parameter>'))

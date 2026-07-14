@@ -24,7 +24,7 @@ class TestConfluenceMatrixHierarchy(unittest.TestCase):
         positions = [content.index(fragment) for fragment in fragments]
         self.assertEqual(positions, sorted(positions))
         self.assertIn("<h3>Service: api</h3>", content)
-        self.assertIn('ac:parameter ac:name="title">Service: api</ac:parameter>', content)
+        self.assertNotIn('ac:parameter ac:name="title">Service: api</ac:parameter>', content)
         self.assertNotIn(">Requests (Service: api)</a>", content)
 
     def test_two_dimensions_render_each_final_value_as_a_separate_branch(self) -> None:
@@ -78,7 +78,7 @@ class TestConfluenceMatrixHierarchy(unittest.TestCase):
         positions = [content.index(fragment) for fragment in fragments]
         self.assertEqual(positions, sorted(positions))
 
-    def test_hidden_prefix_values_keep_separate_neutral_groups(self) -> None:
+    def test_implicit_hidden_prefix_values_are_visible(self) -> None:
         panel = self.panel(
             self.artifact(
                 "hidden-one.png",
@@ -94,10 +94,10 @@ class TestConfluenceMatrixHierarchy(unittest.TestCase):
 
         content = render_matrix_dashboard(self.config(panel), 600)
 
-        self.assertIn("Group 1", content)
-        self.assertIn("Group 2", content)
-        self.assertNotIn("private-a", content)
-        self.assertNotIn("private-b", content)
+        self.assertIn("Namespace: private-a", content)
+        self.assertIn("Namespace: private-b", content)
+        self.assertNotIn("Group 1", content)
+        self.assertNotIn("Group 2", content)
         self.assertEqual(content.count('ac:parameter ac:name="title">Panels</ac:parameter>'), 2)
 
     def test_explicit_hide_false_displays_each_dimension(self) -> None:

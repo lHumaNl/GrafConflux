@@ -187,6 +187,75 @@ class TestMatrixGroupedPanelsRendering(unittest.TestCase):
         self.assertEqual(positions, sorted(positions))
         self.assertEqual(content.count("dashboard-api"), 1)
 
+    def test_matrix_values_first_two_dimension_output_has_plain_final_heading(self) -> None:
+        context = [
+            self.context("namespace", "Namespace", "apps"),
+            self.context("service", "Service", "api"),
+        ]
+        panel = self.panel("Requests", self.artifact("api.png", context, "panel-api"))
+        config = self.config([panel], layout="matrix_values_first")
+        config.matrix_dashboard_links = [self.dashboard_link("dashboard-api", context)]
+
+        content = render_matrix_dashboard(config, 600)
+
+        expected = (
+            '<ac:structured-macro ac:name="expand">\n'
+            '  <ac:parameter ac:name="title">Demo</ac:parameter>\n'
+            '  <ac:rich-text-body>\n'
+            '<h3>Namespace: apps</h3>\n'
+            '<ac:structured-macro ac:name="expand">\n'
+            '  <ac:parameter ac:name="title">Namespace: apps</ac:parameter>\n'
+            '  <ac:rich-text-body>\n'
+            '<h3>Service: api</h3>\n'
+            '<p><a href="dashboard-api">Dashboard</a></p>\n'
+            '<ac:structured-macro ac:name="expand">\n'
+            '  <ac:parameter ac:name="title">Panels</ac:parameter>\n'
+            '  <ac:rich-text-body>\n'
+            '<ac:structured-macro ac:name="expand">\n'
+            '  <ac:parameter ac:name="title">Requests</ac:parameter>\n'
+            '  <ac:rich-text-body>\n'
+            '    <p><a href="panel-api">Service: api</a></p>\n'
+            '    <p><ac:image ac:width="600"><ri:attachment ri:filename="api.png" /></ac:image></p>\n'
+            '  </ac:rich-text-body>\n'
+            '</ac:structured-macro>\n'
+            '  </ac:rich-text-body>\n'
+            '</ac:structured-macro>\n'
+            '  </ac:rich-text-body>\n'
+            '</ac:structured-macro>\n'
+            '  </ac:rich-text-body>\n'
+            '</ac:structured-macro>\n'
+        )
+        self.assertEqual(content, expected)
+
+    def test_matrix_values_first_implicit_hide_renders_all_dimensions(self) -> None:
+        context = [
+            {"key": "namespace", "label": "Namespace", "value": "apps", "raw_value": "apps", "hidden": True},
+            {"key": "service", "label": "Service", "value": "api", "raw_value": "api", "hidden": True},
+        ]
+        panel = self.panel("Requests", self.artifact("api.png", context, "panel-api"))
+        config = self.config([panel], layout="matrix_values_first")
+        config.render_matrix["variables"] = {"namespace": {}, "service": {}}
+
+        content = render_matrix_dashboard(config, 600)
+
+        self.assertIn("Namespace: apps", content)
+        self.assertIn("Service: api", content)
+        self.assertNotIn("Group 1", content)
+        self.assertNotIn(">Variant</a>", content)
+
+    def test_matrix_values_first_explicit_hide_uses_neutral_labels(self) -> None:
+        context = [
+            self.context("namespace", "Namespace", "apps", hidden=True, hide_explicit=True),
+            self.context("service", "Service", "api", hidden=True, hide_explicit=True),
+        ]
+        panel = self.panel("Requests", self.artifact("api.png", context, "panel-api", neutral_label="Variant 1"))
+        content = render_matrix_dashboard(self.config([panel], layout="matrix_values_first"), 600)
+
+        self.assertIn("Group 1", content)
+        self.assertIn(">Variant 1</a>", content)
+        self.assertNotIn("Namespace: apps", content)
+        self.assertNotIn("Service: api", content)
+
     def test_default_grouped_panels_two_dimension_output_is_byte_invariant(self) -> None:
         context = [
             self.context("namespace", "Namespace", "apps"),

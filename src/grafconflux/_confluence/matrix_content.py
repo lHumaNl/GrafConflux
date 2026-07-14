@@ -90,19 +90,19 @@ def _matrix_hierarchy(grafana_config: Any) -> dict[str, Any]:
     for panel in _ordered_panels(getattr(grafana_config, "panels", []) or []):
         for artifact in _matrix_artifacts(panel):
             context = _raw_context_path(artifact)
-            node = _hierarchy_node(root, context)
+            node = _hierarchy_node(grafana_config, root, context)
             entry = node["panels"].setdefault(id(panel), {"panel": panel, "artifacts": []})
             entry["artifacts"].append(artifact)
     return root
 
 
-def _hierarchy_node(root: dict[str, Any], context: list[dict[str, Any]]) -> dict[str, Any]:
+def _hierarchy_node(grafana_config: Any, root: dict[str, Any], context: list[dict[str, Any]]) -> dict[str, Any]:
     node = root
     for item in context:
         children = node["children"]
         identity = _context_identity(item)
         node = children.setdefault(identity, {
-            "title": _hierarchy_group_title(item, len(children) + 1),
+            "title": _hierarchy_group_title(grafana_config, item, len(children) + 1),
             "children": OrderedDict(),
             "panels": OrderedDict(),
         })
@@ -112,10 +112,10 @@ def _hierarchy_node(root: dict[str, Any], context: list[dict[str, Any]]) -> dict
 def _render_hierarchy_node(grafana_config: Any, node: dict[str, Any], graph_width: int,
                            settings: ConfluenceRenderingSettings) -> str:
     title = html.escape(node["title"])
+    if node["panels"]:
+        return _render_hierarchy_leaf(grafana_config, node, graph_width, settings, title)
     content = f'<h3>{title}</h3>\n<ac:structured-macro ac:name="expand">\n'
     content += f'  <ac:parameter ac:name="title">{title}</ac:parameter>\n  <ac:rich-text-body>\n'
-    content += _render_hierarchy_dashboard_links(grafana_config, node["panels"], settings)
-    content += _render_hierarchy_panels(grafana_config, node["panels"], graph_width, settings)
     content += ''.join(
         _render_hierarchy_node(grafana_config, child, graph_width, settings)
         for child in node["children"].values()
@@ -124,12 +124,24 @@ def _render_hierarchy_node(grafana_config: Any, node: dict[str, Any], graph_widt
     return content
 
 
+def _render_hierarchy_leaf(grafana_config: Any, node: dict[str, Any], graph_width: int,
+                           settings: ConfluenceRenderingSettings, title: str) -> str:
+    """Render a complete matrix context without a redundant expand control."""
+    content = f'<h3>{title}</h3>\n'
+    content += _render_hierarchy_dashboard_links(grafana_config, node["panels"], settings)
+    content += _render_hierarchy_panels(grafana_config, node["panels"], graph_width, settings)
+    return content + ''.join(
+        _render_hierarchy_node(grafana_config, child, graph_width, settings)
+        for child in node["children"].values()
+    )
+
+
 def _render_hierarchy_panels(grafana_config: Any, panels: OrderedDict, graph_width: int,
                              settings: ConfluenceRenderingSettings) -> str:
     if not panels:
         return ''
     body = ''.join(
-        _render_hierarchy_panel_entry(entry, graph_width)
+        _render_hierarchy_panel_entry(grafana_config, entry, graph_width)
         for entry in panels.values()
     )
     if settings.enabled(DESCRIPTION_PANELS):
@@ -137,13 +149,13 @@ def _render_hierarchy_panels(grafana_config: Any, panels: OrderedDict, graph_wid
     return body
 
 
-def _render_hierarchy_panel_entry(entry: dict[str, Any], graph_width: int) -> str:
+def _render_hierarchy_panel_entry(grafana_config: Any, entry: dict[str, Any], graph_width: int) -> str:
     panel = entry["panel"]
     title = html.escape(str(getattr(panel, "display_title", panel.title)))
     content = '<ac:structured-macro ac:name="expand">\n'
     content += f'  <ac:parameter ac:name="title">{title}</ac:parameter>\n  <ac:rich-text-body>\n'
     for artifact in _ordered_artifacts(entry["artifacts"]):
-        content += _render_artifact(panel, artifact, graph_width, _hierarchy_leaf_title(artifact))
+        content += _render_artifact(panel, artifact, graph_width, _hierarchy_leaf_title(grafana_config, artifact))
     content += '  </ac:rich-text-body>\n</ac:structured-macro>\n'
     return content
 
@@ -187,9 +199,20 @@ def _render_hierarchy_dashboard_link(grafana_config: Any, artifact: dict[str, An
         if not _same_artifact_link_identity(artifact, link):
             continue
         url = html.escape(str(link.get("url") or ""))
-        label = html.escape(str(link.get("label") or _hierarchy_leaf_title(artifact)))
+        label = html.escape(_hierarchy_dashboard_label(grafana_config, artifact, link))
         return f'<p><a href="{url}">{label}</a></p>\n' if url else ''
     return ''
+
+
+def _hierarchy_dashboard_label(grafana_config: Any, artifact: dict[str, Any], link: dict[str, Any]) -> str:
+    """Replace legacy automatic neutral labels with the visible final dimension."""
+    label = str(link.get("label") or "")
+    matrix = artifact.get("matrix") or {}
+    context = _raw_context_path(artifact)
+    is_visible = bool(context) and not _explicitly_hidden(grafana_config, context[-1])
+    if is_visible and label == str(matrix.get("neutral_label") or ""):
+        return _hierarchy_leaf_title(grafana_config, artifact)
+    return label or _hierarchy_leaf_title(grafana_config, artifact)
 
 
 def _same_artifact_link_identity(artifact: dict[str, Any], link: dict[str, Any]) -> bool:
@@ -376,16 +399,28 @@ def _context_item_label(item: dict[str, str]) -> str:
     return f"{label}: {value}"
 
 
-def _hierarchy_group_title(item: dict[str, Any], ordinal: int) -> str:
-    return f"Group {ordinal}" if item.get("hidden") is True else _context_item_label(item)
+def _hierarchy_group_title(grafana_config: Any, item: dict[str, Any], ordinal: int) -> str:
+    return f"Group {ordinal}" if _explicitly_hidden(grafana_config, item) else _context_item_label(item)
 
 
-def _hierarchy_leaf_title(artifact: dict[str, Any]) -> str:
+def _hierarchy_leaf_title(grafana_config: Any, artifact: dict[str, Any]) -> str:
     context = _raw_context_path(artifact)
-    if context and context[-1].get("hidden") is not True:
+    if context and not _explicitly_hidden(grafana_config, context[-1]):
         return _context_item_label(context[-1])
     matrix = artifact.get("matrix") or {}
     return str(matrix.get("neutral_label") or "Variant")
+
+
+def _explicitly_hidden(grafana_config: Any, item: dict[str, Any]) -> bool:
+    """Keep legacy hidden metadata neutral only when its provenance is unavailable."""
+    if item.get("hidden") is not True:
+        return False
+    if "hide_explicit" in item:
+        return item.get("hide_explicit") is True
+    matrix = getattr(grafana_config, "render_matrix", None)
+    variables = matrix.get("variables") if isinstance(matrix, dict) else None
+    spec = variables.get(item.get("key")) if isinstance(variables, dict) else None
+    return spec.get("hide") is True if isinstance(spec, dict) else True
 
 
 def _context_path(artifact: dict[str, Any]) -> list[dict[str, str]]:
