@@ -176,15 +176,55 @@ class TestMatrixGroupedPanelsRendering(unittest.TestCase):
         content = render_matrix_dashboard(config, 600)
 
         expected_order = (
+            "Service: api",
+            "dashboard-api",
             self.panels_title(),
             self.panel_title("Requests"),
-            "dashboard-api",
             "panel-api",
             "api.png",
         )
         positions = [content.index(fragment) for fragment in expected_order]
         self.assertEqual(positions, sorted(positions))
         self.assertEqual(content.count("dashboard-api"), 1)
+
+    def test_default_grouped_panels_two_dimension_output_is_byte_invariant(self) -> None:
+        context = [
+            self.context("namespace", "Namespace", "apps"),
+            self.context("service", "Service", "api"),
+        ]
+        panel = self.panel("Requests", self.artifact("api.png", context, "panel-api"))
+        config = self.config([panel], layout=None)
+        config.matrix_dashboard_links = [self.dashboard_link("dashboard-api", context)]
+
+        content = render_matrix_dashboard(config, 600)
+
+        expected = (
+            '<ac:structured-macro ac:name="expand">\n'
+            '  <ac:parameter ac:name="title">Demo</ac:parameter>\n'
+            '  <ac:rich-text-body>\n'
+            '<h3>Namespace: apps</h3>\n'
+            '<ac:structured-macro ac:name="expand">\n'
+            '  <ac:parameter ac:name="title">Namespace: apps</ac:parameter>\n'
+            '  <ac:rich-text-body>\n'
+            '<p><a href="dashboard-api">Service: api</a></p>\n'
+            '<ac:structured-macro ac:name="expand">\n'
+            '  <ac:parameter ac:name="title">Panels</ac:parameter>\n'
+            '  <ac:rich-text-body>\n'
+            '<ac:structured-macro ac:name="expand">\n'
+            '  <ac:parameter ac:name="title">Requests</ac:parameter>\n'
+            '  <ac:rich-text-body>\n'
+            '    <p><a href="panel-api">Service: api</a></p>\n'
+            '    <p><ac:image ac:width="600"><ri:attachment ri:filename="api.png" /></ac:image></p>\n'
+            '  </ac:rich-text-body>\n'
+            '</ac:structured-macro>\n'
+            '  </ac:rich-text-body>\n'
+            '</ac:structured-macro>\n'
+            '  </ac:rich-text-body>\n'
+            '</ac:structured-macro>\n'
+            '  </ac:rich-text-body>\n'
+            '</ac:structured-macro>\n'
+        )
+        self.assertEqual(content, expected)
 
     def test_explicit_legacy_layout_contracts_are_unchanged(self) -> None:
         context = [self.context("service", "Service", "api")]

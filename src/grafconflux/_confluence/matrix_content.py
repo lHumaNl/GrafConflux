@@ -76,7 +76,8 @@ def _render_matrix_values_first_dashboard(grafana_config: Any, graph_width: int,
 def _render_matrix_values_first_sections(grafana_config: Any, graph_width: int,
                                           settings: ConfluenceRenderingSettings) -> str:
     hierarchy = _matrix_hierarchy(grafana_config)
-    content = _render_hierarchy_panels(grafana_config, hierarchy["panels"], graph_width, settings)
+    content = _render_hierarchy_dashboard_links(grafana_config, hierarchy["panels"], settings)
+    content += _render_hierarchy_panels(grafana_config, hierarchy["panels"], graph_width, settings)
     content += ''.join(
         _render_hierarchy_node(grafana_config, node, graph_width, settings)
         for node in hierarchy["children"].values()
@@ -89,7 +90,7 @@ def _matrix_hierarchy(grafana_config: Any) -> dict[str, Any]:
     for panel in _ordered_panels(getattr(grafana_config, "panels", []) or []):
         for artifact in _matrix_artifacts(panel):
             context = _raw_context_path(artifact)
-            node = _hierarchy_node(root, context[:-1])
+            node = _hierarchy_node(root, context)
             entry = node["panels"].setdefault(id(panel), {"panel": panel, "artifacts": []})
             entry["artifacts"].append(artifact)
     return root
@@ -113,11 +114,12 @@ def _render_hierarchy_node(grafana_config: Any, node: dict[str, Any], graph_widt
     title = html.escape(node["title"])
     content = f'<h3>{title}</h3>\n<ac:structured-macro ac:name="expand">\n'
     content += f'  <ac:parameter ac:name="title">{title}</ac:parameter>\n  <ac:rich-text-body>\n'
+    content += _render_hierarchy_dashboard_links(grafana_config, node["panels"], settings)
+    content += _render_hierarchy_panels(grafana_config, node["panels"], graph_width, settings)
     content += ''.join(
         _render_hierarchy_node(grafana_config, child, graph_width, settings)
         for child in node["children"].values()
     )
-    content += _render_hierarchy_panels(grafana_config, node["panels"], graph_width, settings)
     content += '  </ac:rich-text-body>\n</ac:structured-macro>\n'
     return content
 
@@ -127,7 +129,7 @@ def _render_hierarchy_panels(grafana_config: Any, panels: OrderedDict, graph_wid
     if not panels:
         return ''
     body = ''.join(
-        _render_hierarchy_panel_entry(grafana_config, entry, graph_width, settings)
+        _render_hierarchy_panel_entry(entry, graph_width)
         for entry in panels.values()
     )
     if settings.enabled(DESCRIPTION_PANELS):
@@ -135,17 +137,46 @@ def _render_hierarchy_panels(grafana_config: Any, panels: OrderedDict, graph_wid
     return body
 
 
-def _render_hierarchy_panel_entry(grafana_config: Any, entry: dict[str, Any], graph_width: int,
-                                  settings: ConfluenceRenderingSettings) -> str:
+def _render_hierarchy_panel_entry(entry: dict[str, Any], graph_width: int) -> str:
     panel = entry["panel"]
     title = html.escape(str(getattr(panel, "display_title", panel.title)))
     content = '<ac:structured-macro ac:name="expand">\n'
     content += f'  <ac:parameter ac:name="title">{title}</ac:parameter>\n  <ac:rich-text-body>\n'
     for artifact in _ordered_artifacts(entry["artifacts"]):
-        content += _render_hierarchy_dashboard_link(grafana_config, artifact, settings)
         content += _render_artifact(panel, artifact, graph_width, _hierarchy_leaf_title(artifact))
     content += '  </ac:rich-text-body>\n</ac:structured-macro>\n'
     return content
+
+
+def _render_hierarchy_dashboard_links(grafana_config: Any, panels: OrderedDict,
+                                      settings: ConfluenceRenderingSettings) -> str:
+    if not panels or not settings.dashboard_links_at_leaf():
+        return ''
+    content = ''
+    rendered_identities: list[tuple[Any, ...]] = []
+    for artifact in _hierarchy_artifacts(panels):
+        identity = _artifact_link_identity(artifact)
+        if identity not in rendered_identities:
+            rendered = _render_hierarchy_dashboard_link(grafana_config, artifact, settings)
+            content += rendered
+            rendered_identities += [identity] if rendered else []
+    return content
+
+
+def _hierarchy_artifacts(panels: OrderedDict) -> list[dict[str, Any]]:
+    return [
+        artifact
+        for entry in panels.values()
+        for artifact in _ordered_artifacts(entry["artifacts"])
+    ]
+
+
+def _artifact_link_identity(artifact: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        _raw_context_signature(_raw_context_path(artifact)),
+        "timestamp_id" in artifact,
+        artifact.get("timestamp_id"),
+    )
 
 
 def _render_hierarchy_dashboard_link(grafana_config: Any, artifact: dict[str, Any],
