@@ -588,10 +588,10 @@ class TestGrafanaConfigLoading(unittest.TestCase):
         self.assertEqual(config.repeating_panels, [
             {"title": "$jvm_memory_pool_heap", "repeat_values": {"mode": "all"}},
             {"title": "$jvm_memory_pool_nonheap", "repeat_values": {
-                "mode": "filter", "include": ["Metaspace"],
+                "mode": "manual", "values": ["Metaspace"],
             }},
             {"title": "$selected", "repeat_values": {
-                "mode": "filter", "include": ["one", "two"],
+                "mode": "manual", "values": ["one", "two"],
             }},
             {"title": "$filtered", "repeat_values": {
                 "mode": "filter",

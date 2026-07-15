@@ -1463,6 +1463,139 @@ class TestGrafanaPanels(unittest.TestCase):
             ["prod-1", "prod-2", "db-1"],
         )
 
+    def test_repeating_scalar_shorthand_uses_explicit_value_without_discovery(self):
+        manager = self.create_manager(
+            enable_repeating_panels=True,
+            repeating_panels=[{"CPU by host": "known-host"}],
+        )
+        manager.dashboard_uid = "dashboard-uid"
+        manager.dashboard_url = "/d/dashboard-uid/dashboard"
+        manager.session.get = Mock(return_value=Mock(
+            status_code=200,
+            json=Mock(return_value={"dashboard": self.dynamic_repeating_dashboard()}),
+        ))
+
+        panels = manager.get_panels(self.create_timestamps(count=1))
+
+        self.assertEqual(
+            [artifact["repeat_value"] for artifact in panels[0].artifacts],
+            ["known-host"],
+        )
+        self.assertEqual(manager.session.get.call_count, 1)
+
+    def test_repeating_all_dynamically_resolves_hidden_query_variable(self):
+        manager = self.create_manager(
+            enable_repeating_panels=True,
+            repeating_panels=["CPU by host"],
+        )
+        manager.dashboard_uid = "dashboard-uid"
+        manager.dashboard_url = "/d/dashboard-uid/dashboard"
+        manager.session.get = Mock(side_effect=[
+            Mock(status_code=200, json=Mock(return_value={
+                "dashboard": self.dynamic_repeating_dashboard(),
+            })),
+            Mock(status_code=200, json=Mock(return_value={
+                "status": "success",
+                "data": [{"host": "host-a"}, {"host": "host-b"}],
+            })),
+        ])
+
+        panels = manager.get_panels(self.create_timestamps(count=1))
+
+        self.assertEqual(
+            [artifact["repeat_value"] for artifact in panels[0].artifacts],
+            ["host-a", "host-b"],
+        )
+        discovery_call = manager.session.get.call_args_list[1]
+        self.assertIn("/api/v1/series", discovery_call.args[0])
+        self.assertEqual(
+            discovery_call.kwargs["params"]["match[]"],
+            'up{namespace="apps"}',
+        )
+
+    def test_repeating_all_dynamic_values_resolve_per_timestamp(self):
+        manager = self.create_manager(
+            enable_repeating_panels=True,
+            repeating_panels=["CPU by host"],
+        )
+        manager.dashboard_uid = "dashboard-uid"
+        manager.dashboard_url = "/d/dashboard-uid/dashboard"
+        manager.session.get = Mock(side_effect=[
+            Mock(status_code=200, json=Mock(return_value={
+                "dashboard": self.dynamic_repeating_dashboard(),
+            })),
+            Mock(status_code=200, json=Mock(return_value={
+                "status": "success", "data": [{"host": "first-host"}],
+            })),
+            Mock(status_code=200, json=Mock(return_value={
+                "status": "success", "data": [{"host": "second-host"}],
+            })),
+        ])
+
+        panels = manager.get_panels(self.create_distinct_timestamps())
+
+        self.assertEqual(
+            [
+                (artifact["timestamp_tag"], artifact["repeat_value"])
+                for artifact in panels[0].artifacts
+            ],
+            [("tag0", "first-host"), ("tag1", "second-host")],
+        )
+        self.assertEqual(manager.session.get.call_args_list[1].kwargs["params"]["start"], "1700000000")
+        self.assertEqual(manager.session.get.call_args_list[2].kwargs["params"]["start"], "1700007200")
+
+    def test_repeating_dynamic_discovery_uses_configured_dependency_override(self):
+        manager = self.create_manager(
+            enable_repeating_panels=True,
+            vars={"namespace": "configured"},
+            repeating_panels=["CPU by host"],
+        )
+        manager.dashboard_uid = "dashboard-uid"
+        manager.dashboard_url = "/d/dashboard-uid/dashboard"
+        manager.session.get = Mock(side_effect=[
+            Mock(status_code=200, json=Mock(return_value={
+                "dashboard": self.dynamic_repeating_dashboard(),
+            })),
+            Mock(status_code=200, json=Mock(return_value={
+                "status": "success", "data": [{"host": "configured-host"}],
+            })),
+        ])
+
+        panels = manager.get_panels(self.create_timestamps(count=1))
+
+        self.assertEqual(
+            [artifact["repeat_value"] for artifact in panels[0].artifacts],
+            ["configured-host"],
+        )
+        self.assertEqual(
+            manager.session.get.call_args_list[1].kwargs["params"]["match[]"],
+            'up{namespace="configured"}',
+        )
+
+    def test_repeating_filter_uses_dynamic_values_when_saved_options_are_empty(self):
+        manager = self.create_manager(
+            enable_repeating_panels=True,
+            repeating_panels=[{"CPU by host": {"regex": "^host-a$"}}],
+        )
+        manager.dashboard_uid = "dashboard-uid"
+        manager.dashboard_url = "/d/dashboard-uid/dashboard"
+        manager.session.get = Mock(side_effect=[
+            Mock(status_code=200, json=Mock(return_value={
+                "dashboard": self.dynamic_repeating_dashboard(),
+            })),
+            Mock(status_code=200, json=Mock(return_value={
+                "status": "success",
+                "data": [{"host": "host-a"}, {"host": "host-b"}],
+            })),
+        ])
+
+        panels = manager.get_panels(self.create_timestamps(count=1))
+
+        self.assertEqual(
+            [artifact["repeat_value"] for artifact in panels[0].artifacts],
+            ["host-a"],
+        )
+
     def test_repeating_panel_fallback_uses_config_vars_before_current(self):
         _, panels = self.get_repeating_panels(
             self.repeating_dashboard(),
@@ -1551,7 +1684,7 @@ class TestGrafanaPanels(unittest.TestCase):
         self.assertEqual([artifact["repeat_value"] for artifact in panels[0].artifacts], ["discovered"])
         self.assertEqual(manager.session.get.call_count, 2)
 
-    def test_explicit_all_and_regex_modes_do_not_call_datasource_without_options(self):
+    def test_explicit_all_and_regex_modes_discover_values_without_saved_options(self):
         for repeat_values in ({"mode": "all"}, {"mode": "regex", "regex": ".*"}):
             with self.subTest(repeat_values=repeat_values):
                 manager = self.create_manager(
@@ -1560,17 +1693,23 @@ class TestGrafanaPanels(unittest.TestCase):
                 )
                 manager.dashboard_uid = "dashboard-uid"
                 manager.dashboard_url = "/d/dashboard-uid/dashboard"
-                manager.session.get = Mock(return_value=Mock(
-                    status_code=200,
-                    json=Mock(return_value={"dashboard": self.prometheus_repeating_dashboard()}),
-                ))
+                manager.session.get = Mock(side_effect=[
+                    Mock(status_code=200, json=Mock(return_value={
+                        "dashboard": self.prometheus_repeating_dashboard(),
+                    })),
+                    Mock(status_code=200, json=Mock(return_value={
+                        "status": "success",
+                        "data": [{"database": "ad"}, {"database": "global"}],
+                    })),
+                ])
 
-                with self.assertLogs("grafconflux.grafana", level="WARNING") as logs:
-                    panels = manager.get_panels(self.create_timestamps(count=1))
+                panels = manager.get_panels(self.create_timestamps(count=1))
 
-                self.assertEqual(panels, [])
-                self.assertEqual(manager.session.get.call_count, 1)
-                self.assertTrue(any("variable_values_unresolved" in message for message in logs.output))
+                self.assertEqual(
+                    [artifact["repeat_value"] for artifact in panels[0].artifacts],
+                    ["ad", "global"],
+                )
+                self.assertEqual(manager.session.get.call_count, 2)
 
     def test_repeating_panel_prometheus_discovery_preserves_current_fallback_on_error(self):
         manager = self.create_manager(
@@ -1780,6 +1919,38 @@ class TestGrafanaPanels(unittest.TestCase):
             "panels": [
                 {"id": 19, "type": "timeseries", "title": "Calls $database", "repeat": "database"},
             ],
+        }
+
+    @staticmethod
+    def dynamic_repeating_dashboard():
+        return {
+            "templating": {"list": [
+                {
+                    "name": "namespace",
+                    "type": "query",
+                    "current": {"text": "apps", "value": "apps"},
+                },
+                {
+                    "name": "host",
+                    "label": "Host",
+                    "type": "query",
+                    "hide": 2,
+                    "datasource": {"type": "prometheus", "uid": "prom"},
+                    "query": {
+                        "queryType": "label_values",
+                        "label": "host",
+                        "query": 'up{namespace="$namespace"}',
+                    },
+                    "options": [],
+                    "current": {"text": "All", "value": "$__all"},
+                },
+            ]},
+            "panels": [{
+                "id": 17,
+                "type": "timeseries",
+                "title": "CPU by host",
+                "repeat": "host",
+            }],
         }
 
 

@@ -15,10 +15,14 @@ from grafconflux._shared.grafana_models import (
     PanelRenderTask,
 )
 from grafconflux._grafana.repeat_tasks import RepeatTaskBuilder
+from grafconflux._grafana.matrix_discovery import MatrixValueResolver
 logger = logging.getLogger('grafconflux.grafana')
 def is_unresolved_repeating_rule(rule: Optional[Dict[str, Any]]) -> bool: return rule is not None and not rule.get('values')
 class RepeatingPlanner:
-    def __init__(self, config, session): self.config = config; self.session = session
+    def __init__(self, config, session):
+        self.config = config
+        self.session = session
+        self._dynamic_resolver: Optional[MatrixValueResolver] = None
     def resolve_repeating_rules(self, dashboard: Dict, descriptors: List[PanelDescriptor],
                                 timestamps: List[GrafanaTimeDownloader]) -> Dict[int, Dict[str, Any]]:
         resolved_rules = {}
@@ -177,10 +181,13 @@ class RepeatingPlanner:
         if not timestamps:
             return {}
         repeat_values = rule.get(REPEAT_VALUES_KEY)
+        mode = repeat_values.get('mode') if isinstance(repeat_values, dict) else None
+        options_available = bool(self._templating_option_values(dashboard, repeat_var, panel_id))
         if (
             REPEAT_VALUES_KEY in rule
             and repeat_values is not None
-            and not (isinstance(repeat_values, dict) and repeat_values.get('mode') == 'auto')
+            and mode != 'auto'
+            and (mode == 'manual' or options_available)
         ):
             values = self._resolve_repeat_values(dashboard, repeat_var, rule, path, panel_id, timestamps)
             return {timestamp.id_time: values for timestamp in timestamps}
@@ -200,7 +207,10 @@ class RepeatingPlanner:
             return self._fallback_repeat_values(dashboard, repeat_var, self._first_timestamp(timestamps))
         if mode == 'manual':
             return self._manual_repeat_values(repeat_values, path)
-        return self._discovered_repeat_values(dashboard, repeat_var, repeat_values, mode, path, panel_id)
+        return self._discovered_repeat_values(
+            dashboard, repeat_var, repeat_values, mode, path, panel_id,
+            self._first_timestamp(timestamps),
+        )
     @staticmethod
     def _first_timestamp(timestamps: List[GrafanaTimeDownloader]) -> Optional[GrafanaTimeDownloader]: return timestamps[0] if timestamps else None
     def _validated_repeat_values_mapping(self, repeat_values: Any, path: str) -> Dict:
@@ -222,14 +232,43 @@ class RepeatingPlanner:
             return value
         self._raise_repeating_error(f'{path}.{REPEAT_VALUES_KEY}.values[{index}]', value, 'non-empty string')
     def _discovered_repeat_values(self, dashboard: Dict, repeat_var: str, repeat_values: Dict,
-                                  mode: str, path: str, panel_id: int) -> List[str]:
+                                   mode: str, path: str, panel_id: int,
+                                   timestamp: Optional[GrafanaTimeDownloader]) -> List[str]:
         values = self._templating_option_values(dashboard, repeat_var, panel_id)
+        if not values:
+            values = self._dynamic_repeat_values(dashboard, repeat_var, timestamp)
         if mode == 'all':
             return values
         if mode == 'filter':
             return self._filtered_repeat_values(values, repeat_values, path)
         patterns = self._compile_repeat_value_patterns(repeat_values.get('regex'), path)
         return [value for value in values if any(pattern.search(value) for pattern in patterns)]
+
+    def _dynamic_repeat_values(self, dashboard: Dict, repeat_var: str,
+                               timestamp: Optional[GrafanaTimeDownloader]) -> List[str]:
+        if timestamp is None:
+            return []
+        if self._dynamic_resolver is None:
+            self._dynamic_resolver = MatrixValueResolver(
+                dashboard,
+                self.session,
+                self.config,
+                dynamic_variable_names={repeat_var},
+            )
+        result = self._dynamic_resolver.resolve(
+            repeat_var,
+            {'values_from': {}},
+            timestamp,
+            {},
+            self.config.vars or {},
+        )
+        if result.authoritative:
+            return result.values
+        logger.warning(
+            f'Repeat variable discovery unresolved repeat_var={repeat_var} '
+            f'status={result.status.value} reason={result.provenance.get("method")}'
+        )
+        return []
 
     def _filtered_repeat_values(self, values: List[str], repeat_values: Dict,
                                 path: str) -> List[str]:

@@ -392,6 +392,11 @@ matches. String and list forms are accepted for `include`, `exclude`, and `regex
 `re.search`. Grafana option order is preserved, duplicate values are removed, and All sentinels are excluded.
 Selectors currently match Grafana `option.value`, not `option.text` or a runtime clone title.
 
+Bare title shorthand and `mode: all`, `mode: regex`, or `mode: filter` use saved Grafana options first. If
+the variable has no concrete saved options, GrafConflux resolves supported query variables for each requested
+time range using the same timestamp- and context-aware Prometheus resolver as `render_matrix`. Scalar/list
+shorthand values are explicit (`mode: manual`) and never trigger discovery.
+
 `mode: auto` preserves the previous explicit-rule fallback to configured `vars`, dashboard current/default,
 and supported datasource-backed discovery. Automatic repeating panels without an explicit rule continue to use
 that auto-resolution behavior.

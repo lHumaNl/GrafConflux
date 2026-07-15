@@ -808,8 +808,8 @@ def _normalized_repeat_shorthand(path: str, value: Any) -> Dict[str, Any]:
         return {'mode': 'all'}
     if isinstance(value, (str, list)):
         return {
-            'mode': 'filter',
-            'include': _normalized_repeat_string_list(path + '.include', value),
+            'mode': 'manual',
+            'values': _normalized_repeat_string_list(path + '.values', value),
         }
     if not isinstance(value, dict):
         raise ConfigurationError(f'{path}: shorthand value must be string, list, or filter mapping.')
