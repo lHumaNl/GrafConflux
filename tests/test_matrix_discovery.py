@@ -127,7 +127,9 @@ class TestMatrixValueResolver(unittest.TestCase):
         self.assertIn("/api/datasources/uid/prom/resources/api/v1/series", resources_call.args[0])
         self.assertEqual(resources_call.kwargs, proxy_call.kwargs)
         self.assertEqual(len(logs.output), 1)
-        self.assertIn("matrix_discovery variable=pod period=period count=1 values=['api-1']", logs.output[0])
+        self.assertIn("matrix_discovery variable=pod timestamp_id=7 count=1", logs.output[0])
+        self.assertNotIn("api-1", logs.output[0])
+        self.assertNotIn("values=", logs.output[0])
 
     def test_series_404_resources_success_can_be_authoritatively_empty(self) -> None:
         session = Mock()
@@ -272,7 +274,7 @@ class TestMatrixValueResolver(unittest.TestCase):
 
         self.assertEqual(len(logs.output), 1)
         diagnostic = logs.output[0]
-        self.assertIn("matrix_discovery variable=pod period=period status=failed reason=prometheus_series", diagnostic)
+        self.assertIn("matrix_discovery variable=pod timestamp_id=7 status=failed reason=prometheus_series", diagnostic)
         self.assertNotIn("request_url", diagnostic)
         self.assertNotIn("private", diagnostic)
         self.assertNotIn("datasource_uid", diagnostic)

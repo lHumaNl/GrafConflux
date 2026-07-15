@@ -338,6 +338,9 @@ def _effective_context_path(matrix: dict[str, Any], variables: dict[str, Any]) -
     context_path = []
     for item in matrix.get("context_path") or []:
         updated = dict(item)
+        if updated.get("synthetic") is True:
+            context_path.append(updated)
+            continue
         grafana_variable = str(updated.get("grafana_variable") or updated.get("key") or "")
         key = str(updated.get("key") or "")
         if grafana_variable in variables:
@@ -353,7 +356,7 @@ def _effective_alias_variables(context_path: list[dict[str, Any]], matrix: dict[
         return {
             str(item.get("label") or item.get("key") or "Variable"): item.get("display_value", item.get("value"))
             for item in context_path
-            if item.get("hidden") is not True
+            if item.get("hidden") is not True and item.get("synthetic") is not True
         }
     return dict(matrix.get("variables") or {})
 
@@ -364,7 +367,7 @@ def _effective_raw_variables(context_path: list[dict[str, Any]], matrix: dict[st
     return {
         str(item.get("key")): item.get("raw_value", item.get("value"))
         for item in context_path
-        if item.get("key")
+        if item.get("key") and item.get("synthetic") is not True
     }
 
 

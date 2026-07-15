@@ -1,0 +1,49 @@
+<ac:structured-macro ac:name="expand">
+  <ac:parameter ac:name="title">Demo</ac:parameter>
+  <ac:rich-text-body>
+<h3>Namespace: payments</h3>
+<ac:structured-macro ac:name="expand">
+  <ac:parameter ac:name="title">Namespace: payments</ac:parameter>
+  <ac:rich-text-body>
+<h3>Service: &lt;API &amp; Core&gt;</h3>
+<ac:structured-macro ac:name="expand">
+  <ac:parameter ac:name="title">Service: &lt;API &amp; Core&gt;</ac:parameter>
+  <ac:rich-text-body>
+<p><a href="dashboard-visible">Pod: pod-visible</a></p>
+<ac:structured-macro ac:name="expand">
+  <ac:parameter ac:name="title">Panels</ac:parameter>
+  <ac:rich-text-body>
+<ac:structured-macro ac:name="expand">
+  <ac:parameter ac:name="title">CPU</ac:parameter>
+  <ac:rich-text-body>
+    <p><a href="panel-visible">Pod: pod-visible</a></p>
+    <p><ac:image ac:width="600"><ri:attachment ri:filename="visible.png" /></ac:image></p>
+  </ac:rich-text-body>
+</ac:structured-macro>
+  </ac:rich-text-body>
+</ac:structured-macro>
+  </ac:rich-text-body>
+</ac:structured-macro>
+<h3>Group 2</h3>
+<ac:structured-macro ac:name="expand">
+  <ac:parameter ac:name="title">Group 2</ac:parameter>
+  <ac:rich-text-body>
+<p><a href="dashboard-hidden">Variant 2</a></p>
+<ac:structured-macro ac:name="expand">
+  <ac:parameter ac:name="title">Panels</ac:parameter>
+  <ac:rich-text-body>
+<ac:structured-macro ac:name="expand">
+  <ac:parameter ac:name="title">CPU</ac:parameter>
+  <ac:rich-text-body>
+    <p><a href="panel-hidden">Variant 2</a></p>
+    <p><ac:image ac:width="600"><ri:attachment ri:filename="hidden.png" /></ac:image></p>
+  </ac:rich-text-body>
+</ac:structured-macro>
+  </ac:rich-text-body>
+</ac:structured-macro>
+  </ac:rich-text-body>
+</ac:structured-macro>
+  </ac:rich-text-body>
+</ac:structured-macro>
+  </ac:rich-text-body>
+</ac:structured-macro>

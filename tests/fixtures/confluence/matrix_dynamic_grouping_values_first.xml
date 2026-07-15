@@ -1,0 +1,45 @@
+<ac:structured-macro ac:name="expand">
+  <ac:parameter ac:name="title">Demo</ac:parameter>
+  <ac:rich-text-body>
+<h3>Namespace: payments</h3>
+<ac:structured-macro ac:name="expand">
+  <ac:parameter ac:name="title">Namespace: payments</ac:parameter>
+  <ac:rich-text-body>
+<h3>Service: Payments API</h3>
+<ac:structured-macro ac:name="expand">
+  <ac:parameter ac:name="title">Service: Payments API</ac:parameter>
+  <ac:rich-text-body>
+<h3>Pod: pod-a</h3>
+<p><a href="dashboard-a">Dashboard</a></p>
+<ac:structured-macro ac:name="expand">
+  <ac:parameter ac:name="title">Panels</ac:parameter>
+  <ac:rich-text-body>
+<ac:structured-macro ac:name="expand">
+  <ac:parameter ac:name="title">CPU</ac:parameter>
+  <ac:rich-text-body>
+    <p><a href="panel-a">Pod: pod-a</a></p>
+    <p><ac:image ac:width="600"><ri:attachment ri:filename="pod-a.png" /></ac:image></p>
+  </ac:rich-text-body>
+</ac:structured-macro>
+  </ac:rich-text-body>
+</ac:structured-macro>
+<h3>Pod: pod-b</h3>
+<p><a href="dashboard-b">Dashboard</a></p>
+<ac:structured-macro ac:name="expand">
+  <ac:parameter ac:name="title">Panels</ac:parameter>
+  <ac:rich-text-body>
+<ac:structured-macro ac:name="expand">
+  <ac:parameter ac:name="title">CPU</ac:parameter>
+  <ac:rich-text-body>
+    <p><a href="panel-b">Pod: pod-b</a></p>
+    <p><ac:image ac:width="600"><ri:attachment ri:filename="pod-b.png" /></ac:image></p>
+  </ac:rich-text-body>
+</ac:structured-macro>
+  </ac:rich-text-body>
+</ac:structured-macro>
+  </ac:rich-text-body>
+</ac:structured-macro>
+  </ac:rich-text-body>
+</ac:structured-macro>
+  </ac:rich-text-body>
+</ac:structured-macro>

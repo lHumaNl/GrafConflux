@@ -374,24 +374,22 @@ def _log_result(variable: str, timestamp: Any, result: MatrixValueResult) -> Non
     if result.authoritative:
         log = logger.warning if result.status is MatrixDiscoveryStatus.EMPTY else logger.info
         log(
-            "matrix_discovery variable=%s period=%s count=%s values=%s",
-            safe_discovery_variable(variable), _period_identifier(timestamp), len(result.values), result.values,
+            "matrix_discovery variable=%s timestamp_id=%s count=%s",
+            safe_discovery_variable(variable), _timestamp_identifier(timestamp), len(result.values),
         )
         return
     error_type = result.provenance.get("error_type")
     suffix = " error_type=%s" if error_type else ""
     logger.warning(
-        f"matrix_discovery variable=%s period=%s status=%s reason=%s{suffix}",
-        safe_discovery_variable(variable), _period_identifier(timestamp), result.status.value,
+        f"matrix_discovery variable=%s timestamp_id=%s status=%s reason=%s{suffix}",
+        safe_discovery_variable(variable), _timestamp_identifier(timestamp), result.status.value,
         result.provenance.get("method"), *([error_type] if error_type else []),
     )
 
 
-def _period_identifier(timestamp: Any) -> str:
-    time_tag = getattr(timestamp, "time_tag", None)
-    if time_tag not in (None, ""):
-        return str(time_tag)
-    return f"{timestamp.start_time_timestamp}..{timestamp.end_time_timestamp}"
+def _timestamp_identifier(timestamp: Any) -> Any:
+    value = getattr(timestamp, "id_time", None)
+    return value if value is not None else "unknown"
 
 
 def safe_discovery_variable(variable: str) -> str:

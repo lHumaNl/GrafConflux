@@ -457,7 +457,7 @@ dashboards:
 
 - `values`: explicit list.
 - `values_by`: map dependent values by previously resolved matrix variables. It requires `depends_on`; with multiple dependencies, keys are joined as `value1|value2`.
-- `values_from`: pull options from the Grafana variable named by `grafana_variable` or by the matrix key. Use an object with optional `regex` and `max_values`. A dependent variable with `depends_on` and no explicit value source is treated as `values_from: {}`.
+- `values_from`: pull options from the Grafana variable named by `grafana_variable` or by the matrix key. Use an object with optional `regex`, `max_values`, `filters_by_parent`, and `grouping`. A dependent variable with `depends_on` and no explicit value source is treated as `values_from: {}`.
 - `display_name`: user-facing variable name. Matrix `alias` remains supported as a legacy synonym; configuring both with different values is an error.
 - `lookup`: explicit, dashboard-scoped lookup identifier for a Grafana variable. It matches exactly and case-sensitively against the variable's technical `name`, `label`, or `description`. Exactly one variable must match; zero or multiple matches are configuration errors. `lookup` and `grafana_variable` are mutually exclusive.
 - `value_aliases`: exact raw-to-display mappings. Unknown values fall back to their raw string, and list values are mapped element by element.
@@ -487,6 +487,39 @@ dashboards:
             regex: "^(api|worker|db)$"
             max_values: 2
 ```
+
+For dynamic matrix filtering, `values_from.regex`, each `filters_by_parent[].regex`, and each
+named `grouping.rules[].regex` accept either one regex string or a non-empty list of regex
+strings. A list uses OR semantics: a value passes that field when any pattern matches via
+`re.search`. Separate matching parent filters still compose with AND. Multiple patterns from
+one named grouping rule produce only one membership for that rule. A matching
+`override_global` parent filter still disables the complete global regex set for that parent
+context without disabling other matching parent filters.
+
+```yaml
+pod:
+  depends_on: namespace
+  values_from:
+    regex:
+      - '^calculator-covenant-api-.+'
+      - '^matrix-calculator-rate-.+'
+      - '^matrix-offer-generator-.*'
+    filters_by_parent:
+      - when: {namespace: production}
+        regex:
+          - '^calculator-covenant-api-.+'
+          - '^matrix-calculator-rate-.+'
+    grouping:
+      rules:
+        - name: calculators
+          label: Calculator services
+          regex:
+            - '^calculator-covenant-api-.+'
+            - '^matrix-calculator-rate-.+'
+```
+
+Regex lists are intentionally not supported by legacy variable-level `regex` or by
+`grouping.capture.regex`; capture grouping continues to require one regex string.
 
 Behavior notes:
 

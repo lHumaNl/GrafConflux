@@ -1066,7 +1066,9 @@ class GrafanaManager:
         }
 
         if self.config.render_matrix:
-            save_data.update({'render_matrix': self.config.render_matrix})
+            from grafconflux._grafana.matrix_config import serializable_render_matrix
+
+            save_data.update({'render_matrix': serializable_render_matrix(self.config.render_matrix)})
         if self.config.vars_presentation:
             save_data.update({'vars_presentation': self.config.vars_presentation})
 

@@ -6,7 +6,7 @@ from grafconflux._grafana.matrix_discovery import MatrixValueResolver
 
 
 class TestMatrixOperationalDiagnostics(unittest.TestCase):
-    def test_empty_result_log_includes_an_empty_values_list(self) -> None:
+    def test_empty_result_log_includes_only_safe_count(self) -> None:
         dashboard = {"templating": {"list": [{
             "name": "service", "type": "query",
             "datasource": {"type": "prometheus", "uid": "private-uid"},
@@ -20,9 +20,12 @@ class TestMatrixOperationalDiagnostics(unittest.TestCase):
         with self.assertLogs("grafconflux._grafana.matrix_discovery", level="WARNING") as logs:
             MatrixValueResolver(dashboard, session, config).resolve("service", {"values_from": {}}, timestamp, {}, {})
 
-        self.assertEqual(logs.output, ["WARNING:grafconflux._grafana.matrix_discovery:matrix_discovery variable=service period=1700000000000..1700003600000 count=0 values=[]"])
+        self.assertEqual(logs.output, [
+            "WARNING:grafconflux._grafana.matrix_discovery:matrix_discovery "
+            "variable=service timestamp_id=1 count=0"
+        ])
 
-    def test_result_log_includes_complete_discovered_values_without_request_details(self) -> None:
+    def test_result_log_excludes_discovered_values_and_request_details(self) -> None:
         dashboard = {"templating": {"list": [{
             "name": "service",
             "type": "query",
@@ -55,8 +58,10 @@ class TestMatrixOperationalDiagnostics(unittest.TestCase):
 
         diagnostic = "\n".join(logs.output)
         self.assertEqual(len(logs.output), 1)
-        self.assertIn("matrix_discovery variable=service period=1700000000000..1700003600000 count=2", diagnostic)
-        self.assertIn("values=['token=known-secret', 'opaque-private-material-8675309']", diagnostic)
+        self.assertIn("matrix_discovery variable=service timestamp_id=1 count=2", diagnostic)
+        self.assertNotIn("token=known-secret", diagnostic)
+        self.assertNotIn("opaque-private-material-8675309", diagnostic)
+        self.assertNotIn("values=", diagnostic)
         self.assertNotIn("https://", diagnostic)
         self.assertNotIn("private-uid", diagnostic)
         self.assertNotIn("request_url", diagnostic)

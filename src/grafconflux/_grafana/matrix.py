@@ -17,6 +17,7 @@ from grafconflux._grafana.matrix_config import (
 )
 from grafconflux._grafana.matrix_dependencies import configured_dependencies, ordered_matrix_variables
 from grafconflux._grafana.matrix_discovery import MatrixValueResolver, safe_discovery_variable
+from grafconflux._grafana.matrix_dynamic import DynamicOccurrence, DynamicValuePlanner
 from grafconflux._grafana.variable_lookup import resolve_matrix_variable_lookups
 from grafconflux._shared.grafana_models import ConfigurationError, Panel, PanelDescriptor, PanelRenderTask
 from grafconflux._shared.presentation import display_name, display_value, resolved_hidden
@@ -39,6 +40,7 @@ def append_matrix_tasks(
         return render_tasks
     lookup_matrix = resolve_matrix_variable_lookups(config.name, matrix, dashboard)
     planning_matrix = _planning_matrix(config.name, lookup_matrix, dashboard)
+    _validate_dynamic_variant_overrides(config, planning_matrix)
     browser_fallback = (
         BrowserMatrixFallback(config, session, dashboard_url, dashboard=dashboard)
         if dashboard_url else None
@@ -90,7 +92,83 @@ def _planning_matrix(dashboard_name: str, matrix: dict[str, Any], dashboard: dic
     }
     if matrix.get("combination_mode", "product") == "zip" and any(dependencies.values()):
         raise ConfigurationError(_path(dashboard_name, "combination_mode") + ": zip does not support dependent variables.")
+    _validate_dynamic_dependencies(dashboard_name, variables, ordered, dependencies)
     return {**matrix, "variables": variables}
+
+
+def _validate_dynamic_dependencies(
+    dashboard_name: str,
+    variables: dict[str, dict[str, Any]],
+    ordered: list[str],
+    dependencies: dict[str, list[str]],
+) -> None:
+    positions = {key: index for index, key in enumerate(ordered)}
+    for key, spec in variables.items():
+        source = spec.get("values_from")
+        if not isinstance(source, dict):
+            continue
+        conditions = _dynamic_conditions(source)
+        if "filters_by_parent" in source and not dependencies[key]:
+            raise ConfigurationError(
+                _path(dashboard_name, f"variables.{key}.values_from.filters_by_parent")
+                + ": resolved dependencies are required."
+            )
+        for path_suffix, when in conditions:
+            for parent in when:
+                if (
+                    parent not in variables
+                    or parent not in dependencies[key]
+                    or positions.get(parent, len(ordered)) >= positions[key]
+                ):
+                    raise ConfigurationError(
+                        _path(dashboard_name, f"variables.{key}.values_from.{path_suffix}")
+                        + f": parent selector '{parent}' is outside resolved dependencies."
+                    )
+
+
+def _dynamic_conditions(source: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    conditions = [
+        (f"filters_by_parent[{index}].when", item["when"])
+        for index, item in enumerate(source.get("filters_by_parent") or [])
+    ]
+    grouping = source.get("grouping") or {}
+    conditions.extend(
+        (f"grouping.rules[{index}].when", rule["when"])
+        for index, rule in enumerate(grouping.get("rules") or [])
+        if "when" in rule
+    )
+    capture = grouping.get("capture")
+    if isinstance(capture, dict) and "when" in capture:
+        conditions.append(("grouping.capture.when", capture["when"]))
+    return conditions
+
+
+def _validate_dynamic_variant_overrides(config: Any, matrix: dict[str, Any]) -> None:
+    protected: dict[str, str] = {}
+    for key, spec in matrix["variables"].items():
+        source = spec.get("values_from")
+        if isinstance(source, dict) and any(name in source for name in ("filters_by_parent", "grouping")):
+            protected[_grafana_variable(key, spec)] = key
+            protected[key] = key
+    if not protected:
+        return
+    for index, rule in enumerate(getattr(config, "panel_variants", []) or []):
+        variables = rule.get("variables") or {}
+        collision = next((name for name in variables if name in protected), None)
+        if collision is not None:
+            key = protected[collision]
+            raise ConfigurationError(
+                f"dashboards.{config.name}.panel_variants[{index}].variables.{collision}: "
+                f"cannot override filtered/grouped matrix variable '{key}'."
+            )
+
+
+def _has_dynamic_filtering_or_grouping(matrix: dict[str, Any]) -> bool:
+    return any(
+        isinstance(spec.get("values_from"), dict)
+        and any(name in spec["values_from"] for name in ("filters_by_parent", "grouping"))
+        for spec in matrix["variables"].values()
+    )
 
 
 def _rows_by_timestamp(config: Any, matrix: dict[str, Any], dashboard: dict[str, Any],
@@ -107,9 +185,13 @@ def _rows_for_timestamp(config: Any, matrix: dict[str, Any], dashboard: dict[str
     if matrix.get("combination_mode", "product") == "product":
         rows = _product_rows(config, matrix, dashboard, timestamp, static_vars, resolver)
         if not rows:
+            reason = (
+                " reason=filtered_or_unmatched_empty"
+                if _has_dynamic_filtering_or_grouping(matrix) else ""
+            )
             raise ConfigurationError(
                 _path(dashboard_name, "variables")
-                + ": no rows resolved. Check values_from discovery warnings; implicit values_from requires "
+                + f": no rows resolved.{reason} Check values_from discovery warnings; implicit values_from requires "
                 + "a supported Grafana variable query or explicit values/values_by."
             )
         _validate_row_limit(dashboard_name, matrix, len(rows))
@@ -135,22 +217,37 @@ def _extend_rows(config: Any, matrix: dict[str, Any], key: str, spec: dict[str, 
                   rows: list[dict[str, Any]], resolver: MatrixValueResolver) -> list[dict[str, Any]]:
     extended: list[dict[str, Any]] = []
     for row in rows:
-        values, provenance = _values_for_spec(config, key, spec, dashboard, timestamp, row, static_vars, resolver)
-        if not values:
+        values, provenance, occurrences = _values_for_spec(
+            config, key, spec, dashboard, timestamp, row, static_vars, resolver,
+        )
+        if not values or occurrences == []:
             logger.warning(
                 "Render matrix branch skipped dashboard=%s variable=%s timestamp_id=%s context_vars=%s "
-                "reason=authoritative_empty source=%s method=%s",
+                "reason=%s source=%s method=%s discovered=%s after_global=%s after_parent=%s "
+                "unique_capped=%s memberships=%s unmatched=%s emitted_rows=%s",
                 config.name,
                 safe_discovery_variable(key),
                 timestamp.id_time,
                 sorted(str(name) for name in row if not str(name).startswith("__")),
+                (provenance or {}).get("reason") or "authoritative_empty",
                 (provenance or {}).get("source"),
                 (provenance or {}).get("method"),
+                (provenance or {}).get("discovered"),
+                (provenance or {}).get("after_global"),
+                (provenance or {}).get("after_parent"),
+                (provenance or {}).get("unique_capped"),
+                (provenance or {}).get("memberships"),
+                (provenance or {}).get("unmatched"),
+                (provenance or {}).get("emitted_rows"),
             )
             continue
         presentation = _resolved_presentation(key, spec, values)
-        for value in values:
-            extended.append(_extended_row(row, key, value, provenance, presentation))
+        planned = occurrences if occurrences is not None else values
+        for item in planned:
+            if hasattr(item, "membership") and hasattr(item, "value"):
+                extended.append(_extended_grouped_row(row, key, item, provenance, presentation))
+            else:
+                extended.append(_extended_row(row, key, item, provenance, presentation))
             _validate_row_limit(config.name, matrix, len(extended))
     return extended
 
@@ -160,14 +257,17 @@ def _variable_values(config: Any, matrix: dict[str, Any], dashboard: dict[str, A
     values: dict[str, list[str]] = {}
     provenance: dict[str, Any] = {}
     for key, spec in matrix["variables"].items():
-        values[key], variable_provenance = _values_for_spec(config, key, spec, dashboard, timestamp, {}, static_vars, resolver)
+        values[key], variable_provenance, _ = _values_for_spec(
+            config, key, spec, dashboard, timestamp, {}, static_vars, resolver,
+        )
         if variable_provenance:
             provenance[key] = variable_provenance
     return values, provenance
 
 
 def _values_for_spec(config: Any, key: str, spec: dict[str, Any], dashboard: dict[str, Any], timestamp: Any,
-                     context: dict[str, Any], static_vars: dict[str, Any], resolver: MatrixValueResolver) -> tuple[list[str], dict[str, Any] | None]:
+                     context: dict[str, Any], static_vars: dict[str, Any], resolver: MatrixValueResolver
+                     ) -> tuple[list[str], dict[str, Any] | None, list[DynamicOccurrence] | None]:
     provenance = None
     if "values" in spec:
         values = _scalar_list(spec.get("values"))
@@ -180,8 +280,13 @@ def _values_for_spec(config: Any, key: str, spec: dict[str, Any], dashboard: dic
         if not result.authoritative:
             raise ConfigurationError(_discovery_failure(config.name, key, result.provenance))
         values, provenance = result.values, result.provenance
+    planner = spec.get("__dynamic_planner__")
+    if planner is not None and callable(getattr(planner, "plan", None)):
+        result = planner.plan(values, _public_row_context(context))
+        provenance = {**(provenance or {}), **result.provenance}
+        return result.values, provenance, result.occurrences if planner.grouping else None
     values = _filtered_values(spec, values)
-    return values, provenance
+    return values, provenance, None
 
 
 def _discovery_failure(dashboard_name: str, key: str, provenance: dict[str, Any]) -> str:
@@ -204,6 +309,22 @@ def _extended_row(
     if provenance:
         extended["__discovery__"] = {**row.get("__discovery__", {}), key: provenance}
     return extended
+
+
+def _extended_grouped_row(
+    row: dict[str, Any],
+    key: str,
+    occurrence: DynamicOccurrence,
+    provenance: dict[str, Any] | None,
+    presentation: dict[str, Any],
+) -> dict[str, Any]:
+    extended = _extended_row(row, key, occurrence.value, provenance, presentation)
+    extended["__groups__"] = {**row.get("__groups__", {}), key: occurrence.membership}
+    return extended
+
+
+def _public_row_context(row: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in row.items() if not str(key).startswith("__")}
 
 
 def _discovery_context(matrix: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
@@ -255,31 +376,61 @@ def _validate_zip_lengths(values: dict[str, list[str]], dashboard_name: str) -> 
 
 
 def _row_record(dashboard_name: str, matrix: dict[str, Any], index: int, row: dict[str, Any]) -> dict[str, Any]:
-    aliases = _alias_variables(row)
+    aliases = _alias_variables(matrix, row)
+    label_aliases = _label_alias_variables(matrix, row, aliases)
     url_variables = _url_variables(matrix, row)
     raw_variables = {key: row[key] for key in matrix["variables"]}
-    row_hash = _stable_hash(dashboard_name, index, url_variables)
+    groups = _group_metadata(matrix, row)
+    identities = tuple(group["id"] for group in groups)
+    row_hash = _stable_hash(dashboard_name, index, url_variables, identities or None)
     context_path = _context_path(matrix, row)
-    label = _row_label(dashboard_name, matrix, index, row, aliases)
-    return {"index": index, "hash": row_hash, "variables": aliases, "raw_variables": raw_variables,
-            "url_variables": url_variables, "label": label, "neutral_label": f"Variant {index + 1}",
-            "group": _row_group(matrix, row, aliases),
-            "context_path": context_path, "discovery": row.get("__discovery__", {})}
+    label = _row_label(dashboard_name, matrix, index, row, label_aliases)
+    record = {"index": index, "hash": row_hash, "variables": aliases, "raw_variables": raw_variables,
+              "url_variables": url_variables, "label": label, "neutral_label": f"Variant {index + 1}",
+              "group": _row_group(matrix, row, aliases),
+              "context_path": context_path, "discovery": row.get("__discovery__", {})}
+    if groups:
+        record["groups"] = groups
+    return record
 
 
 def _context_path(matrix: dict[str, Any], row: dict[str, Any]) -> list[dict[str, Any]]:
-    return [
-        _context_item(key, spec, row[key], row["__presentation__"][key])
-        for key, spec in matrix["variables"].items()
-    ]
+    context: list[dict[str, Any]] = []
+    grouped = bool(row.get("__groups__"))
+    for key, spec in matrix["variables"].items():
+        if key in row.get("__groups__", {}):
+            context.append(_group_context_item(key, spec, row["__groups__"][key]))
+        item = _context_item(key, spec, row[key], row["__presentation__"][key])
+        if grouped:
+            item["synthetic"] = False
+        context.append(item)
+    return context
 
 
-def _alias_variables(row: dict[str, Any]) -> dict[str, Any]:
+def _alias_variables(matrix: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
     return {
         presentation["display_name"]: display_value(row[key], presentation["value_aliases"])
         for key, presentation in row["__presentation__"].items()
         if not presentation["hidden"]
     }
+
+
+def _label_alias_variables(
+    matrix: dict[str, Any],
+    row: dict[str, Any],
+    aliases: dict[str, Any],
+) -> dict[str, Any]:
+    label_aliases: dict[str, Any] = {}
+    for key, presentation in row["__presentation__"].items():
+        membership = row.get("__groups__", {}).get(key)
+        if membership is not None:
+            dimension = matrix["variables"][key]["values_from"]["grouping"]["dimension"]
+            if not dimension["hide"]:
+                label_aliases[dimension["display_name"]] = membership.display_value
+        display = presentation["display_name"]
+        if display in aliases:
+            label_aliases[display] = aliases[display]
+    return label_aliases
 
 
 def _url_variables(matrix: dict[str, Any], row: dict[str, Any]) -> dict[str, str]:
@@ -349,17 +500,19 @@ def _matrix_task(config: Any, task: PanelRenderTask, row: dict[str, Any]) -> Pan
 
 def _matrix_artifact(dashboard_name: str, panel: Panel, timestamp: Any, row: dict[str, Any], source: dict[str, Any] | None) -> dict[str, Any]:
     file_name = f"{dashboard_name}__{panel.panel_id}__matrix-{row['index']:03d}-{row['hash']}__{timestamp.id_time}.png"
+    matrix_metadata = {"index": row["index"], "hash": row["hash"], "variables": row["variables"],
+                       "raw_variables": row["raw_variables"], "grafana_variables": row["url_variables"],
+                       "label": row["label"], "neutral_label": row["neutral_label"], "group": row.get("group"),
+                       "context_path": row["context_path"], "discovery": row.get("discovery", {})}
+    if row.get("groups"):
+        matrix_metadata["groups"] = row["groups"]
     return {"artifact_type": "matrix", "timestamp_id": timestamp.id_time, "timestamp_tag": timestamp.time_tag,
             "from": str(timestamp.start_time_timestamp), "to": str(timestamp.end_time_timestamp),
             "render_status": "rendered", "png_file": file_name, "skip_reason": None,
             "source_panel_id": panel.panel_id, "source_panel_type": panel.type,
             "source_panel_title": panel.title, "source_panel_display_title": panel.display_title,
             "source_timestamp_id": timestamp.id_time, "display_title": _matrix_panel_title(panel.display_title, row),
-            "repeat_var": source.get("repeat_var") if source else None,
-            "matrix": {"index": row["index"], "hash": row["hash"], "variables": row["variables"],
-                        "raw_variables": row["raw_variables"], "grafana_variables": row["url_variables"],
-                        "label": row["label"], "neutral_label": row["neutral_label"], "group": row.get("group"),
-                        "context_path": row["context_path"], "discovery": row.get("discovery", {})}}
+            "repeat_var": source.get("repeat_var") if source else None, "matrix": matrix_metadata}
 
 
 def _matrix_panel_title(panel_title: str, row: dict[str, Any]) -> str:
@@ -405,6 +558,46 @@ def _context_item(key: str, spec: dict[str, Any], raw_value: str, presentation: 
     }
 
 
+def _group_context_item(key: str, spec: dict[str, Any], membership: Any) -> dict[str, Any]:
+    grouping = spec["values_from"]["grouping"]
+    dimension = grouping["dimension"]
+    return {
+        "key": dimension["key"],
+        "label": dimension["display_name"],
+        "display_name": dimension["display_name"],
+        "value": membership.identity,
+        "raw_value": membership.identity,
+        "display_value": membership.display_value,
+        "value_aliases": {},
+        "hidden": dimension["hide"],
+        "hide_explicit": spec.get("__group_hide_explicit__", False),
+        "grafana_variable": None,
+        "synthetic": True,
+        "kind": "value_group",
+        "source_variable": key,
+        "group_origin": membership.origin,
+        "group_name": membership.name,
+    }
+
+
+def _group_metadata(matrix: dict[str, Any], row: dict[str, Any]) -> list[dict[str, Any]]:
+    groups = []
+    for key, membership in row.get("__groups__", {}).items():
+        dimension = matrix["variables"][key]["values_from"]["grouping"]["dimension"]
+        groups.append({
+            "id": membership.identity,
+            "origin": membership.origin,
+            "name": membership.name,
+            "display_value": membership.display_value,
+            "dimension_key": dimension["key"],
+            "display_name": dimension["display_name"],
+            "source_variable": key,
+            "hidden": dimension["hide"],
+            "hide_explicit": matrix["variables"][key].get("__group_hide_explicit__", False),
+        })
+    return groups
+
+
 def _reject_hidden_template_fields(
     dashboard_name: str,
     matrix: dict[str, Any],
@@ -432,8 +625,17 @@ def _dedupe(values: list[str]) -> list[str]:
     return list(dict.fromkeys(values))
 
 
-def _stable_hash(dashboard_name: str, index: int, variables: dict[str, str]) -> str:
-    payload = repr((dashboard_name, index, sorted(variables.items())))
+def _stable_hash(
+    dashboard_name: str,
+    index: int,
+    variables: dict[str, str],
+    presentation_ids: tuple[str, ...] | None = None,
+) -> str:
+    payload = repr(
+        (dashboard_name, index, sorted(variables.items()))
+        if presentation_ids is None
+        else ("grouped-v1", dashboard_name, index, sorted(variables.items()), presentation_ids)
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:8]
 
 

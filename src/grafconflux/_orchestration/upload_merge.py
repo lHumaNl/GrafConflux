@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import datetime
 import copy
+import datetime
+import logging
 import os
 import re
 import shutil
@@ -19,6 +20,11 @@ from grafconflux._orchestration.manifest import assign_artifact_order, write_run
 from grafconflux._orchestration.paths import build_run_folder_name
 
 
+logger = logging.getLogger(__name__)
+MatrixDimensionFingerprint = tuple[str, bool, str, str, str, bool, bool]
+MatrixSchemaFingerprint = frozenset[tuple[MatrixDimensionFingerprint, ...]] | None
+
+
 @dataclass
 class _UploadMergeState:
     timestamps_count: dict[str, int] = field(default_factory=dict)
@@ -29,7 +35,7 @@ class _UploadMergeState:
     backup_dashboard_links: dict[str, list] = field(default_factory=dict)
     confluence_rendering: dict[str, dict] = field(default_factory=dict)
     render_matrix: dict[str, dict | None] = field(default_factory=dict)
-    matrix_schemas: dict[str, frozenset[tuple[tuple[str, str, str, bool, bool], ...]] | None] = field(default_factory=dict)
+    matrix_schemas: dict[str, MatrixSchemaFingerprint] = field(default_factory=dict)
     vars_presentation: dict[str, dict] = field(default_factory=dict)
     has_vars_presentation_metadata: dict[str, bool] = field(default_factory=dict)
     timestamps: dict[str, list] = field(default_factory=dict)
@@ -108,8 +114,11 @@ def _merge_render_matrix(merge_state: _UploadMergeState, grafana_config: Grafana
     config_name = grafana_config.name
     current = merge_state.render_matrix[config_name]
     incoming = getattr(grafana_config, 'render_matrix', None)
+    incoming_schema = _matrix_schema_fingerprints(grafana_config.panels)
     if current is None:
         merge_state.render_matrix[config_name] = copy.deepcopy(incoming)
+        if incoming_schema is not None:
+            merge_state.matrix_schemas[config_name] = incoming_schema
         return
     if incoming is None:
         return
@@ -124,8 +133,10 @@ def _merge_render_matrix(merge_state: _UploadMergeState, grafana_config: Grafana
         config_name,
         current_layout,
         merge_state.matrix_schemas[config_name],
-        _matrix_schema_fingerprints(grafana_config.panels),
+        incoming_schema,
     )
+    if merge_state.matrix_schemas[config_name] is None and incoming_schema is not None:
+        merge_state.matrix_schemas[config_name] = incoming_schema
 
 
 def _upload_matrix_layout(config_name: str, matrix: object) -> str:
@@ -139,18 +150,23 @@ def _upload_matrix_layout(config_name: str, matrix: object) -> str:
 def _validate_matrix_schema_compatibility(
     config_name: str,
     layout: str,
-    current_schema: frozenset[tuple[tuple[str, str, str, bool, bool], ...]] | None,
-    incoming_schema: frozenset[tuple[tuple[str, str, str, bool, bool], ...]] | None,
+    current_schema: MatrixSchemaFingerprint,
+    incoming_schema: MatrixSchemaFingerprint,
 ) -> None:
-    if layout != DEFAULT_MATRIX_LAYOUT:
+    if layout not in {DEFAULT_MATRIX_LAYOUT, "matrix_values_first"}:
         return
     if current_schema and incoming_schema and current_schema != incoming_schema:
         raise ConfigurationError(
             f"upload merge for dashboard '{config_name}': matrix dimension schemas differ across folders."
         )
+    if current_schema is None or incoming_schema is None:
+        logger.warning(
+            "Upload merge uses legacy matrix schema fallback dashboard=%s reason=insufficient_context_schema",
+            config_name,
+        )
 
 
-def _matrix_schema_fingerprints(panels: list[Panel] | None) -> frozenset[tuple[tuple[str, str, str, bool, bool], ...]] | None:
+def _matrix_schema_fingerprints(panels: list[Panel] | None) -> MatrixSchemaFingerprint:
     """Fingerprint complete matrix context schemas without recording raw dimension values."""
     artifacts = [
         artifact
@@ -164,7 +180,7 @@ def _matrix_schema_fingerprints(panels: list[Panel] | None) -> frozenset[tuple[t
     return frozenset(schemas) if all(schema is not None for schema in schemas) else None
 
 
-def _context_schema(artifact: dict) -> tuple[tuple[str, str, str, bool, bool], ...] | None:
+def _context_schema(artifact: dict) -> tuple[MatrixDimensionFingerprint, ...] | None:
     context = (artifact.get('matrix') or {}).get('context_path')
     if not isinstance(context, list) or not context:
         return None
@@ -172,15 +188,31 @@ def _context_schema(artifact: dict) -> tuple[tuple[str, str, str, bool, bool], .
     return tuple(dimensions) if all(dimension is not None for dimension in dimensions) else None
 
 
-def _context_dimension(item: object) -> tuple[str, str, str, bool, bool] | None:
+def _context_dimension(item: object) -> MatrixDimensionFingerprint | None:
     if not isinstance(item, dict):
         return None
     key = item.get('key')
+    synthetic = item.get('synthetic') is True
     variable = item.get('grafana_variable')
     label = item.get('label')
-    if not all(isinstance(value, str) and value for value in (key, variable, label)):
+    if not isinstance(key, str) or not key or not isinstance(label, str) or not label:
         return None
-    return key, variable, label, item.get('hidden') is True, item.get('hide_explicit') is True
+    if synthetic:
+        if variable is not None:
+            return None
+    elif not isinstance(variable, str) or not variable:
+        return None
+    kind = str(item.get('kind') or ("value_group" if synthetic else "matrix_value"))
+    source_variable = str(item.get('source_variable') or "")
+    return (
+        key,
+        synthetic,
+        kind,
+        source_variable,
+        label,
+        item.get('hidden') is True,
+        item.get('hide_explicit') is True,
+    )
 
 
 def _append_config_name_once(merge_state: _UploadMergeState, config_name: str) -> None:
