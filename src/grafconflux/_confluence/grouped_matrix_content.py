@@ -154,13 +154,15 @@ def _panels_container(body: str, settings: ConfluenceRenderingSettings) -> str:
 
 
 def _render_group_panel(grafana_config: Any, entry: dict[str, Any], graph_width: int) -> str:
-    from grafconflux._confluence.matrix_content import _ordered_artifacts, _render_artifact
+    from grafconflux._confluence.matrix_content import _render_matrix_panel_artifacts
 
     panel = entry["panel"]
     title = html.escape(str(getattr(panel, "display_title", panel.title)))
-    body = ''.join(
-        _render_artifact(panel, artifact, graph_width, _leaf_title(grafana_config, artifact))
-        for artifact in _ordered_artifacts(entry["artifacts"])
+    body = _render_matrix_panel_artifacts(
+        panel,
+        entry["artifacts"],
+        graph_width,
+        lambda artifact: _leaf_title(grafana_config, artifact),
     )
     content = '<ac:structured-macro ac:name="expand">\n'
     content += f'  <ac:parameter ac:name="title">{title}</ac:parameter>\n  <ac:rich-text-body>\n'

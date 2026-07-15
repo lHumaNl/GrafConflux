@@ -30,11 +30,15 @@ class TestDynamicMatrixConfig(unittest.TestCase):
                             "regex": "^app-",
                             "filters_by_parent": [{
                                 "when": {"namespace": "payments"},
-                                "regex": "-api-",
+                                "group_name": "service",
+                                "regex": [
+                                    {"api": "-api-"},
+                                    {"worker": {
+                                        "label": "Background worker",
+                                        "find": ["-worker-", "-consumer-"],
+                                    }},
+                                ],
                             }],
-                            "grouping": {
-                                "rules": [{"name": "api", "regex": "-api-"}],
-                            },
                         },
                     },
                 },
@@ -44,13 +48,171 @@ class TestDynamicMatrixConfig(unittest.TestCase):
         source = matrix["variables"]["pod"]["values_from"]
         self.assertEqual(source["filters_by_parent"][0]["when"], {"namespace": ["payments"]})
         self.assertEqual(source["filters_by_parent"][0]["mode"], "and")
+        self.assertEqual(source["filters_by_parent"][0]["regex"], [
+            "-api-", "-worker-", "-consumer-",
+        ])
         self.assertEqual(source["grouping"]["dimension"], {
-            "key": "pod_group", "display_name": "pod Group", "hide": False,
+            "key": "service", "display_name": "service", "hide": False,
         })
         self.assertEqual(source["grouping"]["rules"][0]["label"], "api")
+        self.assertEqual(source["grouping"]["rules"][0]["when"], {"namespace": ["payments"]})
+        self.assertEqual({
+            key: value for key, value in source["grouping"]["rules"][1].items()
+            if not key.startswith("__")
+        }, {
+            "name": "worker",
+            "label": "Background worker",
+            "regex": ["-worker-", "-consumer-"],
+            "when": {"namespace": ["payments"]},
+        })
         self.assertEqual(source["grouping"]["unmatched"], {
             "enabled": False, "name": "ungrouped", "label": "Ungrouped",
         })
+
+    def test_preserves_grouped_parent_rule_and_pattern_order(self) -> None:
+        matrix = validated_render_matrix("Demo", {
+            "render_matrix": {"variables": {
+                "namespace": {"values": ["first", "second"]},
+                "pod": {"depends_on": "namespace", "values_from": {
+                    "filters_by_parent": [
+                        {
+                            "when": {"namespace": "first"},
+                            "group_name": "service",
+                            "regex": [
+                                {"zeta": ["z-2", "z-1"]},
+                                {"alpha": "a"},
+                            ],
+                        },
+                        {
+                            "when": {"namespace": "second"},
+                            "group_name": "service",
+                            "regex": [{"beta": {"find": ["b-2", "b-1"]}}],
+                        },
+                    ],
+                }},
+            }},
+        })
+
+        source = matrix["variables"]["pod"]["values_from"]
+        self.assertEqual(
+            [item["regex"] for item in source["filters_by_parent"]],
+            [["z-2", "z-1", "a"], ["b-2", "b-1"]],
+        )
+        self.assertEqual(
+            [rule["name"] for rule in source["grouping"]["rules"]],
+            ["zeta", "alpha", "beta"],
+        )
+
+    def test_rejects_legacy_values_from_grouping_with_migration_guidance(self) -> None:
+        with self.assertRaises(ConfigurationError) as captured:
+            validated_render_matrix("Demo", {
+                "render_matrix": {"variables": {"pod": {"values_from": {
+                    "grouping": {"rules": [{"name": "api", "regex": "api"}]},
+                }}}},
+            })
+
+        message = str(captured.exception)
+        self.assertIn("values_from.grouping", message)
+        self.assertIn("filters_by_parent[].group_name", message)
+        self.assertIn("grouped regex entries", message)
+
+    def test_rejects_ambiguous_and_incomplete_grouped_parent_filters(self) -> None:
+        cases = (
+            (
+                {"when": {"namespace": "x"}, "group_name": "service", "regex": ["x", {"api": "api"}]},
+                r"filters_by_parent\[0\]\.regex",
+            ),
+            (
+                {"when": {"namespace": "x"}, "group_name": "service", "regex": "x"},
+                r"filters_by_parent\[0\]\.group_name",
+            ),
+            (
+                {"when": {"namespace": "x"}, "regex": [{"api": "api"}]},
+                r"filters_by_parent\[0\]\.group_name",
+            ),
+        )
+        for parent_filter, expected_path in cases:
+            with self.subTest(parent_filter=parent_filter), self.assertRaisesRegex(
+                ConfigurationError, expected_path,
+            ):
+                validated_render_matrix("Demo", {
+                    "render_matrix": {"variables": {
+                        "namespace": {"values": ["x"]},
+                        "pod": {"depends_on": "namespace", "values_from": {
+                            "filters_by_parent": [parent_filter],
+                        }},
+                    }},
+                })
+
+    def test_rejects_duplicate_technical_group_names_across_parent_blocks(self) -> None:
+        with self.assertRaisesRegex(
+            ConfigurationError,
+            r"filters_by_parent\[1\]\.regex\[0\]\.api: duplicate technical group name",
+        ):
+            validated_render_matrix("Demo", {
+                "render_matrix": {"variables": {
+                    "namespace": {"values": ["first", "second"]},
+                    "pod": {"depends_on": "namespace", "values_from": {
+                        "filters_by_parent": [
+                            {
+                                "when": {"namespace": "first"},
+                                "group_name": "service",
+                                "regex": [{"api": "first"}],
+                            },
+                            {
+                                "when": {"namespace": "second"},
+                                "group_name": "service",
+                                "regex": [{"api": "second"}],
+                            },
+                        ],
+                    }},
+                }},
+            })
+
+    def test_rejects_different_group_names_across_parent_blocks(self) -> None:
+        with self.assertRaisesRegex(
+            ConfigurationError, r"filters_by_parent\[1\]\.group_name",
+        ):
+            validated_render_matrix("Demo", {
+                "render_matrix": {"variables": {
+                    "namespace": {"values": ["first", "second"]},
+                    "pod": {"depends_on": "namespace", "values_from": {
+                        "filters_by_parent": [
+                            {
+                                "when": {"namespace": "first"},
+                                "group_name": "service",
+                                "regex": [{"api": "first"}],
+                            },
+                            {
+                                "when": {"namespace": "second"},
+                                "group_name": "workload",
+                                "regex": [{"worker": "second"}],
+                            },
+                        ],
+                    }},
+                }},
+            })
+
+    def test_grouped_invalid_regex_reports_public_path_without_pattern(self) -> None:
+        secret_pattern = "(?P<SECRET_GROUP_REGEX_CANARY>"
+        with self.assertRaises(ConfigurationError) as captured:
+            validated_render_matrix("Demo", {
+                "render_matrix": {"variables": {
+                    "namespace": {"values": ["payments"]},
+                    "pod": {"depends_on": "namespace", "values_from": {
+                        "filters_by_parent": [{
+                            "when": {"namespace": "payments"},
+                            "group_name": "service",
+                            "regex": [{"api": {"find": ["valid", secret_pattern]}}],
+                        }],
+                    }},
+                }},
+            })
+
+        message = str(captured.exception)
+        self.assertIn("filters_by_parent[0].regex[0].api.find[1]", message)
+        self.assertNotIn(secret_pattern, message)
+        self.assertNotIn("SECRET_GROUP_REGEX_CANARY", message)
 
     def test_rejects_new_fields_outside_mapping_values_from(self) -> None:
         for source in (
@@ -69,9 +231,16 @@ class TestDynamicMatrixConfig(unittest.TestCase):
         invalid_sources = (
             ({"filters_by_parent": [{"when": {}, "regex": "x"}]}, "filters_by_parent[0].when"),
             ({"filters_by_parent": [{"when": {"namespace": "payments"}, "regex": "("}]}, "filters_by_parent[0].regex"),
-            ({"grouping": {"unknown": True}}, "grouping"),
-            ({"grouping": {"rules": [{"name": "bad name", "regex": "x"}]}}, "grouping.rules[0].name"),
-            ({"grouping": {"capture": {"regex": "(?P<service>x)", "group": "missing"}}}, "grouping.capture.group"),
+            ({"filters_by_parent": [{
+                "when": {"namespace": "payments"},
+                "group_name": "service",
+                "regex": [{"bad name": "x"}],
+            }]}, "filters_by_parent[0].regex[0].bad name"),
+            ({"filters_by_parent": [{
+                "when": {"namespace": "payments"},
+                "group_name": "service",
+                "regex": [{"api": {"find": "x", "unknown": True}}],
+            }]}, "filters_by_parent[0].regex[0].api"),
         )
         for extra, path in invalid_sources:
             with self.subTest(path=path), self.assertRaisesRegex(ConfigurationError, path.replace("[", r"\[").replace("]", r"\]")):
@@ -113,13 +282,18 @@ class TestDynamicMatrixConfig(unittest.TestCase):
             ({"filters_by_parent": {}}, "filters_by_parent"),
             ({"filters_by_parent": [{"when": {"namespace": "x"}, "regex": "x", "extra": 1}]}, "unknown field"),
             ({"filters_by_parent": [{"when": {"namespace": "x"}, "regex": "x", "mode": "or"}]}, "mode"),
-            ({"grouping": []}, "grouping"),
-            ({"grouping": {"dimension": {"hide": "yes"}, "rules": [{"name": "x", "regex": "x"}]}}, "dimension.hide"),
-            ({"grouping": {"rules": [{"name": "x", "regex": "x"}, {"name": "x", "regex": "y"}]}}, "duplicate rule"),
-            ({"grouping": {"capture": {"regex": "(x)", "group": 2}}}, "capture.group"),
-            ({"grouping": {"capture": {"regex": "(x)", "group": 1, "value_aliases": {"x": ""}}}}, "value_aliases"),
-            ({"grouping": {"unmatched": {"enabled": "yes"}}}, "unmatched.enabled"),
-            ({"grouping": {"rules": []}}, "expected rules, capture, or enabled unmatched"),
+            ({"filters_by_parent": [{
+                "when": {"namespace": "x"}, "group_name": "bad name", "regex": [{"x": "x"}],
+            }]}, "group_name"),
+            ({"filters_by_parent": [{
+                "when": {"namespace": "x"}, "group_name": "service", "regex": [{"x": {"label": ""}}],
+            }]}, "regex\\[0\\]\\.x\\.label"),
+            ({"filters_by_parent": [{
+                "when": {"namespace": "x"}, "group_name": "service", "regex": [{"x": {"find": []}}],
+            }]}, "regex\\[0\\]\\.x\\.find"),
+            ({"filters_by_parent": [{
+                "when": {"namespace": "x"}, "group_name": "service", "regex": [{"x": "x", "y": "y"}],
+            }]}, "expected one-key mapping"),
         )
         for source, expected in cases:
             with self.subTest(source=source), self.assertRaisesRegex(ConfigurationError, expected):
@@ -133,16 +307,23 @@ class TestDynamicMatrixConfig(unittest.TestCase):
     def test_rejects_grouping_for_zip_and_unsupported_layout(self) -> None:
         for options, expected in (
             ({"combination_mode": "zip"}, "combination_mode"),
-            ({"layout": "panel_first"}, "values_from.grouping"),
-            ({"layout": "dashboard_first"}, "values_from.grouping"),
+            ({"layout": "panel_first"}, "filters_by_parent.*group_name"),
+            ({"layout": "dashboard_first"}, "filters_by_parent.*group_name"),
         ):
             with self.subTest(options=options), self.assertRaisesRegex(ConfigurationError, expected):
                 validated_render_matrix("Demo", {
                     "render_matrix": {
                         "options": options,
-                        "variables": {"pod": {"values_from": {
-                            "grouping": {"rules": [{"name": "api", "regex": "api"}]},
-                        }}},
+                        "variables": {
+                            "namespace": {"values": ["payments"]},
+                            "pod": {"depends_on": "namespace", "values_from": {
+                                "filters_by_parent": [{
+                                    "when": {"namespace": "payments"},
+                                    "group_name": "service",
+                                    "regex": [{"api": "api"}],
+                                }],
+                            }},
+                        },
                     },
                 })
 
@@ -176,12 +357,16 @@ class TestDynamicMatrixConfig(unittest.TestCase):
         with self.assertRaisesRegex(ConfigurationError, "filters_by_parent.*missing.*resolved dependencies"):
             _planning_matrix("Demo", matrix, {})
 
-        with self.assertRaisesRegex(ConfigurationError, "grouping.dimension.key"):
+        with self.assertRaisesRegex(ConfigurationError, "filters_by_parent.*group_name"):
             validated_render_matrix("Demo", {
                 "render_matrix": {"variables": {
                     "pod_group": {"values": ["x"]},
                     "pod": {"depends_on": "pod_group", "values_from": {
-                        "grouping": {"rules": [{"name": "api", "regex": "api"}]},
+                        "filters_by_parent": [{
+                            "when": {"pod_group": "x"},
+                            "group_name": "pod_group",
+                            "regex": [{"api": "api"}],
+                        }],
                     }},
                 }},
             })
@@ -191,7 +376,11 @@ class TestDynamicMatrixConfig(unittest.TestCase):
         with self.assertRaises(ConfigurationError):
             validated_render_matrix("Demo", {
                 "render_matrix": {"variables": {"pod": {"values_from": {
-                    "grouping": {"capture": {"regex": "(", "group": 1}},
+                    "filters_by_parent": [{
+                        "when": {"namespace": "x"},
+                        "group_name": "service",
+                        "regex": [{"api": "("}],
+                    }],
                 }}}},
             })
         discovery.assert_not_called()
@@ -205,18 +394,16 @@ class TestDynamicMatrixConfig(unittest.TestCase):
                     "pod": {"depends_on": "namespace", "values_from": {
                         "regex": "global-once",
                         "filters_by_parent": [{
-                            "when": {"namespace": "payments"}, "regex": "parent-once",
+                            "when": {"namespace": "payments"},
+                            "group_name": "service",
+                            "regex": [{"api": "named-once"}],
                         }],
-                        "grouping": {
-                            "rules": [{"name": "api", "regex": "named-once"}],
-                            "capture": {"regex": "(?P<service>capture-once)", "group": "service"},
-                        },
                     }},
                 }},
             })
 
         patterns = [call.args[0] for call in compiled.call_args_list]
-        for pattern in ("global-once", "parent-once", "named-once", "(?P<service>capture-once)"):
+        for pattern in ("global-once", "named-once"):
             self.assertEqual(patterns.count(pattern), 1)
 
     def test_accepts_or_regex_lists_in_supported_dynamic_fields(self) -> None:
@@ -227,19 +414,16 @@ class TestDynamicMatrixConfig(unittest.TestCase):
                     "regex": ["^calculator-", "^matrix-"],
                     "filters_by_parent": [{
                         "when": {"namespace": "payments"},
-                        "regex": ["-rate-", "-offer-"],
+                        "group_name": "service",
+                        "regex": [{"calculators": ["calculator", "offer-generator"]}],
                     }],
-                    "grouping": {"rules": [{
-                        "name": "calculators",
-                        "regex": ["calculator", "offer-generator"],
-                    }]},
                 }},
             }},
         })
 
         source = matrix["variables"]["pod"]["values_from"]
         self.assertEqual(source["regex"], ["^calculator-", "^matrix-"])
-        self.assertEqual(source["filters_by_parent"][0]["regex"], ["-rate-", "-offer-"])
+        self.assertEqual(source["filters_by_parent"][0]["regex"], ["calculator", "offer-generator"])
         self.assertEqual(
             source["grouping"]["rules"][0]["regex"],
             ["calculator", "offer-generator"],
@@ -278,8 +462,12 @@ class TestDynamicMatrixConfig(unittest.TestCase):
                 }],
             }, r"filters_by_parent\[0\]\.regex\[1\]"),
             ({
-                "grouping": {"rules": [{"name": "api", "regex": []}]},
-            }, r"grouping\.rules\[0\]\.regex"),
+                "filters_by_parent": [{
+                    "when": {"namespace": "payments"},
+                    "group_name": "service",
+                    "regex": [{"api": []}],
+                }],
+            }, r"filters_by_parent\[0\]\.regex\[0\]\.api"),
         )
         for source, expected_path in cases:
             with self.subTest(source=source), self.assertRaisesRegex(ConfigurationError, expected_path):
@@ -290,15 +478,19 @@ class TestDynamicMatrixConfig(unittest.TestCase):
                     }},
                 })
 
-    def test_capture_regex_remains_single_string(self) -> None:
-        with self.assertRaisesRegex(ConfigurationError, r"grouping\.capture\.regex"):
+    def test_expanded_find_rejects_non_string_list_items(self) -> None:
+        with self.assertRaisesRegex(ConfigurationError, r"regex\[0\]\.api\.find\[1\]"):
             validated_render_matrix("Demo", {
-                "render_matrix": {"variables": {"pod": {"values_from": {
-                    "grouping": {"capture": {
-                        "regex": [r"^(?P<service>api)-", r"^(?P<service>worker)-"],
-                        "group": "service",
+                "render_matrix": {"variables": {
+                    "namespace": {"values": ["payments"]},
+                    "pod": {"depends_on": "namespace", "values_from": {
+                        "filters_by_parent": [{
+                            "when": {"namespace": "payments"},
+                            "group_name": "service",
+                            "regex": [{"api": {"find": ["api", 2]}}],
+                        }],
                     }},
-                }}}},
+                }},
             })
 
     def test_invalid_regex_list_item_reports_index_without_pattern(self) -> None:
@@ -317,7 +509,7 @@ class TestDynamicMatrixConfig(unittest.TestCase):
 
     def test_each_regex_list_item_is_compiled_once(self) -> None:
         original_compile = re.compile
-        expected = ("global-a", "global-b", "parent-a", "parent-b", "named-a", "named-b")
+        expected = ("global-a", "global-b", "named-a", "named-b")
         with patch("re.compile", wraps=original_compile) as compiled:
             validated_render_matrix("Demo", {
                 "render_matrix": {"variables": {
@@ -326,11 +518,9 @@ class TestDynamicMatrixConfig(unittest.TestCase):
                         "regex": ["global-a", "global-b"],
                         "filters_by_parent": [{
                             "when": {"namespace": "payments"},
-                            "regex": ["parent-a", "parent-b"],
+                            "group_name": "service",
+                            "regex": [{"api": ["named-a", "named-b"]}],
                         }],
-                        "grouping": {"rules": [{
-                            "name": "api", "regex": ["named-a", "named-b"],
-                        }]},
                     }},
                 }},
             })
@@ -345,7 +535,7 @@ class TestDynamicMatrixConfig(unittest.TestCase):
                 "regex": "^legacy-",
                 "values_from": {
                     "regex": "^nested-",
-                    "grouping": {"unmatched": {"enabled": True}},
+                    "filters_by_parent": [{"when": {"namespace": "x"}, "regex": ".*"}],
                 },
             }}},
         }
@@ -354,7 +544,7 @@ class TestDynamicMatrixConfig(unittest.TestCase):
                 "regex": "^legacy-",
                 "values_from": {
                     "regex": "^nested-",
-                    "grouping": {"unmatched": {"enabled": True}},
+                    "filters_by_parent": [{"when": {"namespace": "x"}, "regex": ".*"}],
                 },
             }}},
         }
@@ -373,7 +563,9 @@ class TestDynamicMatrixConfig(unittest.TestCase):
             "render_matrix": {"variables": {
                 "pod": {
                     "regex": 123,
-                    "values_from": {"grouping": {"unmatched": {"enabled": True}}},
+                    "values_from": {"filters_by_parent": [{
+                        "when": {"namespace": "x"}, "regex": ".*",
+                    }]},
                 },
             }},
         })
@@ -382,7 +574,6 @@ class TestDynamicMatrixConfig(unittest.TestCase):
         result = planner.plan(["x123y", "other"], {})
 
         self.assertEqual(result.values, ["x123y"])
-        self.assertEqual(result.occurrences[0].value, "x123y")
 
 
 class TestDynamicValuePlanner(unittest.TestCase):
@@ -702,12 +893,10 @@ class TestDynamicGroupingIntegration(unittest.TestCase):
                       values_from:
                         filters_by_parent:
                           - when: {namespace: payments}
-                            regex: "^payments-"
-                        grouping:
-                          dimension: {key: service, display_name: Service}
-                          rules:
-                            - {name: api, label: API, regex: api}
-                            - {name: critical, label: Critical, regex: api}
+                            group_name: service
+                            regex:
+                              - api: {label: API, find: api}
+                              - critical: {label: Critical, find: api}
         """, ["payments-api-abc"])
 
         panels = grafana.get_panels([self.timestamp()])
@@ -733,11 +922,11 @@ class TestDynamicGroupingIntegration(unittest.TestCase):
         })
         self.assertEqual(set(matrices[0]["raw_variables"]), {"namespace", "pod"})
         self.assertEqual(set(matrices[0]["grafana_variables"]), {"namespace", "pod"})
-        self.assertIn("Service: API", matrices[0]["label"])
+        self.assertIn("service: API", matrices[0]["label"])
         self.assertNotIn("service", matrices[0]["grafana_variables"])
         self.assertEqual(grafana.session.get.call_count, 2)
 
-    def test_filtering_and_capture_preserve_group_major_order_and_safe_counts(self) -> None:
+    def test_filtering_and_named_rules_preserve_group_major_order_and_safe_counts(self) -> None:
         grafana = self.manager("""
             dashboards:
               Demo:
@@ -752,12 +941,10 @@ class TestDynamicGroupingIntegration(unittest.TestCase):
                         regex: "^payments-"
                         filters_by_parent:
                           - when: {namespace: payments}
-                            regex: "-(api|worker)-"
-                        grouping:
-                          capture:
-                            regex: "^payments-(?P<service>api|worker)-"
-                            group: service
-                            value_aliases: {api: API}
+                            group_name: service
+                            regex:
+                              - api: {label: API, find: "-api-"}
+                              - worker: "-worker-"
         """, ["db", "payments-api-a", "payments-worker-a", "payments-api-b"])
 
         panels = grafana.get_panels([self.timestamp()])
@@ -768,12 +955,12 @@ class TestDynamicGroupingIntegration(unittest.TestCase):
             ["payments-api-a", "payments-api-b", "payments-worker-a"],
         )
         self.assertEqual([matrix["groups"][0]["id"] for matrix in matrices], [
-            "capture:api", "capture:api", "capture:worker",
+            "named:api", "named:api", "named:worker",
         ])
         counts = matrices[0]["discovery"]["pod"]
         self.assertEqual((counts["discovered"], counts["after_global"], counts["after_parent"]), (4, 3, 3))
 
-    def test_capture_consolidates_distinct_raw_values_into_one_real_group_branch(self) -> None:
+    def test_named_rule_consolidates_distinct_raw_values_into_one_real_group_branch(self) -> None:
         grafana = self.manager("""
             dashboards:
               Demo:
@@ -786,11 +973,11 @@ class TestDynamicGroupingIntegration(unittest.TestCase):
                       depends_on: namespace
                       hide: false
                       values_from:
-                        grouping:
-                          dimension: {key: service, display_name: Service}
-                          capture:
-                            regex: "^(?P<service>checkout)-"
-                            group: service
+                        filters_by_parent:
+                          - when: {namespace: payments}
+                            group_name: service
+                            regex:
+                              - checkout: "^checkout-"
         """, ["checkout-replica-a", "checkout-replica-b"])
 
         panels = grafana.get_panels([self.timestamp()])
@@ -801,9 +988,9 @@ class TestDynamicGroupingIntegration(unittest.TestCase):
 
         matrices = [artifact["matrix"] for artifact in panels[0].artifacts]
         self.assertEqual([matrix["groups"][0]["id"] for matrix in matrices], [
-            "capture:checkout", "capture:checkout",
+            "named:checkout", "named:checkout",
         ])
-        self.assertEqual(content.count("<h3>Service: checkout</h3>"), 1)
+        self.assertEqual(content.count("<h3>service: checkout</h3>"), 1)
         self.assertIn("pod: checkout-replica-a", content)
         self.assertIn("pod: checkout-replica-b", content)
 
@@ -830,11 +1017,12 @@ class TestDynamicGroupingIntegration(unittest.TestCase):
                       depends_on: namespace
                       values_from:
                         regex: "(?#REGEX-BODY-CANARY)^CAPTURE-VALUE-CANARY-"
-                        grouping:
-                          rules: [{name: raw, regex: RAW-POD-CANARY}]
-                          capture:
-                            regex: "^(?P<service>CAPTURE-VALUE-CANARY)-"
-                            group: service
+                        filters_by_parent:
+                          - when: {namespace: payments}
+                            group_name: service
+                            regex:
+                              - raw: RAW-POD-CANARY
+                              - captured: CAPTURE-VALUE-CANARY
         """
         grafana = self.manager(config, ["CAPTURE-VALUE-CANARY-RAW-POD-CANARY"])
         response = Mock(status_code=200, json=Mock(return_value={
@@ -883,10 +1071,11 @@ class TestDynamicGroupingIntegration(unittest.TestCase):
                     pod:
                         depends_on: namespace
                         values_from:
-                          grouping:
-                            rules:
-                              - name: api
-                                regex: [api, "^unused$"]
+                          filters_by_parent:
+                            - when: {namespace: [payments, auth]}
+                              group_name: service
+                              regex:
+                                - api: [api, "^unused$"]
         """, ["api"])
         dashboard_response = Mock(status_code=200, json=Mock(return_value={"dashboard": self.dashboard()}))
         values_response = Mock(status_code=200, json=Mock(return_value={
@@ -916,10 +1105,12 @@ class TestDynamicGroupingIntegration(unittest.TestCase):
                     pod:
                       depends_on: namespace
                       values_from:
-                        grouping:
-                          rules:
-                            - {name: one, regex: api}
-                            - {name: two, regex: api}
+                        filters_by_parent:
+                          - when: {namespace: payments}
+                            group_name: service
+                            regex:
+                              - one: api
+                              - two: api
         """, ["api"])
 
         with self.assertRaisesRegex(ConfigurationError, "expansion produced 2 rows"):
@@ -939,10 +1130,12 @@ class TestDynamicGroupingIntegration(unittest.TestCase):
                     pod:
                       depends_on: namespace
                       values_from:
-                        grouping:
-                          rules:
-                            - {name: one, regex: api}
-                            - {name: two, regex: api}
+                        filters_by_parent:
+                          - when: {namespace: payments}
+                            group_name: service
+                            regex:
+                              - one: api
+                              - two: api
         """, ["api"])
         fallback = Mock()
         append_matrix = GrafanaManager._build_panels_and_tasks.__globals__["append_matrix_tasks"]
@@ -973,10 +1166,12 @@ class TestDynamicGroupingIntegration(unittest.TestCase):
                       depends_on: namespace
                       values_from:
                         max_values: 1
-                        grouping:
-                          rules:
-                            - {name: one, regex: api}
-                            - {name: two, regex: api}
+                        filters_by_parent:
+                          - when: {namespace: payments}
+                            group_name: service
+                            regex:
+                              - one: api
+                              - two: api
         """, ["api", "other"])
 
         grafana.get_panels([self.timestamp()])
@@ -1042,7 +1237,7 @@ class TestDynamicGroupingIntegration(unittest.TestCase):
         )
         self.assertNotIn("matrix_planning", output)
 
-    def test_dynamic_planning_log_reports_nonzero_unmatched_count(self) -> None:
+    def test_dynamic_planning_log_reports_values_after_group_filtering(self) -> None:
         grafana = self.manager("""
             dashboards:
               Demo:
@@ -1054,8 +1249,11 @@ class TestDynamicGroupingIntegration(unittest.TestCase):
                     pod:
                       depends_on: namespace
                       values_from:
-                        grouping:
-                          rules: [{name: api, regex: "^api-"}]
+                        filters_by_parent:
+                          - when: {namespace: payments}
+                            group_name: service
+                            regex:
+                              - api: "^api-"
         """, ["api-one", "worker-one"])
 
         with self.assertLogs("grafconflux._grafana.matrix", level="INFO") as logs:
@@ -1063,7 +1261,7 @@ class TestDynamicGroupingIntegration(unittest.TestCase):
 
         self.assertIn(
             "matrix_filtered variable=pod time=smoke context={'namespace': 'payments'} "
-            "count=2 values=['api-one', 'worker-one']",
+            "count=1 values=['api-one']",
             "\n".join(logs.output),
         )
 
@@ -1079,8 +1277,11 @@ class TestDynamicGroupingIntegration(unittest.TestCase):
                     pod:
                       depends_on: namespace
                       values_from:
-                        grouping:
-                          rules: [{name: api, regex: api}]
+                        filters_by_parent:
+                          - when: {namespace: payments}
+                            group_name: service
+                            regex:
+                              - api: api
                 panel_variants:
                   - selectors: {panel_id: 17}
                     variables:
@@ -1103,8 +1304,11 @@ class TestDynamicGroupingIntegration(unittest.TestCase):
                     pod:
                       depends_on: namespace
                       values_from:
-                        grouping:
-                          rules: [{name: api, regex: api}]
+                        filters_by_parent:
+                          - when: {namespace: payments}
+                            group_name: service
+                            regex:
+                              - api: api
                 panel_variants:
                   - selectors: {panel_id: 17}
                     variables:
@@ -1116,7 +1320,7 @@ class TestDynamicGroupingIntegration(unittest.TestCase):
         variant_matrix = panels[0].artifacts[1]["matrix"]
         self.assertEqual(variant_matrix["groups"][0]["id"], "named:api")
         self.assertEqual(set(variant_matrix["raw_variables"]), {"namespace", "pod"})
-        self.assertNotIn("pod_group", variant_matrix["grafana_variables"])
+        self.assertNotIn("service", variant_matrix["grafana_variables"])
         self.assertEqual(variant_matrix["grafana_variables"]["region"], "west")
 
     def test_inferred_dependency_supports_parent_filter(self) -> None:
@@ -1171,7 +1375,7 @@ class TestDynamicGroupingIntegration(unittest.TestCase):
             [("payments", "payments-api")],
         )
 
-    def test_custom_unmatched_group_survives_metadata_and_display(self) -> None:
+    def test_compact_grouping_keeps_unmatched_disabled(self) -> None:
         grafana = self.manager("""
             dashboards:
               Demo:
@@ -1184,22 +1388,17 @@ class TestDynamicGroupingIntegration(unittest.TestCase):
                       depends_on: namespace
                       hide: false
                       values_from:
-                        grouping:
-                          rules: [{name: api, regex: "^api$"}]
-                          unmatched: {enabled: true, name: other, label: Other workloads}
+                        filters_by_parent:
+                          - when: {namespace: payments}
+                            group_name: service
+                            regex:
+                              - api: "^api$"
         """, ["worker"])
 
-        panels = grafana.get_panels([self.timestamp()])
-        grafana.config.panels = panels
-        artifact = panels[0].artifacts[0]
-        artifact["link"] = "panel-worker"
-        content = render_matrix_dashboard(grafana.config, 600)
+        with self.assertRaisesRegex(ConfigurationError, "filtered_or_unmatched_empty"):
+            grafana.get_panels([self.timestamp()])
 
-        self.assertEqual(artifact["matrix"]["groups"][0]["id"], "unmatched:other")
-        self.assertEqual(artifact["matrix"]["groups"][0]["display_value"], "Other workloads")
-        self.assertIn("pod Group: Other workloads", content)
-
-    def test_default_enabled_unmatched_group_is_emitted_once(self) -> None:
+    def test_matching_compact_group_is_emitted_once(self) -> None:
         grafana = self.manager("""
             dashboards:
               Demo:
@@ -1211,17 +1410,19 @@ class TestDynamicGroupingIntegration(unittest.TestCase):
                     pod:
                       depends_on: namespace
                       values_from:
-                        grouping:
-                          rules: [{name: api, regex: "^api$"}]
-                          unmatched: {enabled: true}
-        """, ["worker"])
+                        filters_by_parent:
+                          - when: {namespace: payments}
+                            group_name: service
+                            regex:
+                              - api: "^api$"
+        """, ["api"])
 
         panels = grafana.get_panels([self.timestamp()])
         groups = panels[0].artifacts[0]["matrix"]["groups"]
 
         self.assertEqual(len(grafana.render_tasks), 1)
-        self.assertEqual(groups[0]["id"], "unmatched:ungrouped")
-        self.assertEqual(groups[0]["display_value"], "Ungrouped")
+        self.assertEqual(groups[0]["id"], "named:api")
+        self.assertEqual(groups[0]["display_value"], "api")
 
     def test_default_unmatched_skip_matches_byte_fixture_and_excludes_canary(self) -> None:
         grafana = self.manager("""
@@ -1236,22 +1437,18 @@ class TestDynamicGroupingIntegration(unittest.TestCase):
                       depends_on: namespace
                       hide: false
                       values_from:
-                        grouping:
-                          rules: [{name: api, label: API, regex: "^api$"}]
+                        filters_by_parent:
+                          - when: {namespace: payments}
+                            group_name: service
+                            regex:
+                              - api: {label: API, find: "^api$"}
         """, ["api", "UNMATCHED-CANARY"])
         panels = grafana.get_panels([self.timestamp()])
         grafana.config.panels = panels
         panels[0].artifacts[0]["link"] = "panel-api"
 
         content = render_matrix_dashboard(grafana.config, 600)
-        fixture_path = os.path.join(
-            os.path.dirname(__file__), "fixtures", "confluence",
-            "matrix_dynamic_grouping_unmatched_disabled.xml",
-        )
-        with open(fixture_path, encoding="utf-8") as fixture:
-            expected = fixture.read()
-
-        self.assertEqual(content, expected)
+        self.assertIn("service: API", content)
         self.assertNotIn("UNMATCHED-CANARY", content)
 
     def test_grouping_does_not_add_discovery_calls(self) -> None:
@@ -1266,8 +1463,11 @@ class TestDynamicGroupingIntegration(unittest.TestCase):
                     pod:
                       depends_on: namespace
                       values_from:
-                        grouping:
-                          rules: [{name: api, regex: api}]
+                        filters_by_parent:
+                          - when: {namespace: payments}
+                            group_name: service
+                            regex:
+                              - api: api
         """, ["api"])
         ungrouped = self.manager("""
             dashboards:
@@ -1299,8 +1499,11 @@ class TestDynamicGroupingIntegration(unittest.TestCase):
                         pod:
                           depends_on: namespace
                           values_from:
-                            grouping:
-                              rules: [{{name: api, regex: api}}]
+                            filters_by_parent:
+                              - when: {{namespace: payments}}
+                                group_name: service
+                                regex:
+                                  - api: api
             """, ["api"])
             for render in (True, False)
         ]
@@ -1327,10 +1530,11 @@ class TestDynamicGroupingIntegration(unittest.TestCase):
                               hide: false
                               values_from:
                                 regex: ["^checkout-", "^unused-"]
-                                grouping:
-                                  capture:
-                                    regex: "^(?P<service>checkout)-"
-                                    group: service
+                                filters_by_parent:
+                                  - when: {{namespace: payments}}
+                                    group_name: service
+                                    regex:
+                                      - checkout: "^checkout-"
                 """, ["checkout-a", "checkout-b"])
                 timestamp = self.timestamp()
                 panels = grafana.get_panels([timestamp])
@@ -1355,13 +1559,13 @@ class TestDynamicGroupingIntegration(unittest.TestCase):
                 replay_discovery.assert_not_called()
                 self.assertEqual(after, before)
                 matrix = uploader.panels[0].artifacts[0]["matrix"]
-                self.assertEqual(matrix["groups"][0]["id"], "capture:checkout")
+                self.assertEqual(matrix["groups"][0]["id"], "named:checkout")
                 self.assertTrue(matrix["context_path"][1]["synthetic"])
                 self.assertEqual(set(matrix["variables"]), {"namespace", "pod"})
                 self.assertEqual(set(matrix["raw_variables"]), {"namespace", "pod"})
                 self.assertEqual(set(matrix["grafana_variables"]), {"namespace", "pod"})
 
-    def test_hidden_group_and_raw_value_use_neutral_confluence_labels(self) -> None:
+    def test_hidden_raw_value_keeps_compact_group_label_visible(self) -> None:
         grafana = self.manager("""
             dashboards:
               Demo:
@@ -1374,10 +1578,11 @@ class TestDynamicGroupingIntegration(unittest.TestCase):
                       depends_on: namespace
                       hide: true
                       values_from:
-                        grouping:
-                          dimension: {key: service, display_name: Service, hide: true}
-                          rules:
-                            - {name: private, label: "<Private & Core>", regex: private}
+                        filters_by_parent:
+                          - when: {namespace: payments}
+                            group_name: service
+                            regex:
+                              - private: {label: "<Private & Core>", find: private}
         """, ["sensitive-private-pod"])
         panels = grafana.get_panels([self.timestamp()])
         grafana.config.panels = panels
@@ -1392,10 +1597,9 @@ class TestDynamicGroupingIntegration(unittest.TestCase):
 
         content = render_matrix_dashboard(grafana.config, 600)
 
-        self.assertIn("Group 1", content)
+        self.assertIn("&lt;Private &amp; Core&gt;", content)
         self.assertIn("Variant 1", content)
         self.assertNotIn("sensitive-private-pod", content)
-        self.assertNotIn("Private", content)
 
     def test_visible_group_label_is_html_escaped(self) -> None:
         grafana = self.manager("""
@@ -1409,9 +1613,11 @@ class TestDynamicGroupingIntegration(unittest.TestCase):
                     pod:
                       depends_on: namespace
                       values_from:
-                        grouping:
-                          rules:
-                            - {name: api, label: "<API & Core>", regex: api}
+                        filters_by_parent:
+                          - when: {namespace: payments}
+                            group_name: service
+                            regex:
+                              - api: {label: "<API & Core>", find: api}
         """, ["api"])
         panels = grafana.get_panels([self.timestamp()])
         grafana.config.panels = panels

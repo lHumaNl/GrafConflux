@@ -512,20 +512,45 @@ def _matrix_task(config: Any, task: PanelRenderTask, row: dict[str, Any]) -> Pan
 
 
 def _matrix_artifact(dashboard_name: str, panel: Panel, timestamp: Any, row: dict[str, Any], source: dict[str, Any] | None) -> dict[str, Any]:
-    file_name = f"{dashboard_name}__{panel.panel_id}__matrix-{row['index']:03d}-{row['hash']}__{timestamp.id_time}.png"
+    file_name = _matrix_file_name(dashboard_name, panel.panel_id, timestamp, row, source)
     matrix_metadata = {"index": row["index"], "hash": row["hash"], "variables": row["variables"],
                        "raw_variables": row["raw_variables"], "grafana_variables": row["url_variables"],
                        "label": row["label"], "neutral_label": row["neutral_label"], "group": row.get("group"),
                        "context_path": row["context_path"], "discovery": row.get("discovery", {})}
     if row.get("groups"):
         matrix_metadata["groups"] = row["groups"]
-    return {"artifact_type": "matrix", "timestamp_id": timestamp.id_time, "timestamp_tag": timestamp.time_tag,
-            "from": str(timestamp.start_time_timestamp), "to": str(timestamp.end_time_timestamp),
-            "render_status": "rendered", "png_file": file_name, "skip_reason": None,
-            "source_panel_id": panel.panel_id, "source_panel_type": panel.type,
-            "source_panel_title": panel.title, "source_panel_display_title": panel.display_title,
-            "source_timestamp_id": timestamp.id_time, "display_title": _matrix_panel_title(panel.display_title, row),
-            "repeat_var": source.get("repeat_var") if source else None, "matrix": matrix_metadata}
+    artifact = {"artifact_type": "matrix", "timestamp_id": timestamp.id_time, "timestamp_tag": timestamp.time_tag,
+                "from": str(timestamp.start_time_timestamp), "to": str(timestamp.end_time_timestamp),
+                "render_status": "rendered", "png_file": file_name, "skip_reason": None,
+                "source_panel_id": panel.panel_id, "source_panel_type": panel.type,
+                "source_panel_title": panel.title, "source_panel_display_title": panel.display_title,
+                "source_timestamp_id": timestamp.id_time, "display_title": _matrix_panel_title(panel.display_title, row),
+                "matrix": matrix_metadata}
+    if source and source.get("repeat_value") is not None:
+        artifact.update({
+            "repeat_var": source.get("repeat_var"),
+            "repeat_value": source.get("repeat_value"),
+            "repeat_index": source.get("repeat_index", 0),
+            "repeat_hash": source.get("repeat_hash"),
+            "repeat_id": source.get("repeat_id"),
+        })
+    return artifact
+
+
+def _matrix_file_name(
+    dashboard_name: str,
+    panel_id: int,
+    timestamp: Any,
+    row: dict[str, Any],
+    source: dict[str, Any] | None,
+) -> str:
+    repeat_segment = ""
+    if source and source.get("repeat_id"):
+        repeat_segment = f"__repeat-{source['repeat_id']}"
+    return (
+        f"{dashboard_name}__{panel_id}{repeat_segment}"
+        f"__matrix-{row['index']:03d}-{row['hash']}__{timestamp.id_time}.png"
+    )
 
 
 def _matrix_panel_title(panel_title: str, row: dict[str, Any]) -> str:

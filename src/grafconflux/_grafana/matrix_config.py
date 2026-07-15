@@ -48,17 +48,20 @@ def _normalized_matrix(dashboard_name: str, value: dict[str, Any]) -> dict[str, 
     normalized.setdefault("layout", DEFAULT_MATRIX_LAYOUT)
     normalized_variables = variables if variables is not None else _legacy_variables(matrix)
     if normalized_variables:
-        normalized["variables"] = _normalized_variables(normalized_variables)
+        normalized["variables"] = _normalized_variables(dashboard_name, normalized_variables)
     return normalized
 
 
-def _normalized_variables(variables: Any) -> Any:
+def _normalized_variables(dashboard_name: str, variables: Any) -> Any:
     if not isinstance(variables, dict):
         return variables
-    return {key: _normalized_variable(key, spec) for key, spec in variables.items()}
+    return {
+        key: _normalized_variable(dashboard_name, key, spec)
+        for key, spec in variables.items()
+    }
 
 
-def _normalized_variable(key: Any, spec: Any) -> Any:
+def _normalized_variable(dashboard_name: str, key: Any, spec: Any) -> Any:
     spec = _variable_with_automatic_source(spec)
     if not isinstance(spec, dict):
         return spec
@@ -66,16 +69,143 @@ def _normalized_variable(key: Any, spec: Any) -> Any:
     source = normalized.get("values_from")
     if isinstance(source, dict):
         source = dict(source)
+        if "grouping" in source:
+            raise ConfigurationError(
+                _path(dashboard_name, f"variables.{key}.values_from.grouping")
+                + ": unsupported; use filters_by_parent[].group_name plus grouped regex entries."
+            )
         if "filters_by_parent" in source and isinstance(source["filters_by_parent"], list):
-            source["filters_by_parent"] = [
-                _normalized_parent_filter(item) for item in source["filters_by_parent"]
-            ]
-        if "grouping" in source and isinstance(source["grouping"], dict):
-            dimension = source["grouping"].get("dimension")
-            normalized["__group_hide_explicit__"] = isinstance(dimension, dict) and "hide" in dimension
-            source["grouping"] = _normalized_grouping(str(key), normalized, source["grouping"])
+            filters, grouping = _normalized_parent_filters(
+                dashboard_name, str(key), source["filters_by_parent"]
+            )
+            source["filters_by_parent"] = filters
+            if grouping is not None:
+                normalized["__group_hide_explicit__"] = False
+                source["grouping"] = grouping
         normalized["values_from"] = source
     return normalized
+
+
+def _normalized_parent_filters(
+    dashboard_name: str,
+    key: str,
+    filters: list[Any],
+) -> tuple[list[Any], dict[str, Any] | None]:
+    path = _path(dashboard_name, f"variables.{key}.values_from.filters_by_parent")
+    state: dict[str, Any] = {"dimension": None, "dimension_path": None, "rules": [], "names": set()}
+    normalized = [
+        _normalized_compact_parent_filter(f"{path}[{index}]", item, state)
+        for index, item in enumerate(filters)
+    ]
+    if state["dimension"] is None:
+        return normalized, None
+    grouping = {
+        "dimension": {
+            "key": state["dimension"], "display_name": state["dimension"], "hide": False,
+        },
+        "rules": state["rules"],
+        "unmatched": {"enabled": False, "name": "ungrouped", "label": "Ungrouped"},
+        "__path__": state["dimension_path"],
+    }
+    return normalized, grouping
+
+
+def _normalized_compact_parent_filter(path: str, item: Any, state: dict[str, Any]) -> Any:
+    normalized = _normalized_parent_filter(item)
+    if not isinstance(item, dict):
+        return normalized
+    regex = item.get("regex")
+    kind = _parent_regex_kind(regex)
+    has_group_name = "group_name" in item
+    if kind == "mixed":
+        raise ConfigurationError(path + ".regex: mixed string and mapping entries are ambiguous.")
+    if has_group_name != (kind == "grouped"):
+        raise ConfigurationError(path + ".group_name: required exactly with grouped regex mappings.")
+    if kind != "grouped":
+        return normalized
+    group_name = item.get("group_name")
+    _validate_identifier(path + ".group_name", group_name)
+    _record_group_dimension(path, group_name, state)
+    rules, patterns, pattern_paths = _normalized_compact_rules(path, item, state)
+    normalized.pop("group_name", None)
+    normalized["regex"] = patterns
+    normalized["__regex_paths__"] = pattern_paths
+    state["rules"].extend(rules)
+    return normalized
+
+
+def _parent_regex_kind(regex: Any) -> str:
+    if not isinstance(regex, list) or not regex:
+        return "plain"
+    mapping_count = sum(isinstance(item, dict) for item in regex)
+    if mapping_count == 0:
+        return "plain"
+    return "grouped" if mapping_count == len(regex) else "mixed"
+
+
+def _record_group_dimension(path: str, group_name: str, state: dict[str, Any]) -> None:
+    if state["dimension"] is None:
+        state["dimension"] = group_name
+        state["dimension_path"] = path
+        return
+    if state["dimension"] != group_name:
+        raise ConfigurationError(path + ".group_name: expected the same grouping dimension across the variable.")
+
+
+def _normalized_compact_rules(
+    path: str,
+    item: dict[str, Any],
+    state: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+    rules: list[dict[str, Any]] = []
+    patterns: list[str] = []
+    pattern_paths: list[str] = []
+    for index, entry in enumerate(item["regex"]):
+        rule, finds, find_paths = _normalized_compact_rule(
+            f"{path}.regex[{index}]", entry, item.get("when"), state["names"]
+        )
+        rules.append(rule)
+        patterns.extend(finds)
+        pattern_paths.extend(find_paths)
+    return rules, patterns, pattern_paths
+
+
+def _normalized_compact_rule(
+    path: str,
+    entry: dict[Any, Any],
+    when: Any,
+    names: set[str],
+) -> tuple[dict[str, Any], list[str], list[str]]:
+    if len(entry) != 1:
+        raise ConfigurationError(path + ": expected one-key mapping.")
+    name, value = next(iter(entry.items()))
+    _validate_identifier(path + (f".{name}" if isinstance(name, str) else ""), name)
+    if name in names:
+        raise ConfigurationError(f"{path}.{name}: duplicate technical group name across the variable.")
+    names.add(name)
+    label, find, find_path = _normalized_compact_rule_value(f"{path}.{name}", name, value)
+    patterns = find if isinstance(find, list) else [find]
+    pattern_paths = [
+        f"{find_path}[{index}]" if isinstance(find, list) else find_path
+        for index in range(len(patterns))
+    ]
+    normalized_when = _normalized_when(when) if isinstance(when, dict) else when
+    return {
+        "name": name, "label": label, "regex": find, "when": normalized_when,
+        "__regex_paths__": pattern_paths,
+    }, patterns, pattern_paths
+
+
+def _normalized_compact_rule_value(path: str, name: str, value: Any) -> tuple[str, Any, str]:
+    if not isinstance(value, dict):
+        _validate_regex_set(path, value)
+        return name, value, path
+    _reject_unknown(path, value, {"label", "find"})
+    label = value.get("label", name)
+    _validate_non_empty_string(path + ".label", label)
+    find_path = path + ".find"
+    _validate_regex_set(find_path, value.get("find"))
+    return label, value["find"], find_path
 
 
 def _normalized_parent_filter(item: Any) -> Any:
@@ -98,45 +228,6 @@ def _normalized_when(when: dict[Any, Any]) -> dict[Any, Any]:
 
 def _normalized_scalar(value: Any) -> Any:
     return value if value is None or isinstance(value, (dict, list)) else str(value)
-
-
-def _normalized_grouping(key: str, spec: dict[str, Any], grouping: dict[str, Any]) -> dict[str, Any]:
-    normalized = dict(grouping)
-    dimension = normalized.get("dimension", {})
-    if isinstance(dimension, dict):
-        dimension = dict(dimension)
-        dimension.setdefault("key", f"{key}_group")
-        dimension.setdefault("display_name", f"{display_name(key, spec)} Group")
-        dimension.setdefault("hide", False)
-        normalized["dimension"] = dimension
-    rules = normalized.get("rules", [])
-    if isinstance(rules, list):
-        normalized["rules"] = [_normalized_group_rule(rule) for rule in rules]
-    unmatched = normalized.get("unmatched", {})
-    if isinstance(unmatched, dict):
-        unmatched = dict(unmatched)
-        unmatched.setdefault("enabled", False)
-        unmatched.setdefault("name", "ungrouped")
-        unmatched.setdefault("label", "Ungrouped")
-        normalized["unmatched"] = unmatched
-    capture = normalized.get("capture")
-    if isinstance(capture, dict):
-        capture = dict(capture)
-        if isinstance(capture.get("when"), dict):
-            capture["when"] = _normalized_when(capture["when"])
-        normalized["capture"] = capture
-    return normalized
-
-
-def _normalized_group_rule(rule: Any) -> Any:
-    if not isinstance(rule, dict):
-        return rule
-    normalized = dict(rule)
-    if isinstance(normalized.get("name"), str):
-        normalized.setdefault("label", normalized["name"])
-    if isinstance(normalized.get("when"), dict):
-        normalized["when"] = _normalized_when(normalized["when"])
-    return normalized
 
 
 def _variable_with_automatic_source(spec: Any) -> Any:
@@ -383,7 +474,7 @@ def _validate_parent_filters(path: str, filters: Any) -> None:
         item_path = f"{path}.filters_by_parent[{index}]"
         if not isinstance(item, dict):
             raise ConfigurationError(item_path + ": expected mapping.")
-        _reject_unknown(item_path, item, {"when", "regex", "mode"})
+        _reject_unknown(item_path, item, {"when", "regex", "mode", "__regex_paths__"})
         _validate_when(item_path + ".when", item.get("when"))
         _validate_regex_set(item_path + ".regex", item.get("regex"))
         if item.get("mode", "and") not in {"and", "override_global"}:
@@ -394,7 +485,7 @@ def _validate_grouping(path: str, grouping: Any) -> None:
     group_path = path + ".grouping"
     if not isinstance(grouping, dict):
         raise ConfigurationError(group_path + ": expected mapping.")
-    _reject_unknown(group_path, grouping, {"dimension", "rules", "capture", "unmatched"})
+    _reject_unknown(group_path, grouping, {"dimension", "rules", "capture", "unmatched", "__path__"})
     _validate_group_dimension(group_path, grouping.get("dimension"))
     rules = grouping.get("rules", [])
     _validate_group_rules(group_path, rules)
@@ -427,7 +518,7 @@ def _validate_group_rules(path: str, rules: Any) -> None:
         rule_path = f"{rules_path}[{index}]"
         if not isinstance(rule, dict):
             raise ConfigurationError(rule_path + ": expected mapping.")
-        _reject_unknown(rule_path, rule, {"name", "label", "regex", "when"})
+        _reject_unknown(rule_path, rule, {"name", "label", "regex", "when", "__regex_paths__"})
         name = rule.get("name")
         _validate_identifier(rule_path + ".name", name)
         if name in names:
@@ -524,6 +615,7 @@ def _compiled_dynamic_planner(dashboard_name: str, key: str, spec: dict[str, Any
     )
     if compiled_regex not in (None, ""):
         effective_source["regex"] = compiled_regex
+    regex_cache: dict[tuple[str, str], re.Pattern[str]] = {}
     compiled: dict[str, Any] = {
         "global": _compile_regex_set_at(
             _path(
@@ -534,18 +626,22 @@ def _compiled_dynamic_planner(dashboard_name: str, key: str, spec: dict[str, Any
             optional=True,
         ),
         "parents": [
-            _compile_regex_set_at(
+            _compile_regex_set_for_item(
                 _path(dashboard_name, f"variables.{key}.values_from.filters_by_parent[{index}].regex"),
                 item["regex"],
+                item,
+                regex_cache,
             )
             for index, item in enumerate(source.get("filters_by_parent") or [])
         ],
     }
     grouping = source.get("grouping") or {}
     compiled["named"] = [
-        _compile_regex_set_at(
+        _compile_regex_set_for_item(
             _path(dashboard_name, f"variables.{key}.values_from.grouping.rules[{index}].regex"),
             rule["regex"],
+            rule,
+            regex_cache,
         )
         for index, rule in enumerate(grouping.get("rules") or [])
     ]
@@ -575,6 +671,33 @@ def _compile_regex_set_at(path: str, value: Any, optional: bool = False) -> tupl
         _compile_at(f"{path}[{index}]" if isinstance(value, list) else path, pattern)
         for index, pattern in enumerate(values)
     )
+
+
+def _compile_regex_set_for_item(
+    path: str,
+    value: Any,
+    item: dict[str, Any],
+    cache: dict[tuple[str, str], re.Pattern[str]],
+) -> tuple[re.Pattern[str], ...]:
+    values = value if isinstance(value, list) else [value]
+    paths = item.get("__regex_paths__")
+    if not isinstance(paths, list) or len(paths) != len(values):
+        return _compile_regex_set_at(path, value)
+    return tuple(
+        _compile_cached_at(pattern_path, pattern, cache)
+        for pattern_path, pattern in zip(paths, values)
+    )
+
+
+def _compile_cached_at(
+    path: str,
+    value: str,
+    cache: dict[tuple[str, str], re.Pattern[str]],
+) -> re.Pattern[str]:
+    cache_key = (path, value)
+    if cache_key not in cache:
+        cache[cache_key] = _compile_at(path, value)
+    return cache[cache_key]
 
 
 def _validate_compiled_capture_group(path: str, pattern: re.Pattern[str], group: str | int) -> None:
@@ -607,17 +730,19 @@ def _validate_dynamic_matrix_constraints(
         grouping = source.get("grouping")
         if not isinstance(grouping, dict):
             continue
-        group_path = _path(dashboard_name, f"variables.{key}.values_from.grouping")
+        group_path = grouping.get("__path__") or _path(
+            dashboard_name, f"variables.{key}.values_from.grouping"
+        )
         if matrix.get("layout", DEFAULT_MATRIX_LAYOUT) not in GROUPING_LAYOUTS:
             allowed = ", ".join(sorted(GROUPING_LAYOUTS))
-            raise ConfigurationError(group_path + f": grouping requires layout in [{allowed}].")
+            raise ConfigurationError(group_path + f".group_name: grouping requires layout in [{allowed}].")
         dimension = grouping["dimension"]
         dimension_key = dimension["key"]
         dimension_name = dimension["display_name"]
         if dimension_key in raw_keys | display_names | synthetic_keys | synthetic_names:
-            raise ConfigurationError(group_path + ".dimension.key: collides with matrix dimension.")
+            raise ConfigurationError(group_path + ".group_name: collides with matrix dimension.")
         if dimension_name in raw_keys | display_names | synthetic_keys | synthetic_names:
-            raise ConfigurationError(group_path + ".dimension.display_name: collides with matrix dimension.")
+            raise ConfigurationError(group_path + ".group_name: collides with matrix dimension.")
         synthetic_keys.add(dimension_key)
         synthetic_names.add(dimension_name)
 

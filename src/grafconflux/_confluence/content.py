@@ -370,22 +370,41 @@ def _render_panel_artifacts(panel, row_title: str, graph_width: int) -> str:
     new_content = ''
     if _has_matrix_artifacts(panel.artifacts):
         new_content += _render_matrix_artifacts(panel, row_title, graph_width)
-    for artifact in _ordered_artifacts(panel.artifacts):
-        if artifact.get('artifact_type') == 'matrix':
-            continue
-        if not _artifact_is_visible(artifact):
-            continue
-        if not _artifact_has_rendered_png(artifact):
-            continue
-        title = _artifact_title(panel, row_title, artifact)
-        link = artifact.get('link') or _first_panel_link(panel)
-        if link:
-            new_content += f'    <p><a href="{html.escape(link)}">{title}</a></p>\n'
-        else:
-            new_content += f'    <p>{title} (Grafana link unavailable)</p>\n'
-        new_content += f'    <p><ac:image ac:width="{graph_width}">'
-        new_content += f'<ri:attachment ri:filename="{html.escape(artifact["png_file"])}" /></ac:image></p>\n'
+    artifacts = [
+        artifact for artifact in _ordered_artifacts(panel.artifacts)
+        if artifact.get('artifact_type') != 'matrix'
+        and _artifact_is_visible(artifact)
+        and _artifact_has_rendered_png(artifact)
+    ]
+    repeated_artifacts = [artifact for artifact in artifacts if artifact.get('repeat_value') is not None]
+    other_artifacts = [artifact for artifact in artifacts if artifact.get('repeat_value') is None]
+    repeat_groups = _repeat_artifact_groups(repeated_artifacts)
+    if len(repeat_groups) > 1:
+        for repeat_value, grouped_artifacts in repeat_groups.items():
+            new_content += '    <ac:structured-macro ac:name="expand">\n'
+            new_content += (
+                '      <ac:parameter ac:name="title">'
+                f'{html.escape(normalize_grafana_display_value(repeat_value))}</ac:parameter>\n'
+            )
+            new_content += '      <ac:rich-text-body>\n'
+            for artifact in grouped_artifacts:
+                new_content += _render_artifact_image_block(panel, row_title, artifact, graph_width, '        ')
+            new_content += '      </ac:rich-text-body>\n    </ac:structured-macro>\n'
+        for artifact in other_artifacts:
+            new_content += _render_artifact_image_block(panel, row_title, artifact, graph_width, '    ')
+        return new_content
+    for artifact in artifacts:
+        new_content += _render_artifact_image_block(panel, row_title, artifact, graph_width, '    ')
     return new_content
+
+
+def _repeat_artifact_groups(artifacts):
+    if not artifacts:
+        return {}
+    grouped = {}
+    for artifact in artifacts:
+        grouped.setdefault(str(artifact['repeat_value']), []).append(artifact)
+    return grouped
 
 
 def _has_matrix_artifacts(artifacts) -> bool:
@@ -469,7 +488,16 @@ def _ordered_panels(panels):
 
 
 def _ordered_artifacts(artifacts):
-    return sorted(artifacts or [], key=lambda artifact: artifact.get('order_index', 0))
+    return sorted(
+        artifacts or [],
+        key=_artifact_order_key,
+    )
+
+
+def _artifact_order_key(artifact):
+    if artifact.get('repeat_value') is not None:
+        return 0, artifact.get('repeat_index', 0), artifact.get('order_index', 0)
+    return 1, artifact.get('order_index', 0), 0
 
 
 def _artifact_is_visible(artifact) -> bool:

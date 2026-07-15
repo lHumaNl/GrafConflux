@@ -1,3 +1,4 @@
+import hashlib
 import os
 import tempfile
 import threading
@@ -838,7 +839,7 @@ class TestGrafanaPanels(unittest.TestCase):
 
         self.assertEqual([task.repeat_value for task in manager.render_tasks], ["prod/one"])
         self.assertEqual(panel.artifacts[0]["repeat_value_slug"], "prod-one")
-        self.assertEqual(manager.render_tasks[0].file_name, "demo__17__repeat-prod-one__0.png")
+        self.assertEqual(manager.render_tasks[0].file_name, "demo__17__repeat-000-61b01bde__0.png")
 
     def test_repeating_panel_manual_values_materialize_render_tasks(self):
         manager, panels = self.get_repeating_panels(
@@ -939,7 +940,7 @@ class TestGrafanaPanels(unittest.TestCase):
         self.assertNotIn(99, [task.panel.panel_id for task in manager.render_tasks])
         self.assertEqual([task.panel.panel_id for task in manager.render_tasks].count(17), 2)
 
-    def test_repeating_panel_filename_includes_deterministic_repeat_slug(self):
+    def test_repeating_panel_filename_includes_deterministic_repeat_id(self):
         manager, panels = self.get_repeating_panels(
             self.repeating_dashboard(),
             repeating_panels=[{"panel_id": 17, "repeat_values": {"mode": "manual", "values": ["prod/one"]}}],
@@ -949,9 +950,10 @@ class TestGrafanaPanels(unittest.TestCase):
 
         self.assertEqual(manager.render_tasks[0].file_name, repeated_artifact["png_file"])
         self.assertEqual(repeated_artifact["repeat_value_slug"], "prod-one")
-        self.assertEqual(repeated_artifact["png_file"], "demo__17__repeat-prod-one__0.png")
+        self.assertEqual(repeated_artifact["repeat_id"], "000-61b01bde")
+        self.assertEqual(repeated_artifact["png_file"], "demo__17__repeat-000-61b01bde__0.png")
 
-    def test_repeating_panel_slug_collision_uses_stable_hash_suffix(self):
+    def test_repeating_panel_values_with_same_slug_use_distinct_hash_ids(self):
         manager, panels = self.get_repeating_panels(
             self.repeating_dashboard(),
             repeating_panels=[{
@@ -975,9 +977,50 @@ class TestGrafanaPanels(unittest.TestCase):
         )
         self.assertEqual(
             [artifact["png_file"] for artifact in first_artifacts],
-            ["demo__17__repeat-prod-one__0.png", "demo__17__repeat-prod-one-3335cf06__0.png"],
+            ["demo__17__repeat-000-61b01bde__0.png", "demo__17__repeat-001-3335cf06__0.png"],
         )
         self.assertEqual(task_file_names, [artifact["png_file"] for artifact in first_artifacts])
+
+    def test_matrix_repeating_filenames_use_repeat_index_and_hash(self):
+        dashboard = self.repeating_dashboard()
+        dashboard["templating"]["list"].append({
+            "name": "namespace", "current": {"value": "apps"},
+        })
+        manager = self.create_manager(
+            enable_repeating_panels=True,
+            repeating_panels=[{
+                "panel_id": 17,
+                "repeat_values": {
+                    "mode": "manual",
+                    "values": ["G1 Eden Space", "G1 Survivor/Space", "G1 Old Gen"],
+                },
+            }],
+            render_matrix={
+                "variables": {"namespace": {"values": ["apps"]}},
+            },
+        )
+        manager.dashboard_uid = "dashboard-uid"
+        manager.dashboard_url = "/d/dashboard-uid/dashboard"
+        manager.session.get = Mock(return_value=Mock(
+            status_code=200,
+            json=Mock(return_value={"dashboard": dashboard}),
+        ))
+
+        panels = manager.get_panels(self.create_timestamps(count=1))
+
+        artifacts = panels[0].artifacts
+        expected_values = ["G1 Eden Space", "G1 Survivor/Space", "G1 Old Gen"]
+        self.assertEqual([artifact["repeat_value"] for artifact in artifacts], expected_values)
+        self.assertEqual([artifact["repeat_index"] for artifact in artifacts], [0, 1, 2])
+        expected_repeat_ids = [
+            f"{index:03d}-{hashlib.sha256(value.encode('utf-8')).hexdigest()[:8]}"
+            for index, value in enumerate(expected_values)
+        ]
+        self.assertEqual([artifact["repeat_id"] for artifact in artifacts], expected_repeat_ids)
+        self.assertEqual(len({artifact["png_file"] for artifact in artifacts}), 3)
+        for artifact, repeat_id in zip(artifacts, expected_repeat_ids):
+            self.assertIn(f"__repeat-{repeat_id}__matrix-", artifact["png_file"])
+            self.assertRegex(artifact["png_file"], r"^[A-Za-z0-9_.-]+$")
 
     def test_download_chart_render_mode_uses_render_api_params_and_records_fullscreen_link(self):
         manager = self.create_manager(

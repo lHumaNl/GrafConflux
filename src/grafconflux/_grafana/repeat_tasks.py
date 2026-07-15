@@ -47,8 +47,17 @@ class RepeatTaskBuilder:
         for timestamp in timestamps:
             values = self._timestamp_repeat_values(rule, timestamp)
             slugs = self._repeat_value_slugs(values)
-            for repeat_value, repeat_slug in zip(values, slugs):
-                self._append_repeating_task(render_tasks, panel, descriptor, timestamp, rule, repeat_value, repeat_slug)
+            for repeat_index, (repeat_value, repeat_slug) in enumerate(zip(values, slugs)):
+                self._append_repeating_task(
+                    render_tasks,
+                    panel,
+                    descriptor,
+                    timestamp,
+                    rule,
+                    repeat_value,
+                    repeat_slug,
+                    repeat_index,
+                )
 
     @staticmethod
     def _timestamp_repeat_values(rule: Dict[str, Any], timestamp: GrafanaTimeDownloader) -> List[str]:
@@ -62,9 +71,17 @@ class RepeatTaskBuilder:
 
     def _append_repeating_task(self, render_tasks: List[PanelRenderTask], panel: Panel,
                                descriptor: PanelDescriptor, timestamp: GrafanaTimeDownloader,
-                               rule: Dict[str, Any], repeat_value: str, repeat_slug: str) -> None:
+                               rule: Dict[str, Any], repeat_value: str, repeat_slug: str,
+                               repeat_index: int) -> None:
         repeat_var = rule['repeat_var']
-        artifact = self._repeating_artifact(timestamp, repeat_var, repeat_value, repeat_slug, panel.panel_id)
+        artifact = self._repeating_artifact(
+            timestamp,
+            repeat_var,
+            repeat_value,
+            repeat_slug,
+            repeat_index,
+            panel.panel_id,
+        )
         panel.artifacts.append(artifact)
         variables = self._task_variables(repeat_var, repeat_value)
         task = PanelRenderTask(
@@ -88,13 +105,19 @@ class RepeatTaskBuilder:
         }
 
     def _repeating_artifact(self, timestamp: GrafanaTimeDownloader, repeat_var: str,
-                            repeat_value: str, repeat_slug: str, panel_id: int) -> Dict[str, Any]:
+                             repeat_value: str, repeat_slug: str, repeat_index: int,
+                             panel_id: int) -> Dict[str, Any]:
+        repeat_hash = self._stable_hash(repeat_value)
+        repeat_id = f'{repeat_index:03d}-{repeat_hash}'
         artifact = self._base_artifact(
-            timestamp, f'{self.config.name}__{panel_id}__repeat-{repeat_slug}__{timestamp.id_time}.png')
+            timestamp, f'{self.config.name}__{panel_id}__repeat-{repeat_id}__{timestamp.id_time}.png')
         artifact.update({
             'repeat_var': repeat_var,
             'repeat_value': repeat_value,
             'repeat_value_slug': repeat_slug,
+            'repeat_index': repeat_index,
+            'repeat_hash': repeat_hash,
+            'repeat_id': repeat_id,
         })
         return artifact
 

@@ -154,8 +154,12 @@ def _render_hierarchy_panel_entry(grafana_config: Any, entry: dict[str, Any], gr
     title = html.escape(str(getattr(panel, "display_title", panel.title)))
     content = '<ac:structured-macro ac:name="expand">\n'
     content += f'  <ac:parameter ac:name="title">{title}</ac:parameter>\n  <ac:rich-text-body>\n'
-    for artifact in _ordered_artifacts(entry["artifacts"]):
-        content += _render_artifact(panel, artifact, graph_width, _hierarchy_leaf_title(grafana_config, artifact))
+    content += _render_matrix_panel_artifacts(
+        panel,
+        entry["artifacts"],
+        graph_width,
+        lambda artifact: _hierarchy_leaf_title(grafana_config, artifact),
+    )
     content += '  </ac:rich-text-body>\n</ac:structured-macro>\n'
     return content
 
@@ -341,10 +345,56 @@ def _render_panel_entry(entry: dict[str, Any], graph_width: int) -> str:
     content = ''
     content += '<ac:structured-macro ac:name="expand">\n'
     content += f'  <ac:parameter ac:name="title">{title}</ac:parameter>\n  <ac:rich-text-body>\n'
-    for artifact in _ordered_artifacts(entry["artifacts"]):
-        content += _render_artifact(panel, artifact, graph_width)
+    content += _render_matrix_panel_artifacts(panel, entry["artifacts"], graph_width)
     content += '  </ac:rich-text-body>\n</ac:structured-macro>\n'
     return content
+
+
+def _render_matrix_panel_artifacts(
+    panel: Any,
+    artifacts: list[dict[str, Any]],
+    graph_width: int,
+    title_for_artifact: Any = None,
+) -> str:
+    ordered = _ordered_artifacts(artifacts)
+    repeat_groups = _repeat_artifact_groups(ordered)
+    if len(repeat_groups) <= 1:
+        return ''.join(
+            _render_artifact(
+                panel,
+                artifact,
+                graph_width,
+                title_for_artifact(artifact) if title_for_artifact else None,
+            )
+            for artifact in ordered
+        )
+    return ''.join(
+        _render_expand(
+            normalize_grafana_display_value(repeat_value),
+            ''.join(
+                _render_artifact(
+                    panel,
+                    artifact,
+                    graph_width,
+                    title_for_artifact(artifact) if title_for_artifact else None,
+                )
+                for artifact in grouped_artifacts
+            ),
+        )
+        for repeat_value, grouped_artifacts in repeat_groups.items()
+    )
+
+
+def _repeat_artifact_groups(
+    artifacts: list[dict[str, Any]],
+) -> OrderedDict[str, list[dict[str, Any]]]:
+    if not artifacts or any(artifact.get("repeat_value") is None for artifact in artifacts):
+        return OrderedDict()
+    grouped: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
+    for artifact in artifacts:
+        value = str(artifact["repeat_value"])
+        grouped.setdefault(value, []).append(artifact)
+    return grouped
 
 
 def _render_artifact(panel: Any, artifact: dict[str, Any], graph_width: int,
@@ -489,7 +539,11 @@ def _context_identity(item: dict[str, str]) -> tuple[str | None, str | None]:
 
 
 def _matrix_artifacts(panel: Any) -> list[dict[str, Any]]:
-    return [artifact for artifact in getattr(panel, "artifacts", []) or [] if _is_visible_matrix_artifact(artifact)]
+    return _ordered_artifacts([
+        artifact
+        for artifact in getattr(panel, "artifacts", []) or []
+        if _is_visible_matrix_artifact(artifact)
+    ])
 
 
 def _is_visible_matrix_artifact(artifact: dict[str, Any]) -> bool:
@@ -507,7 +561,17 @@ def _ordered_panels(panels):
 
 
 def _ordered_artifacts(artifacts):
-    return sorted(artifacts or [], key=lambda artifact: artifact.get("order_index", 0))
+    return sorted(artifacts or [], key=_artifact_order_key)
+
+
+def _artifact_order_key(artifact: dict[str, Any]) -> tuple[int, int, int, int]:
+    matrix = artifact.get("matrix") or {}
+    return (
+        int(artifact.get("repeat_index", 0)),
+        int(matrix.get("index", 0)),
+        int(artifact.get("timestamp_id", 0)),
+        int(artifact.get("order_index", 0)),
+    )
 
 
 def _first_panel_link(panel: Any) -> str:

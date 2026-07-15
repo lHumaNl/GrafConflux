@@ -37,6 +37,40 @@ class TestMatrixGroupedPanelsConfig(unittest.TestCase):
 
 
 class TestMatrixGroupedPanelsRendering(unittest.TestCase):
+    def test_repeating_matrix_panel_groups_multiple_values_in_config_order(self) -> None:
+        context = [self.context("pod", "pod", "core-api-a")]
+        panel = self.panel(
+            "JVM Memory Pools (Heap)",
+            self.repeat_artifact("old.png", context, "panel-old", "G1 Old Gen", 2),
+            self.repeat_artifact("eden.png", context, "panel-eden", "G1 Eden Space", 0),
+            self.repeat_artifact("survivor.png", context, "panel-survivor", "G1 Survivor Space", 1),
+        )
+
+        content = render_matrix_dashboard(self.config([panel]), 600)
+
+        self.assertEqual(content.count(self.panel_title("JVM Memory Pools (Heap)")), 1)
+        self.assertEqual(content.count(self.panel_title("G1 Eden Space")), 1)
+        self.assertEqual(content.count(self.panel_title("G1 Survivor Space")), 1)
+        self.assertEqual(content.count(self.panel_title("G1 Old Gen")), 1)
+        self.assertLess(content.index("G1 Eden Space"), content.index("G1 Survivor Space"))
+        self.assertLess(content.index("G1 Survivor Space"), content.index("G1 Old Gen"))
+        self.assertLess(content.index("eden.png"), content.index("survivor.png"))
+        self.assertLess(content.index("survivor.png"), content.index("old.png"))
+
+    def test_repeating_matrix_panel_with_one_value_has_no_nested_repeat_expand(self) -> None:
+        context = [self.context("pod", "pod", "core-api-a")]
+        panel = self.panel(
+            "JVM Memory Pools (Non-Heap)",
+            self.repeat_artifact("metaspace.png", context, "panel-metaspace", "Metaspace", 0),
+        )
+
+        content = render_matrix_dashboard(self.config([panel]), 600)
+
+        self.assertEqual(content.count(self.panel_title("JVM Memory Pools (Non-Heap)")), 1)
+        self.assertNotIn(self.panel_title("Metaspace"), content)
+        self.assertIn("panel-metaspace", content)
+        self.assertIn("metaspace.png", content)
+
     def test_dynamic_grouping_storage_fixtures_are_byte_exact(self) -> None:
         namespace = self.context("namespace", "Namespace", "payments")
         service = self.context("service", "Service", "capture:payments-api", display_value="Payments API")
@@ -458,6 +492,24 @@ class TestMatrixGroupedPanelsRendering(unittest.TestCase):
         }
         if timestamp_id is not None:
             artifact["timestamp_id"] = timestamp_id
+        return artifact
+
+    @classmethod
+    def repeat_artifact(
+        cls,
+        file_name: str,
+        context: list[dict],
+        link: str,
+        repeat_value: str,
+        repeat_index: int,
+    ) -> dict:
+        artifact = cls.artifact(file_name, context, link)
+        artifact.update({
+            "repeat_var": "jvm_memory_pool",
+            "repeat_value": repeat_value,
+            "repeat_index": repeat_index,
+            "repeat_id": f"{repeat_index:03d}-deadbeef",
+        })
         return artifact
 
     @staticmethod

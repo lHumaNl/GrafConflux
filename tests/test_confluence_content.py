@@ -200,7 +200,7 @@ class TestConfluenceContent(unittest.TestCase):
         self.assertIn("Demo dashboard__7__0.png", content)
         self.assertIn('<ac:structured-macro ac:name="expand">', content)
 
-    def test_build_confluence_storage_content_groups_repeating_artifacts(self):
+    def test_build_confluence_storage_content_groups_repeats_by_repeat_index(self):
         panel = Panel(17, "timeseries", "CPU by host", 1, ["legacy-link"])
         panel.is_repeating = True
         panel.source_panel_id = 17
@@ -209,18 +209,22 @@ class TestConfluenceContent(unittest.TestCase):
             {
                 "timestamp_tag": "smoke",
                 "render_status": "rendered",
-                "png_file": "Demo dashboard__17__repeat-prod-1__smoke.png",
-                "repeat_value": "prod-1",
-                "repeat_value_slug": "prod-1",
-                "link": "https://grafana.example/panel/17?var-host=prod-1",
+                "png_file": "Demo dashboard__17__repeat-prod-2__smoke.png",
+                "repeat_value": "prod-2",
+                "repeat_value_slug": "prod-2",
+                "repeat_index": 1,
+                "order_index": 0,
+                "link": "https://grafana.example/panel/17?var-host=prod-2",
             },
             {
                 "timestamp_tag": "smoke",
                 "render_status": "rendered",
-                "png_file": "Demo dashboard__17__repeat-prod-2__smoke.png",
-                "repeat_value": "prod-2",
-                "repeat_value_slug": "prod-2",
-                "link": "https://grafana.example/panel/17?var-host=prod-2",
+                "png_file": "Demo dashboard__17__repeat-prod-1__smoke.png",
+                "repeat_value": "prod-1",
+                "repeat_value_slug": "prod-1",
+                "repeat_index": 0,
+                "order_index": 9,
+                "link": "https://grafana.example/panel/17?var-host=prod-1",
             },
         ]
         configs = [SimpleNamespace(
@@ -237,6 +241,48 @@ class TestConfluenceContent(unittest.TestCase):
         self.assertIn("CPU by host [host=prod-2]", content)
         self.assertIn("Demo dashboard__17__repeat-prod-1__smoke.png", content)
         self.assertIn("Demo dashboard__17__repeat-prod-2__smoke.png", content)
+        self.assertEqual(content.count('ac:parameter ac:name="title">prod-1</ac:parameter>'), 1)
+        self.assertEqual(content.count('ac:parameter ac:name="title">prod-2</ac:parameter>'), 1)
+        self.assertLess(content.index('title">prod-1'), content.index('title">prod-2'))
+
+    def test_mixed_panel_artifacts_keep_repeat_value_expands(self):
+        panel = Panel(17, "timeseries", "CPU by host", 1, ["legacy-link"])
+        panel.is_repeating = True
+        panel.repeat_var = "host"
+        panel.artifacts = [
+            {
+                "artifact_type": "variant",
+                "order_index": 0,
+                "render_status": "rendered",
+                "png_file": "variant.png",
+                "variant": {"label": "Variant"},
+            },
+            {
+                "repeat_value": "prod-2",
+                "repeat_index": 1,
+                "render_status": "rendered",
+                "png_file": "prod-2.png",
+            },
+            {
+                "repeat_value": "prod-1",
+                "repeat_index": 0,
+                "render_status": "rendered",
+                "png_file": "prod-1.png",
+            },
+        ]
+        config = SimpleNamespace(
+            name="Demo dashboard",
+            full_links=["https://grafana.example/d/demo?from=1&to=2"],
+            backup_dashboard_links=[],
+            snapshot_urls=None,
+            panels=[panel],
+        )
+
+        content = build_confluence_storage_content([config], self.timestamps, 900)
+
+        self.assertEqual(content.count('ac:parameter ac:name="title">prod-1</ac:parameter>'), 1)
+        self.assertEqual(content.count('ac:parameter ac:name="title">prod-2</ac:parameter>'), 1)
+        self.assertIn("variant.png", content)
 
     def test_build_confluence_storage_content_uses_display_title(self):
         panel = Panel(7, "timeseries", "CPU", 1, ["https://grafana.example/panel/7"], display_title="Renamed CPU")
@@ -353,6 +399,50 @@ class TestConfluenceContent(unittest.TestCase):
         self.assertEqual(uploader.panels[0].artifacts[0]["repeat_value"], "prod-1")
         self.assertIn("CPU by host [host=prod-1]", content)
         self.assertIn("Demo dashboard__17__repeat-prod-1__0.png", content)
+
+    def test_upload_only_repeat_artifacts_restore_repeat_index_order(self):
+        config = {
+            "panels": [{
+                "panel_id": 17,
+                "type": "timeseries",
+                "title": "CPU by host",
+                "links": [],
+                "is_repeating": True,
+                "repeat_var": "host",
+                "artifacts": [
+                    {
+                        "render_status": "rendered",
+                        "png_file": "prod-2.png",
+                        "repeat_value": "prod-2",
+                        "repeat_index": 1,
+                        "order_index": 0,
+                    },
+                    {
+                        "render_status": "rendered",
+                        "png_file": "prod-1.png",
+                        "repeat_value": "prod-1",
+                        "repeat_index": 0,
+                        "order_index": 9,
+                    },
+                ],
+            }],
+            "full_links": ["https://grafana.example/d/demo?from=1&to=2"],
+            "snapshot_urls": [],
+            "charts_path": "unused",
+            "timestamps": [{
+                "time_tag": "smoke",
+                "id_time": 0,
+                "start_time_timestamp": 1700000000000,
+                "end_time_timestamp": 1700003600000,
+                "start_time_human": "2023/11/14 22:13:20",
+                "end_time_human": "2023/11/14 23:13:20",
+            }],
+        }
+        uploader = GrafanaConfigUploader("Demo dashboard", config)
+
+        content = build_confluence_storage_content([uploader], uploader.timestamps, 900)
+
+        self.assertLess(content.index('title">prod-1'), content.index('title">prod-2'))
 
     def test_build_confluence_storage_content_renders_backup_dashboard_links_with_replaced_time_range(self):
         timestamps = [

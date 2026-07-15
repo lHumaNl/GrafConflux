@@ -359,8 +359,17 @@ dashboards:
             - '^Other .*'
 ```
 
-When present, Confluence groups repeating artifacts under the source panel title and labels each repeat like
-`CPU by host [host=prod-1]`.
+Confluence renders one expand for the source panel. With multiple repeat values, it renders nested repeat expands in
+the resolved order and labels each repeat like `CPU by host [host=prod-1]`. With one repeat value, it renders that
+artifact's link and image directly under the source panel without a redundant nested expand. The same rule applies
+when a repeating panel is also expanded by `render_matrix`.
+
+Repeat artifact filenames use a safe deterministic identity rather than the raw value or its slug:
+`{dashboard}__{panel_id}__repeat-{index:03d}-{sha256(value)[:8]}__{timestamp}.png`. For example,
+`Operations__17__repeat-000-deadbeef__Release.png`. A repeat artifact records `repeat_index`, `repeat_hash`,
+`repeat_id`, and the raw `repeat_value` in metadata. `repeat_value_slug` may also be present for display or legacy
+metadata, but it is not part of filename identity. Explicit manual values retain their configured order in metadata
+and Confluence.
 
 `panel_filtering` runs against source dashboard panels before repeat materialization. Select the raw source title
 such as `$jvm_memory_pool_heap`, not runtime clone titles such as `G1 Eden Space`. Repeat status is taken from
@@ -399,7 +408,8 @@ shorthand values are explicit (`mode: manual`) and never trigger discovery.
 
 `mode: auto` preserves the previous explicit-rule fallback to configured `vars`, dashboard current/default,
 and supported datasource-backed discovery. Automatic repeating panels without an explicit rule continue to use
-that auto-resolution behavior.
+that auto-resolution behavior. Unlike `all`/`regex`/`filter`, this legacy-compatible path may retain a saved
+Grafana All current value when datasource discovery is unsupported or fails.
 
 ### No-data preflight
 
@@ -522,7 +532,7 @@ dashboards:
 
 - `values`: explicit list.
 - `values_by`: map dependent values by previously resolved matrix variables. It requires `depends_on`; with multiple dependencies, keys are joined as `value1|value2`.
-- `values_from`: pull options from the Grafana variable named by `grafana_variable` or by the matrix key. Use an object with optional `regex`, `max_values`, `filters_by_parent`, and `grouping`. A dependent variable with `depends_on` and no explicit value source is treated as `values_from: {}`.
+- `values_from`: pull options from the Grafana variable named by `grafana_variable` or by the matrix key. Use an object with optional `regex`, `max_values`, and `filters_by_parent`. A dependent variable with `depends_on` and no explicit value source is treated as `values_from: {}`.
 - `display_name`: user-facing variable name. Matrix `alias` remains supported as a legacy synonym; configuring both with different values is an error.
 - `lookup`: explicit, dashboard-scoped lookup identifier for a Grafana variable. It matches exactly and case-sensitively against the variable's technical `name`, `label`, or `description`. Exactly one variable must match; zero or multiple matches are configuration errors. `lookup` and `grafana_variable` are mutually exclusive.
 - `value_aliases`: exact raw-to-display mappings. Unknown values fall back to their raw string, and list values are mapped element by element.
@@ -553,38 +563,37 @@ dashboards:
             max_values: 2
 ```
 
-For dynamic matrix filtering, `values_from.regex`, each `filters_by_parent[].regex`, and each
-named `grouping.rules[].regex` accept either one regex string or a non-empty list of regex
-strings. A list uses OR semantics: a value passes that field when any pattern matches via
-`re.search`. Separate matching parent filters still compose with AND. Multiple patterns from
-one named grouping rule produce only one membership for that rule. A matching
-`override_global` parent filter still disables the complete global regex set for that parent
-context without disabling other matching parent filters.
+For dynamic matrix filtering, `values_from.regex` and a plain `filters_by_parent[].regex` accept one regex string
+or a non-empty list of strings. A list uses OR semantics with `re.search`. Matching parent filters compose with AND;
+an `override_global` match disables the global regex only for that parent context.
+
+To group dynamically discovered values, use the compact parent-local form below. `group_name` is the visible
+synthetic matrix dimension key and display name. Each one-key `regex` mapping creates a group: its key is the unique
+technical group name; a string or list is shorthand for `label: <name>` and `find`; the expanded form supplies a
+display `label` and `find`. `find` accepts a string or a non-empty list and uses `re.search` OR semantics. The union
+of all group `find` patterns filters the matching parent branch, the parent `when` is inherited by generated group
+rules, group and value order are preserved, and unmatched values are disabled. Grouping requires
+`combination_mode: product` and either `matrix_grouped_panels` or `matrix_values_first`.
 
 ```yaml
 pod:
   depends_on: namespace
   values_from:
-    regex:
-      - '^calculator-covenant-api-.+'
-      - '^matrix-calculator-rate-.+'
-      - '^matrix-offer-generator-.*'
     filters_by_parent:
-      - when: {namespace: production}
+      - when: {namespace: ekp-middle}
+        group_name: service
         regex:
-          - '^calculator-covenant-api-.+'
-          - '^matrix-calculator-rate-.+'
-    grouping:
-      rules:
-        - name: calculators
-          label: Calculator services
-          regex:
-            - '^calculator-covenant-api-.+'
-            - '^matrix-calculator-rate-.+'
+          - scoring-api: '^scoring-api.*'
+          - alfacapture-api:
+              label: AlfaCapture API Service
+              find: '^alfacapture-api.*'
+          - credits-api:
+              label: Credits API Service
+              find: ['^credits-api-.*', '^ufcr-credits-api-.*']
 ```
 
-Regex lists are intentionally not supported by legacy variable-level `regex` or by
-`grouping.capture.regex`; capture grouping continues to require one regex string.
+Do not use `values_from.grouping`: it is unsupported. Do not mix string and mapping items in one grouped `regex`
+list. A plain string or list of strings remains a non-grouped parent filter.
 
 Behavior notes:
 
