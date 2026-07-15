@@ -270,7 +270,11 @@ class TestNoDataPreflight(unittest.TestCase):
         manager = self.create_manager(
             collect_no_data_panels=False,
             enable_repeating_panels=True,
-            repeating_panels=[{"panel_id": 17, "collect_no_data_panels": True}],
+            repeating_panels=[{
+                "panel_id": 17,
+                "collect_no_data_panels": True,
+                "repeat_values": {"mode": "auto"},
+            }],
         )
         manager.session.post = Mock(return_value=Mock(status_code=200, json=Mock(return_value={"results": {"A": {"frames": []}}})))
         self.prepare_dashboard_response(manager, dashboard)

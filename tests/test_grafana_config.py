@@ -553,7 +553,7 @@ class TestGrafanaConfigLoading(unittest.TestCase):
         cases = [
             ("  enable_repeating_panels: 'true'\n", "enable_repeating_panels.*expected bool"),
             ("  repeating_panels:\n    panel_id: 17\n", "repeating_panels.*expected list"),
-            ("  repeating_panels:\n    - 17\n", "repeating_panels.*expected list"),
+            ("  repeating_panels:\n    - 17\n", "repeating_panels.*expected non-empty repeating panel rule"),
         ]
 
         for body, pattern in cases:
@@ -567,6 +567,70 @@ class TestGrafanaConfigLoading(unittest.TestCase):
 
                 with self.assertRaisesRegex(ValueError, pattern):
                     GrafanaManager.load_grafana_config(config_path)
+
+    def test_repeating_panel_shorthand_normalizes_to_explicit_rules(self):
+        config = GrafanaConfigDownloader("demo", {
+            "dash_title": "Dashboard",
+            "grafana_url": "https://grafana.example",
+            "repeating_panels": [
+                "$jvm_memory_pool_heap",
+                {"$jvm_memory_pool_nonheap": "Metaspace"},
+                {"$selected": ["one", "two"]},
+                {"$filtered": {
+                    "include": "one",
+                    "exclude": ["two"],
+                    "regex": ["^some-", "^big-"],
+                }},
+                {"panel_id": 17},
+            ],
+        })
+
+        self.assertEqual(config.repeating_panels, [
+            {"title": "$jvm_memory_pool_heap", "repeat_values": {"mode": "all"}},
+            {"title": "$jvm_memory_pool_nonheap", "repeat_values": {
+                "mode": "filter", "include": ["Metaspace"],
+            }},
+            {"title": "$selected", "repeat_values": {
+                "mode": "filter", "include": ["one", "two"],
+            }},
+            {"title": "$filtered", "repeat_values": {
+                "mode": "filter",
+                "include": ["one"],
+                "exclude": ["two"],
+                "regex": ["^some-", "^big-"],
+            }},
+            {"panel_id": 17, "repeat_values": {"mode": "all"}},
+        ])
+
+    def test_repeating_filter_rejects_invalid_lists_and_unknown_fields(self):
+        cases = (
+            ({"$panel": {"include": []}}, r"include"),
+            ({"$panel": {"regex": ["valid", 7]}}, r"regex\[1\]"),
+            ({"$panel": {"unknown": "value"}}, r"unknown repeat filter"),
+        )
+        for rule, expected in cases:
+            with self.subTest(rule=rule), self.assertRaisesRegex(ConfigurationError, expected):
+                GrafanaConfigDownloader("demo", {
+                    "dash_title": "Dashboard",
+                    "grafana_url": "https://grafana.example",
+                    "repeating_panels": [rule],
+                })
+
+    def test_repeating_rules_reject_typos_mixed_shapes_and_mode_fields(self):
+        cases = (
+            ({"panel_id": 17, "repeat_value": {"mode": "manual"}}, r"unknown.*repeat_value"),
+            ({"panel_id": 17, "$panel": "value"}, r"unknown.*\$panel"),
+            ({"title": "Panel", "repeat_values": {"mode": "all", "regex": ".*"}}, r"mode.*all"),
+            ({"title": "Panel", "repeat_values": {"mode": "manual", "regex": ".*"}}, r"mode.*manual"),
+            ({"$panel": {}}, r"filter.*selector"),
+        )
+        for rule, expected in cases:
+            with self.subTest(rule=rule), self.assertRaisesRegex(ConfigurationError, expected):
+                GrafanaConfigDownloader("demo", {
+                    "dash_title": "Dashboard",
+                    "grafana_url": "https://grafana.example",
+                    "repeating_panels": [rule],
+                })
 
     def test_snapshot_validation_keeps_constructor_visible_defaults(self):
         config_path = self.write_config(

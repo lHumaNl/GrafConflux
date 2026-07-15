@@ -87,7 +87,7 @@ class MatrixValueResolver:
         result = self._discover(source_name, timestamp, assembly.values)
         result = _with_context_assembly(result, assembly)
         self.cache[cache_key] = result
-        _log_result(source_name, timestamp, result)
+        _log_result(source_name, timestamp, _public_context(context), result)
         return result
 
     def _effective_context(
@@ -370,26 +370,42 @@ def _with_context_assembly(
     return MatrixValueResult(result.status, result.values, provenance)
 
 
-def _log_result(variable: str, timestamp: Any, result: MatrixValueResult) -> None:
+def _log_result(
+    variable: str,
+    timestamp: Any,
+    context: dict[str, Any],
+    result: MatrixValueResult,
+) -> None:
     if result.authoritative:
         log = logger.warning if result.status is MatrixDiscoveryStatus.EMPTY else logger.info
         log(
-            "matrix_discovery variable=%s timestamp_id=%s count=%s",
-            safe_discovery_variable(variable), _timestamp_identifier(timestamp), len(result.values),
+            "matrix_discovery variable=%s time=%s context=%s count=%s values=%s",
+            safe_discovery_variable(variable), timestamp_log_label(timestamp), context,
+            len(result.values), result.values,
         )
         return
     error_type = result.provenance.get("error_type")
     suffix = " error_type=%s" if error_type else ""
     logger.warning(
-        f"matrix_discovery variable=%s timestamp_id=%s status=%s reason=%s{suffix}",
-        safe_discovery_variable(variable), _timestamp_identifier(timestamp), result.status.value,
-        result.provenance.get("method"), *([error_type] if error_type else []),
+        f"matrix_discovery variable=%s time=%s context=%s status=%s reason=%s{suffix}",
+        safe_discovery_variable(variable), timestamp_log_label(timestamp), context,
+        result.status.value, result.provenance.get("method"), *([error_type] if error_type else []),
     )
 
 
-def _timestamp_identifier(timestamp: Any) -> Any:
-    value = getattr(timestamp, "id_time", None)
-    return value if value is not None else "unknown"
+def timestamp_log_label(timestamp: Any) -> str:
+    time_tag = getattr(timestamp, "time_tag", None)
+    if time_tag not in (None, ""):
+        return str(time_tag)
+    start_human = getattr(timestamp, "start_time_human", None)
+    end_human = getattr(timestamp, "end_time_human", None)
+    if start_human and end_human:
+        return f"{start_human} - {end_human}"
+    start = getattr(timestamp, "start_time_timestamp", None)
+    end = getattr(timestamp, "end_time_timestamp", None)
+    if start is not None and end is not None:
+        return f"{start}-{end}"
+    return "unknown"
 
 
 def safe_discovery_variable(variable: str) -> str:

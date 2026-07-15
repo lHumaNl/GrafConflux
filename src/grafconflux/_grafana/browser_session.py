@@ -23,6 +23,7 @@ class GrafanaBrowserSession:
         suppress_setup_errors: bool = False,
         require_cookie_domain: bool = False,
         browser_name: str = DEFAULT_PLAYWRIGHT_BROWSER,
+        auth_generation: int = 0,
     ) -> None:
         self.config = config
         self.session = session
@@ -32,6 +33,7 @@ class GrafanaBrowserSession:
         self.suppress_setup_errors = suppress_setup_errors
         self.require_cookie_domain = require_cookie_domain
         self.browser_name = browser_name
+        self.auth_generation = auth_generation
         self.playwright = None
         self.browser = None
         self.context = None
@@ -106,22 +108,41 @@ class GrafanaBrowserSession:
             ) from error
         return sync_playwright()
 
-    def refresh_authentication(self) -> None:
+    def refresh_authentication(self, auth_generation: Optional[int] = None) -> None:
         if self.browser_factory is not None:
             self.authenticate_browser(self.browser)
+            if auth_generation is not None:
+                self.auth_generation = auth_generation
             return
         old_context = self.context
-        self._create_authenticated_context()
+        new_context, new_page = self._new_authenticated_context()
+        self.context = new_context
+        self.page = new_page
+        if auth_generation is not None:
+            self.auth_generation = auth_generation
         if old_context is not None:
-            old_context.close()
+            try:
+                old_context.close()
+            except Exception as error:
+                logger.warning(
+                    f'Old browser context cleanup failed error_type={type(error).__name__}'
+                )
 
     def _create_authenticated_context(self) -> None:
+        self.context, self.page = self._new_authenticated_context()
+
+    def _new_authenticated_context(self):
         cookies = self.playwright_cookies()
-        self.context = self.browser.new_context(**self.context_options())
-        if cookies:
-            self.context.add_cookies(cookies)
-        self.page = self.context.new_page()
-        self.page.on('response', self._record_snapshot_response)
+        context = self.browser.new_context(**self.context_options())
+        try:
+            if cookies:
+                context.add_cookies(cookies)
+            page = context.new_page()
+            page.on('response', self._record_snapshot_response)
+            return context, page
+        except Exception:
+            context.close()
+            raise
 
     def context_options(self) -> Dict[str, Any]:
         options: Dict[str, Any] = {

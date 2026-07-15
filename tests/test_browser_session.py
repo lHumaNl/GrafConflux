@@ -195,6 +195,54 @@ class TestGrafanaBrowserSession(unittest.TestCase):
         self.assertEqual(cookies, [])
         self.assertIn("No Grafana cookies found", "\n".join(logs.output))
 
+    def test_refresh_authentication_keeps_old_context_when_candidate_setup_fails(self):
+        session = Mock()
+        session.headers = {}
+        session.cookies = self.cookie_jar()
+        browser_session = GrafanaBrowserSession(self.create_config(), session)
+        old_context = Mock()
+        old_page = Mock()
+        candidate_context = Mock()
+        candidate_context.add_cookies.side_effect = RuntimeError("cookie setup failed")
+        browser_session.browser = Mock()
+        browser_session.browser.new_context.return_value = candidate_context
+        browser_session.context = old_context
+        browser_session.page = old_page
+
+        with self.assertRaisesRegex(RuntimeError, "cookie setup failed"):
+            browser_session.refresh_authentication()
+
+        self.assertIs(browser_session.context, old_context)
+        self.assertIs(browser_session.page, old_page)
+        old_context.close.assert_not_called()
+        candidate_context.close.assert_called_once()
+
+    def test_refresh_authentication_publishes_generation_then_closes_old_context(self):
+        session = Mock()
+        session.headers = {"Authorization": "Bearer refreshed-token"}
+        session.cookies = self.cookie_jar()
+        browser_session = GrafanaBrowserSession(self.create_config(), session, auth_generation=2)
+        old_context = Mock()
+        old_page = Mock()
+        candidate_context = Mock()
+        candidate_page = Mock()
+        candidate_context.new_page.return_value = candidate_page
+        browser_session.browser = Mock()
+        browser_session.browser.new_context.return_value = candidate_context
+        browser_session.context = old_context
+        browser_session.page = old_page
+
+        browser_session.refresh_authentication(auth_generation=3)
+
+        self.assertIs(browser_session.context, candidate_context)
+        self.assertIs(browser_session.page, candidate_page)
+        self.assertEqual(browser_session.auth_generation, 3)
+        self.assertEqual(
+            browser_session.browser.new_context.call_args.kwargs["extra_http_headers"],
+            {"Authorization": "Bearer refreshed-token"},
+        )
+        old_context.close.assert_called_once()
+
     @staticmethod
     def cookie_jar(domain=".grafana.example", include_host_only=True):
         jar = requests.cookies.RequestsCookieJar()

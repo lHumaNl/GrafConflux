@@ -18,7 +18,10 @@ from grafconflux._shared.time import GrafanaTimeDownloader, GrafanaTimeUploader
 from grafconflux._shared.confluence_settings import confluence_rendering_settings_from_config
 from grafconflux._grafana.browser_session import GrafanaBrowserSession
 from grafconflux._grafana.lookup import log_lookup_mode, search_params, select_dashboard
-from grafconflux._grafana.playwright_screenshots import PlaywrightPanelScreenshotRunner
+from grafconflux._grafana.playwright_screenshots import (
+    PlaywrightPanelScreenshotRunner,
+    is_grafana_login_url,
+)
 from grafconflux._shared.grafana_models import (
     DEFAULT_INTERVAL_MS,
     DEFAULT_MAX_DATA_POINTS,
@@ -156,6 +159,8 @@ class GrafanaManager:
 
     def __init__(self, config: GrafanaConfigDownloader, session: Optional[requests.Session] = None):
         self.thread_local = threading.local()
+        self._authentication_lock = threading.RLock()
+        self._auth_generation = 0
         self.browser_list: Optional[List[Any]] = []
         self.dashboard_url = ''
         self.config = config
@@ -229,25 +234,32 @@ class GrafanaManager:
     def _grafana_login_url(self) -> str:
         return self._grafana_url('/login')
 
-    def _reauthenticate_grafana(self, browser: Optional[Any] = None) -> bool:
+    def _reauthenticate_grafana(
+        self,
+        browser: Optional[Any] = None,
+        observed_generation: Optional[int] = None,
+    ) -> bool:
         if not self.config.auth:
             return False
         if not self._has_reauthentication_credentials():
             logger.error('Cannot re-authenticate Grafana: required credentials are not available')
             return False
-        try:
-            logger.warning('Grafana session expired; re-authenticating')
-            self.session.cookies.clear()
-            self.authenticate(self._confluence_login, self._confluence_password)
-            if browser is not None:
-                self._refresh_browser_authentication(browser)
-            return True
-        except Exception as error:
-            logger.error(
-                f'Grafana re-authentication failed error_type={_exception_type(error)} '
-                f'error={_safe_exception_message(error)}'
-            )
-            return False
+        with self._authentication_lock:
+            try:
+                if observed_generation is None or self._auth_generation <= observed_generation:
+                    logger.warning('Grafana session expired; re-authenticating')
+                    self.session.cookies.clear()
+                    self.authenticate(self._confluence_login, self._confluence_password)
+                    self._auth_generation += 1
+                if browser is not None:
+                    self._refresh_browser_authentication(browser)
+                return True
+            except Exception as error:
+                logger.error(
+                    f'Grafana re-authentication failed error_type={_exception_type(error)} '
+                    f'error={_safe_exception_message(error)}'
+                )
+                return False
 
     def _has_reauthentication_credentials(self) -> bool:
         if self.config.domain:
@@ -262,7 +274,7 @@ class GrafanaManager:
 
     def _refresh_browser_authentication(self, browser: Any) -> None:
         if hasattr(browser, 'refresh_authentication'):
-            browser.refresh_authentication()
+            browser.refresh_authentication(auth_generation=self._auth_generation)
 
     def download_charts(self, test_folder: str, timestamps: List[GrafanaTimeDownloader]):
         """
@@ -1404,6 +1416,7 @@ class GrafanaManager:
             self.session,
             suppress_setup_errors=True,
             require_cookie_domain=True,
+            auth_generation=self._auth_generation,
         ).create_browser()
 
     def __take_screenshot(self, browser: Any, task: PanelRenderTask, final_url, file_path):
@@ -1413,10 +1426,24 @@ class GrafanaManager:
         PlaywrightPanelScreenshotRunner(self).take_screenshot(browser, task, final_url, file_path)
 
     def __get_panel_data_sources(self, final_url):
+        observed_generation = self._auth_generation
         response = self.session.get(final_url, verify=self.config.verify_ssl, timeout=self.config.timeout)
-        if response.status_code in (401, 403) and self._reauthenticate_grafana():
-            logger.info(f'Retrying panel datasource discovery after re-authentication url={sanitize_url_for_log(final_url)}')
+        original_status = response.status_code
+        original_challenge = self._grafana_auth_challenge(response)
+        auth_required = original_challenge != 'none'
+        if auth_required and self._reauthenticate_grafana(observed_generation=observed_generation):
             response = self.session.get(final_url, verify=self.config.verify_ssl, timeout=self.config.timeout)
+            logger.info(
+                'Panel datasource authentication retry original_status=%s original_challenge=%s '
+                'retry_status=%s retry_challenge=%s url=%s',
+                original_status,
+                original_challenge,
+                response.status_code,
+                self._grafana_auth_challenge(response),
+                final_url,
+            )
+        if self._grafana_auth_challenge(response) != 'none':
+            raise RuntimeError('Grafana authentication recovery exhausted during panel datasource discovery')
         if response.status_code != 200:
             logger.warning(f'Panel datasource discovery returned HTTP {response.status_code} url={sanitize_url_for_log(final_url)}')
         response = response.text
@@ -1438,6 +1465,13 @@ class GrafanaManager:
                 ]
 
         return panel_data_sources
+
+    def _grafana_auth_challenge(self, response: Any) -> str:
+        if response.status_code in (401, 403):
+            return f'http_{response.status_code}'
+        if is_grafana_login_url(getattr(response, 'url', None), self.config):
+            return 'login_redirect'
+        return 'none'
 
     @staticmethod
     def load_grafana_config(path: str) -> List[GrafanaConfigDownloader]:

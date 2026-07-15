@@ -173,10 +173,15 @@ class RepeatingPlanner:
         self._validate_max_values(rule.get('max_values'), values, path)
         return values
     def _resolve_repeat_values_by_timestamp(self, dashboard: Dict, repeat_var: str, rule: Dict, path: str,
-                                            panel_id: int, timestamps: List[GrafanaTimeDownloader]) -> Dict[int, List[str]]:
+                                             panel_id: int, timestamps: List[GrafanaTimeDownloader]) -> Dict[int, List[str]]:
         if not timestamps:
             return {}
-        if REPEAT_VALUES_KEY in rule and rule.get(REPEAT_VALUES_KEY) is not None:
+        repeat_values = rule.get(REPEAT_VALUES_KEY)
+        if (
+            REPEAT_VALUES_KEY in rule
+            and repeat_values is not None
+            and not (isinstance(repeat_values, dict) and repeat_values.get('mode') == 'auto')
+        ):
             values = self._resolve_repeat_values(dashboard, repeat_var, rule, path, panel_id, timestamps)
             return {timestamp.id_time: values for timestamp in timestamps}
         return {
@@ -191,6 +196,8 @@ class RepeatingPlanner:
             return self._fallback_repeat_values(dashboard, repeat_var, self._first_timestamp(timestamps))
         repeat_values = self._validated_repeat_values_mapping(rule[REPEAT_VALUES_KEY], path)
         mode = self._validated_repeat_values_mode(repeat_values, path)
+        if mode == 'auto':
+            return self._fallback_repeat_values(dashboard, repeat_var, self._first_timestamp(timestamps))
         if mode == 'manual':
             return self._manual_repeat_values(repeat_values, path)
         return self._discovered_repeat_values(dashboard, repeat_var, repeat_values, mode, path, panel_id)
@@ -219,8 +226,43 @@ class RepeatingPlanner:
         values = self._templating_option_values(dashboard, repeat_var, panel_id)
         if mode == 'all':
             return values
+        if mode == 'filter':
+            return self._filtered_repeat_values(values, repeat_values, path)
         patterns = self._compile_repeat_value_patterns(repeat_values.get('regex'), path)
         return [value for value in values if any(pattern.search(value) for pattern in patterns)]
+
+    def _filtered_repeat_values(self, values: List[str], repeat_values: Dict,
+                                path: str) -> List[str]:
+        include = set(self._repeat_exact_values(repeat_values.get('include'), 'include', path))
+        exclude = set(self._repeat_exact_values(repeat_values.get('exclude'), 'exclude', path))
+        regex_config = repeat_values.get('regex')
+        patterns = self._compile_repeat_value_patterns(regex_config, path) if regex_config is not None else []
+        has_positive_selector = bool(include or patterns)
+        return [
+            value for value in values
+            if (not has_positive_selector or value in include or any(pattern.search(value) for pattern in patterns))
+            and value not in exclude
+        ]
+
+    def _repeat_exact_values(self, value: Any, name: str, path: str) -> List[str]:
+        if value is None:
+            return []
+        values = [value] if isinstance(value, str) else value
+        if not isinstance(values, list) or not values:
+            self._raise_repeating_error(
+                f'{path}.{REPEAT_VALUES_KEY}.{name}', value, 'non-empty string or list[str]'
+            )
+        return [
+            self._validated_repeat_filter_value(item, index, name, path)
+            for index, item in enumerate(values)
+        ]
+
+    def _validated_repeat_filter_value(self, value: Any, index: int, name: str, path: str) -> str:
+        if isinstance(value, str) and value:
+            return value
+        self._raise_repeating_error(
+            f'{path}.{REPEAT_VALUES_KEY}.{name}[{index}]', value, 'non-empty string'
+        )
     def _compile_repeat_value_patterns(self, regex_config: Any, path: str) -> List[Pattern[str]]:
         regex_values = self._repeat_regex_values(regex_config, path)
         return [self._compile_repeating_regex(value, f'{path}.{REPEAT_VALUES_KEY}.regex{suffix}')

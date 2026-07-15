@@ -34,10 +34,15 @@ class TestEmptyDashboardContextDefaults(unittest.TestCase):
         )
         diagnostic = "\n".join(logs.output)
         self.assertIn("variable=pod", diagnostic)
-        self.assertIn("timestamp_id=9", diagnostic)
+        self.assertIn("time=1700000000000-1700003600000", diagnostic)
+        self.assertIn("context={}", diagnostic)
         self.assertEqual(len(logs.output), 1)
-        self.assertIn("matrix_discovery variable=pod timestamp_id=9 count=1", diagnostic)
-        self.assertNotIn("api-1", diagnostic)
+        self.assertIn(
+            "matrix_discovery variable=pod time=1700000000000-1700003600000 "
+            "context={} count=1",
+            diagnostic,
+        )
+        self.assertIn("values=['api-1']", diagnostic)
 
     def test_empty_saved_default_is_used_when_current_is_absent(self) -> None:
         session = self.successful_session()
@@ -126,8 +131,12 @@ class TestEmptyDashboardContextDefaults(unittest.TestCase):
         })
         diagnostic = "\n".join(logs.output)
         self.assertEqual(len(logs.output), 1)
-        self.assertIn("matrix_discovery variable=pod timestamp_id=9 count=1", diagnostic)
-        self.assertNotIn("api-1", diagnostic)
+        self.assertIn(
+            "matrix_discovery variable=pod time=1700000000000-1700003600000 "
+            "context={'namespace': 'team-a'} count=1",
+            diagnostic,
+        )
+        self.assertIn("values=['api-1']", diagnostic)
 
     def test_unresolved_discovery_logs_one_safe_final_warning(self) -> None:
         dashboard = {"templating": {"list": [{
@@ -144,7 +153,11 @@ class TestEmptyDashboardContextDefaults(unittest.TestCase):
         diagnostic = "\n".join(logs.output)
         self.assertEqual(result.status, MatrixDiscoveryStatus.UNSUPPORTED)
         self.assertEqual(len(logs.output), 1)
-        self.assertIn("matrix_discovery variable=pod timestamp_id=9 status=unsupported", diagnostic)
+        self.assertIn(
+            "matrix_discovery variable=pod time=1700000000000-1700003600000 "
+            "context={} status=unsupported",
+            diagnostic,
+        )
         self.assertIn("reason=invalid_or_missing_context", diagnostic)
         self.assertNotIn("fake-uid-should-not-log", diagnostic)
         self.assertNotIn("fake-query-secret", diagnostic)

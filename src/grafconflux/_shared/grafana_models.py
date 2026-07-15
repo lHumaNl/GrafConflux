@@ -3,7 +3,7 @@ import re
 from abc import ABC
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Pattern, Tuple
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import unquote_plus, urlparse, urlunparse
 from grafconflux._shared.confluence_settings import (
     ConfluenceRenderingSettings,
     confluence_rendering_settings_from_metadata,
@@ -25,7 +25,7 @@ REPEAT_VALUES_KEY = 'repeat_values'
 INCLUDE_ALL_EXCEPT_EXCLUDED = 'include_all_except_excluded'
 INCLUDE_ONLY_SELECTED = 'include_only_selected'
 PANEL_FILTERING_MODES = [INCLUDE_ALL_EXCEPT_EXCLUDED, INCLUDE_ONLY_SELECTED]
-REPEAT_VALUE_MODES = ['manual', 'regex', 'all']
+REPEAT_VALUE_MODES = ['manual', 'regex', 'all', 'filter', 'auto']
 ALL_REPEAT_SENTINELS = {'$__all', '__all', 'all'}
 COLLECT_NO_DATA_PANELS_KEY = 'collect_no_data_panels'
 NO_DATA_PREFLIGHT_KEY = 'no_data_preflight'
@@ -616,15 +616,20 @@ def _sanitized_netloc(parsed) -> str:
 
 
 def _sanitized_query(query: str) -> str:
-    items = [(_key, _safe_query_value(_key, value)) for _key, value in parse_qsl(query, keep_blank_values=True)]
-    return urlencode(items, doseq=True)
+    items = []
+    for item in query.split('&'):
+        raw_key, separator, _raw_value = item.partition('=')
+        key = unquote_plus(raw_key)
+        if separator and _is_sensitive_query_key(key):
+            items.append(f'{raw_key}=REDACTED')
+        else:
+            items.append(item)
+    return '&'.join(items)
 
 
-def _safe_query_value(key: str, value: str) -> str:
+def _is_sensitive_query_key(key: str) -> bool:
     lowered_key = key.lower()
-    if any(fragment in lowered_key for fragment in SENSITIVE_QUERY_FRAGMENTS):
-        return 'REDACTED'
-    return value
+    return any(fragment in lowered_key for fragment in SENSITIVE_QUERY_FRAGMENTS)
 
 
 def _normalized_app_path(path: str) -> str:
@@ -752,9 +757,122 @@ def _validated_repeating_panels(dashboard_name: str, config: Dict) -> List[Dict]
     value = config.get(REPEATING_PANELS_KEY, [])
     if value is None:
         return []
-    if isinstance(value, list) and all(isinstance(item, dict) for item in value):
-        return list(value)
-    raise ConfigurationError(f'dashboards.{dashboard_name}.{REPEATING_PANELS_KEY}: invalid value="{value}", expected list[object], suggested fix: configure explicit repeating panel rules')
+    if not isinstance(value, list):
+        raise ConfigurationError(
+            f'dashboards.{dashboard_name}.{REPEATING_PANELS_KEY}: invalid value="{value}", '
+            'expected list[object|string], suggested fix: configure explicit repeating panel rules'
+        )
+    return [
+        _normalized_repeating_panel_rule(
+            item,
+            f'dashboards.{dashboard_name}.{REPEATING_PANELS_KEY}[{index}]',
+        )
+        for index, item in enumerate(value)
+    ]
+
+
+def _normalized_repeating_panel_rule(item: Any, path: str) -> Dict[str, Any]:
+    if isinstance(item, str) and item:
+        return {'title': item, REPEAT_VALUES_KEY: {'mode': 'all'}}
+    if not isinstance(item, dict) or not item:
+        raise ConfigurationError(
+            f'{path}: expected non-empty repeating panel rule or title shorthand.'
+        )
+    canonical_keys = {
+        'panel_id', 'title', 'title_regex', 'repeat_var', REPEAT_VALUES_KEY,
+        'max_values', COLLECT_NO_DATA_PANELS_KEY,
+    }
+    if set(item) & canonical_keys:
+        unknown = set(item) - canonical_keys
+        if unknown:
+            raise ConfigurationError(f'{path}: unknown canonical field(s) {sorted(unknown)}.')
+        normalized = dict(item)
+        normalized[REPEAT_VALUES_KEY] = _normalized_repeat_values(
+            path + f'.{REPEAT_VALUES_KEY}',
+            normalized.get(REPEAT_VALUES_KEY),
+        )
+        return normalized
+    if len(item) != 1:
+        raise ConfigurationError(f'{path}: shorthand must be a one-item title mapping.')
+    title, selector = next(iter(item.items()))
+    if not isinstance(title, str) or not title:
+        raise ConfigurationError(f'{path}: shorthand title must be a non-empty string.')
+    return {
+        'title': title,
+        REPEAT_VALUES_KEY: _normalized_repeat_shorthand(path, selector),
+    }
+
+
+def _normalized_repeat_shorthand(path: str, value: Any) -> Dict[str, Any]:
+    if value is None:
+        return {'mode': 'all'}
+    if isinstance(value, (str, list)):
+        return {
+            'mode': 'filter',
+            'include': _normalized_repeat_string_list(path + '.include', value),
+        }
+    if not isinstance(value, dict):
+        raise ConfigurationError(f'{path}: shorthand value must be string, list, or filter mapping.')
+    unknown = set(value) - {'include', 'exclude', 'regex'}
+    if unknown:
+        raise ConfigurationError(f'{path}: unknown repeat filter field(s) {sorted(unknown)}.')
+    return _normalized_repeat_values(path, {'mode': 'filter', **value})
+
+
+def _normalized_repeat_values(path: str, value: Any) -> Dict[str, Any]:
+    if value is None:
+        return {'mode': 'all'}
+    if not isinstance(value, dict):
+        raise ConfigurationError(f'{path}: expected mapping.')
+    normalized = dict(value)
+    if 'mode' not in normalized:
+        if any(name in normalized for name in ('include', 'exclude', 'regex')):
+            normalized['mode'] = 'filter'
+        elif 'values' in normalized:
+            normalized['mode'] = 'manual'
+        else:
+            normalized['mode'] = 'all'
+    mode = normalized.get('mode')
+    if mode not in REPEAT_VALUE_MODES:
+        raise ConfigurationError(f'{path}.mode: expected one of {REPEAT_VALUE_MODES}.')
+    allowed_by_mode = {
+        'manual': {'mode', 'values'},
+        'regex': {'mode', 'regex'},
+        'filter': {'mode', 'include', 'exclude', 'regex'},
+        'all': {'mode'},
+        'auto': {'mode'},
+    }
+    unknown = set(normalized) - allowed_by_mode[mode]
+    if unknown:
+        raise ConfigurationError(f'{path}: field(s) {sorted(unknown)} are not allowed for mode {mode}.')
+    if mode == 'manual':
+        if 'values' not in normalized:
+            raise ConfigurationError(f'{path}.values: required for mode manual.')
+        normalized['values'] = _normalized_repeat_string_list(f'{path}.values', normalized['values'])
+        return normalized
+    if mode == 'regex':
+        if 'regex' not in normalized:
+            raise ConfigurationError(f'{path}.regex: required for mode regex.')
+        normalized['regex'] = _normalized_repeat_string_list(f'{path}.regex', normalized['regex'])
+        return normalized
+    if mode != 'filter':
+        return normalized
+    for name in ('include', 'exclude', 'regex'):
+        if name in normalized:
+            normalized[name] = _normalized_repeat_string_list(f'{path}.{name}', normalized[name])
+    if not any(name in normalized for name in ('include', 'exclude', 'regex')):
+        raise ConfigurationError(f'{path}: mode filter requires include, exclude, or regex selector.')
+    return normalized
+
+
+def _normalized_repeat_string_list(path: str, value: Any) -> List[str]:
+    values = [value] if isinstance(value, str) else value
+    if not isinstance(values, list) or not values:
+        raise ConfigurationError(f'{path}: expected non-empty string or non-empty list[str].')
+    for index, item in enumerate(values):
+        if not isinstance(item, str) or not item:
+            raise ConfigurationError(f'{path}[{index}]: expected non-empty string.')
+    return list(values)
 
 
 def _validated_panel_variants(dashboard_name: str, config: Dict) -> List[Dict[str, Any]]:

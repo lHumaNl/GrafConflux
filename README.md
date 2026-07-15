@@ -216,6 +216,14 @@ dashboards:
       strict_datasource_fragments: false
 ```
 
+The legacy Grafana fullscreen route uses the bare `fullscreen` query flag without `=`. If a
+navigation or datasource request returns 401/403 or lands on the configured same-origin
+Grafana `/login` page, GrafConflux re-authenticates the requests session, rebuilds the affected
+Playwright context with fresh cookies/headers, and retries that route once. Concurrent workers
+share one bounded authentication generation instead of performing duplicate logins.
+Screenshot opening/response logs retain the exact constructed panel URL so it can be copied for
+manual reproduction; credentials and authorization headers must not be placed in that URL.
+
 Repeating panel and row titles normalize display-only `$__all` values to `All`.
 
 ## Dashboard config DSL
@@ -316,8 +324,9 @@ dashboards:
 - `download_collapsed_rows: true` expands collapsed Grafana rows before extraction.
 - Legacy alias `download_collapse_panels` is still accepted.
 - `download_hidden_panels` is not supported.
-- `enable_repeating_panels: true` keeps Grafana repeating panels as separate artifacts.
-- `repeating_panels` lets you explicitly control repeat expansion for selected panels.
+- Grafana repeating panels are detected from `panel.repeat` or inherited `row.repeat`; a `$` in a title alone does not make a panel repeating.
+- `enable_repeating_panels: true` remains accepted for compatibility.
+- `repeating_panels` explicitly selects a repeat source and optionally filters its concrete values.
 
 ```yaml
 dashboards:
@@ -326,15 +335,66 @@ dashboards:
     grafana_url: https://grafana.example/grafana
     download_collapsed_rows: true
     enable_repeating_panels: true
+    panel_filtering:
+      mode: include_only_selected
+      include_panels:
+        titles:
+          - Uptime
+          - "$jvm_memory_pool_heap"
+          - "$jvm_memory_pool_nonheap"
+
     repeating_panels:
-      - panel_id: 17
-        repeat_values:
-          mode: values
-          values: [api-1, api-2]
+      # Bare source title: all saved Grafana option values except All.
+      - "$jvm_memory_pool_heap"
+
+      # Exact one-value shorthand.
+      - "$jvm_memory_pool_nonheap": Metaspace
+
+      # Include/regex are a union; exclude is the final veto.
+      - "$other_pool":
+          include: [Pool A]
+          exclude: [Pool B]
+          regex:
+            - '^G1 .*'
+            - '^Other .*'
 ```
 
 When present, Confluence groups repeating artifacts under the source panel title and labels each repeat like
 `CPU by host [host=prod-1]`.
+
+`panel_filtering` runs against source dashboard panels before repeat materialization. Select the raw source title
+such as `$jvm_memory_pool_heap`, not runtime clone titles such as `G1 Eden Space`. Repeat status is taken from
+Grafana dashboard metadata.
+
+Explicit rules support both shorthand and canonical mappings:
+
+```yaml
+repeating_panels:
+  # repeat_values is optional; omitted means mode: all.
+  - title: "$jvm_memory_pool_heap"
+
+  - panel_id: 17
+    repeat_values:
+      mode: filter
+      include: [G1 Eden Space]
+      exclude: [G1 Survivor Space]
+      regex:
+        - '^G1 .*'
+
+  - panel_id: 21
+    repeat_values:
+      mode: manual
+      values: [exact-value]
+```
+
+For `mode: filter`, exact `include` values and regex matches are combined with OR, then `exclude` removes
+matches. String and list forms are accepted for `include`, `exclude`, and `regex`; regex lists use OR and
+`re.search`. Grafana option order is preserved, duplicate values are removed, and All sentinels are excluded.
+Selectors currently match Grafana `option.value`, not `option.text` or a runtime clone title.
+
+`mode: auto` preserves the previous explicit-rule fallback to configured `vars`, dashboard current/default,
+and supported datasource-backed discovery. Automatic repeating panels without an explicit rule continue to use
+that auto-resolution behavior.
 
 ### No-data preflight
 
@@ -535,7 +595,7 @@ Behavior notes:
 - Top-level `render_matrix.layout` is not supported; put layout under `render_matrix.options.layout`. Existing flat variable keys without top-level layout remain accepted for older configs.
 - `row_grouping` (alias: `group_by`) groups matrix artifacts in Confluence expand sections using the grouped variable aliases, for example `Environment: prod`.
 - In child-page mode, grouped matrix sections are rendered on the child page; the parent page only gets include/expand content when its `%%%graphs%%%` marker exists.
-- Matrix discovery logs contain concise resolution status, source, count, and bounded raw-safe values. Request URLs, datasource UIDs, selectors, response bodies, headers, cookies, and credentials are not emitted by matrix fallback diagnostics.
+- Matrix diagnostics use two concise records. `matrix_discovery` shows the variable, time tag (or concrete time range), parent context such as namespace, discovered count, and raw values. `matrix_filtered` uses the same shape for values remaining after filtering/dedupe/`max_values`. Regex bodies, request payloads, headers, cookies, and configured credentials are not emitted by these matrix diagnostics.
 - Upload-only replay preserves raw context plus its display-name, display-value, hidden-state snapshot, grouping, and order from saved metadata and `manifest.yaml` when present. Metadata without a layout migrates to B, including old upload-only metadata; newly written metadata stores the resolved `matrix_grouped_panels` layout. Merging upload folders rejects different resolved layouts instead of silently choosing one.
 
 ### Composite images

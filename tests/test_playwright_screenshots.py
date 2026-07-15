@@ -5,6 +5,7 @@ from grafconflux._grafana import playwright_screenshots
 from grafconflux._grafana.playwright_screenshots import (
     PlaywrightPanelScreenshotRunner,
     PlaywrightResponseCollector,
+    is_grafana_login_url,
 )
 from grafconflux._shared.grafana_models import sanitize_url_for_log
 from grafconflux.grafana import GrafanaConfigDownloader
@@ -104,6 +105,64 @@ class TestPlaywrightScreenshotReadiness(unittest.TestCase):
         sanitized = sanitize_url_for_log("https://grafana.example/d/demo?token=secret&viewPanel=7#frag")
 
         self.assertEqual(sanitized, "https://grafana.example/d/demo?token=REDACTED&viewPanel=7")
+
+    def test_sanitize_url_for_log_preserves_bare_fullscreen_flag(self):
+        sanitized = sanitize_url_for_log(
+            "https://grafana.example/d/demo?viewPanel=7&fullscreen"
+        )
+
+        self.assertEqual(
+            sanitized,
+            "https://grafana.example/d/demo?viewPanel=7&fullscreen",
+        )
+        self.assertNotIn("fullscreen=", sanitized)
+
+    def test_login_detection_supports_grafana_subpath_and_rejects_external_origin(self):
+        config = GrafanaConfigDownloader("demo", {
+            "dash_title": "Dashboard",
+            "grafana_url": "https://grafana.example/grafana",
+        })
+
+        self.assertTrue(is_grafana_login_url(
+            "https://grafana.example/grafana/login?redirectTo=%2Fgrafana%2Fd%2Fdemo",
+            config,
+        ))
+        self.assertFalse(is_grafana_login_url(
+            "https://identity.example/login",
+            config,
+        ))
+
+    def test_login_detection_normalizes_default_ports(self):
+        https_config = GrafanaConfigDownloader("demo", {
+            "dash_title": "Dashboard",
+            "grafana_url": "https://grafana.example/grafana",
+        })
+        http_config = GrafanaConfigDownloader("demo", {
+            "dash_title": "Dashboard",
+            "grafana_url": "http://grafana.example/grafana",
+        })
+
+        self.assertTrue(is_grafana_login_url(
+            "https://grafana.example:443/grafana/login",
+            https_config,
+        ))
+        self.assertTrue(is_grafana_login_url(
+            "http://grafana.example:80/grafana/login",
+            http_config,
+        ))
+        self.assertFalse(is_grafana_login_url(
+            "https://grafana.example:444/grafana/login",
+            https_config,
+        ))
+
+        ipv6_config = GrafanaConfigDownloader("demo", {
+            "dash_title": "Dashboard",
+            "grafana_url": "http://[::1]/grafana",
+        })
+        self.assertTrue(is_grafana_login_url(
+            "http://[::1]:80/grafana/login",
+            ipv6_config,
+        ))
 
     def create_runner(self, loading_states=None, timeout=5, **readiness_overrides):
         config = self.create_config(timeout=timeout, **readiness_overrides)

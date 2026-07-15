@@ -6,7 +6,7 @@ from grafconflux._grafana.matrix_discovery import MatrixValueResolver
 
 
 class TestMatrixOperationalDiagnostics(unittest.TestCase):
-    def test_empty_result_log_includes_only_safe_count(self) -> None:
+    def test_empty_result_log_includes_count_and_empty_values(self) -> None:
         dashboard = {"templating": {"list": [{
             "name": "service", "type": "query",
             "datasource": {"type": "prometheus", "uid": "private-uid"},
@@ -22,10 +22,10 @@ class TestMatrixOperationalDiagnostics(unittest.TestCase):
 
         self.assertEqual(logs.output, [
             "WARNING:grafconflux._grafana.matrix_discovery:matrix_discovery "
-            "variable=service timestamp_id=1 count=0"
+            "variable=service time=1700000000000-1700003600000 context={} count=0 values=[]"
         ])
 
-    def test_result_log_excludes_discovered_values_and_request_details(self) -> None:
+    def test_result_log_includes_discovered_values_but_not_request_details(self) -> None:
         dashboard = {"templating": {"list": [{
             "name": "service",
             "type": "query",
@@ -58,10 +58,14 @@ class TestMatrixOperationalDiagnostics(unittest.TestCase):
 
         diagnostic = "\n".join(logs.output)
         self.assertEqual(len(logs.output), 1)
-        self.assertIn("matrix_discovery variable=service timestamp_id=1 count=2", diagnostic)
-        self.assertNotIn("token=known-secret", diagnostic)
-        self.assertNotIn("opaque-private-material-8675309", diagnostic)
-        self.assertNotIn("values=", diagnostic)
+        self.assertIn(
+            "matrix_discovery variable=service time=1700000000000-1700003600000 "
+            "context={} count=2",
+            diagnostic,
+        )
+        self.assertIn("token=known-secret", diagnostic)
+        self.assertIn("opaque-private-material-8675309", diagnostic)
+        self.assertIn("values=", diagnostic)
         self.assertNotIn("https://", diagnostic)
         self.assertNotIn("private-uid", diagnostic)
         self.assertNotIn("request_url", diagnostic)

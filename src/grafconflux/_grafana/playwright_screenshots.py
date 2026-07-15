@@ -35,6 +35,10 @@ PANEL_READY_SELECTOR = ', '.join([
     '.panel-container',
     '.react-grid-item',
 ])
+
+
+class GrafanaAuthenticationError(RuntimeError):
+    """Raised when bounded browser authentication recovery is exhausted."""
 SIDEBAR_BUTTON_SELECTORS = [
     'button[aria-label*="Collapse"]',
     'button[aria-label*="Close"]',
@@ -149,9 +153,14 @@ class PlaywrightPanelScreenshotRunner:
 
     def __init__(self, manager) -> None:
         self.manager = manager
+        self._auth_recovery_used = False
 
     def take_screenshot(self, browser: Any, task: Any, final_url: str, file_path: str) -> None:
+        self._refresh_browser_if_stale(browser)
+        auth_generation = getattr(self.manager, '_auth_generation', 0)
         data_sources = self.manager._GrafanaManager__get_panel_data_sources(final_url)
+        if getattr(self.manager, '_auth_generation', 0) > auth_generation:
+            self._refresh_browser_if_stale(browser)
         fullscreen_state = self._fullscreen_state()
         if fullscreen_state is False:
             self._take_required_route(browser, task, final_url, file_path, data_sources, False)
@@ -178,10 +187,33 @@ class PlaywrightPanelScreenshotRunner:
     def _try_route(self, browser: Any, task: Any, route_url: str, file_path: str,
                    data_sources: List[str], log_errors: bool, fullscreen_state: Optional[bool]) -> bool:
         try:
+            self._refresh_browser_if_stale(browser)
+            observed_generation = getattr(
+                browser,
+                'auth_generation',
+                getattr(self.manager, '_auth_generation', 0),
+            )
             status_code = self._open_validate_and_settle(browser, task, route_url, data_sources)
-            if status_code in UNAUTHORIZED_STATUSES and self.manager._reauthenticate_grafana(browser):
+            if status_code in UNAUTHORIZED_STATUSES:
+                if self._auth_recovery_used:
+                    raise GrafanaAuthenticationError(
+                        f'Grafana authentication recovery exhausted for panel_id={task.panel.panel_id}'
+                    )
+                self._auth_recovery_used = True
+                if not self.manager._reauthenticate_grafana(
+                    browser,
+                    observed_generation=observed_generation,
+                ):
+                    raise GrafanaAuthenticationError(
+                        f'Grafana authentication recovery failed for panel_id={task.panel.panel_id}'
+                    )
                 logger.info(f'Retrying panel after re-authentication panel_id={task.panel.panel_id}')
+                self._refresh_browser_if_stale(browser)
                 status_code = self._open_validate_and_settle(browser, task, route_url, data_sources)
+                if status_code in UNAUTHORIZED_STATUSES:
+                    raise GrafanaAuthenticationError(
+                        f'Grafana authentication recovery exhausted for panel_id={task.panel.panel_id}'
+                    )
             if status_code != 200:
                 raise RuntimeError(self._route_error_message(route_url, status_code))
             self._set_fullscreen_state(fullscreen_state)
@@ -196,6 +228,8 @@ class PlaywrightPanelScreenshotRunner:
                     f'Failed to take screenshot panel_id={task.panel.panel_id} '
                     f'error_type={type(error).__name__} error={_safe_exception_message(error)}'
                 )
+            if isinstance(error, GrafanaAuthenticationError):
+                raise
             return False
 
     def _open_validate_and_settle(self, browser: Any, task: Any, route_url: str, data_sources: List[str]) -> Optional[int]:
@@ -206,6 +240,8 @@ class PlaywrightPanelScreenshotRunner:
                 return status_code
             if status_code != 200:
                 return status_code
+            if is_grafana_login_url(browser.current_url, self.manager.config):
+                return 401
             if not self._loaded_expected_panel(browser, task.panel.panel_id):
                 raise RuntimeError(
                     f'Browser did not load expected panel_id={task.panel.panel_id}; '
@@ -215,24 +251,24 @@ class PlaywrightPanelScreenshotRunner:
             return settle_status or status_code
 
     def _open_route(self, browser: Any, task: Any, route_url: str) -> Optional[int]:
-        logger.info(f'Opening panel for screenshot panel_id={task.panel.panel_id} url={sanitize_url_for_log(route_url)}')
+        logger.info(f'Opening panel for screenshot panel_id={task.panel.panel_id} url={route_url}')
         try:
             response = browser.get(route_url)
         except Exception as error:
             logger.warning(
                 f'Panel navigation failed panel_id={task.panel.panel_id} '
-                f'url={sanitize_url_for_log(route_url)} error_type={type(error).__name__} '
+                f'url={route_url} error_type={type(error).__name__} '
                 f'error={_safe_exception_message(error)}'
             )
             raise RuntimeError(
                 f'Panel navigation failed panel_id={task.panel.panel_id} '
-                f'url={sanitize_url_for_log(route_url)} error_type={type(error).__name__} '
+                f'url={route_url} error_type={type(error).__name__} '
                 f'error={_safe_exception_message(error)}'
             ) from error
         status_code = response_status(response)
         logger.info(
             f'Panel navigation response panel_id={task.panel.panel_id} '
-            f'status={status_code} url={sanitize_url_for_log(route_url)}'
+            f'status={status_code} url={route_url}'
         )
         return status_code
 
@@ -334,16 +370,22 @@ class PlaywrightPanelScreenshotRunner:
     def _fullscreen_state(self) -> Optional[bool]:
         return getattr(self.manager.thread_local, 'is_fullscreen', None)
 
+    def _refresh_browser_if_stale(self, browser: Any) -> None:
+        manager_generation = getattr(self.manager, '_auth_generation', 0)
+        browser_generation = getattr(browser, 'auth_generation', manager_generation)
+        if browser_generation >= manager_generation:
+            return
+        self.manager._refresh_browser_authentication(browser)
+
     def _set_fullscreen_state(self, fullscreen_state: Optional[bool]) -> None:
         if fullscreen_state is not None:
             self.manager.thread_local.is_fullscreen = fullscreen_state
 
     @staticmethod
     def _route_error_message(route_url: str, status_code: Optional[int]) -> str:
-        safe_url = sanitize_url_for_log(route_url)
         if status_code is None:
-            return f'Request to {safe_url} completed without an HTTP response'
-        return f'Request to {safe_url} returned HTTP {status_code}'
+            return f'Request to {route_url} completed without an HTTP response'
+        return f'Request to {route_url} returned HTTP {status_code}'
 
 
 def response_status(response: Any) -> Optional[int]:
@@ -375,6 +417,27 @@ def url_has_panel_id(current_url: str, panel_id: int) -> bool:
     query = parse_qs(urlparse(current_url).query)
     expected = str(panel_id)
     return expected in query.get('panelId', []) or expected in query.get('viewPanel', [])
+
+
+def is_grafana_login_url(current_url: Any, config: Any) -> bool:
+    if not isinstance(current_url, str) or not current_url:
+        return False
+    current = urlparse(current_url)
+    expected = urlparse(config.grafana_base_url)
+    app_path = (getattr(config, 'grafana_app_path', '') or '').rstrip('/')
+    expected_path = f'{app_path}/login' if app_path else '/login'
+    return (
+        current.scheme.lower() == expected.scheme.lower()
+        and (current.hostname or '').lower() == (expected.hostname or '').lower()
+        and _effective_port(current) == _effective_port(expected)
+        and current.path.rstrip('/') == expected_path.rstrip('/')
+    )
+
+
+def _effective_port(parsed: Any) -> Optional[int]:
+    if parsed.port is not None:
+        return parsed.port
+    return 443 if parsed.scheme.lower() == 'https' else 80 if parsed.scheme.lower() == 'http' else None
 
 
 def _hide_sidebar_script() -> str:

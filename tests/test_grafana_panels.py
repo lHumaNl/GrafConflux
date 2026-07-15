@@ -1,6 +1,8 @@
 import os
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock
 from urllib.parse import parse_qs, urlparse
 
@@ -565,6 +567,146 @@ class TestGrafanaPanels(unittest.TestCase):
         manager.session.post.assert_not_called()
         self.assertIn("required credentials", "\n".join(logs.output))
 
+    def test_reauthentication_generation_avoids_duplicate_login(self):
+        manager = self.create_manager(login="grafana-user", password="grafana-secret")
+        manager.authenticate = Mock()
+        first_browser = Mock()
+        second_browser = Mock()
+
+        self.assertTrue(manager._reauthenticate_grafana(first_browser, observed_generation=0))
+        self.assertTrue(manager._reauthenticate_grafana(second_browser, observed_generation=0))
+
+        manager.authenticate.assert_called_once()
+        first_browser.refresh_authentication.assert_called_once()
+        second_browser.refresh_authentication.assert_called_once()
+        self.assertEqual(manager._auth_generation, 1)
+
+    def test_concurrent_reauthentication_performs_one_login_per_generation(self):
+        manager = self.create_manager(login="grafana-user", password="grafana-secret")
+        manager.authenticate = Mock()
+        barrier = threading.Barrier(2)
+        browsers = [Mock(), Mock()]
+
+        def recover(browser):
+            barrier.wait()
+            return manager._reauthenticate_grafana(browser, observed_generation=0)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(recover, browsers))
+
+        self.assertEqual(results, [True, True])
+        manager.authenticate.assert_called_once()
+        for browser in browsers:
+            browser.refresh_authentication.assert_called_once()
+
+    def test_stale_browser_generation_refreshes_without_another_login(self):
+        manager = self.create_manager(render=False, login="user", password="secret")
+        manager._auth_generation = 1
+        manager._reauthenticate_grafana = Mock(return_value=True)
+        task = self.create_screenshot_task()
+        final_url = "https://grafana.example/panel?viewPanel=17"
+        fullscreen_url = f"{final_url}&fullscreen"
+        browser = FakeScreenshotBrowser({fullscreen_url: 200})
+        browser.auth_generation = 0
+        manager.thread_local.is_fullscreen = None
+        manager._GrafanaManager__get_panel_data_sources = Mock(return_value=[])
+
+        manager._GrafanaManager__take_screenshot(browser, task, final_url, "panel.png")
+
+        self.assertEqual(browser.auth_generation, 1)
+        self.assertEqual(browser.refresh_count, 1)
+        manager._reauthenticate_grafana.assert_not_called()
+
+    def test_datasource_reauthentication_generation_refreshes_browser_before_navigation(self):
+        manager = self.create_manager(render=False, login="user", password="secret")
+        task = self.create_screenshot_task()
+        final_url = "https://grafana.example/panel?viewPanel=17"
+        fullscreen_url = f"{final_url}&fullscreen"
+        browser = FakeScreenshotBrowser({fullscreen_url: 200})
+        browser.auth_generation = 0
+        manager.thread_local.is_fullscreen = None
+
+        def renew_during_discovery(_url):
+            manager._auth_generation = 1
+            return []
+
+        manager._GrafanaManager__get_panel_data_sources = Mock(side_effect=renew_during_discovery)
+
+        manager._GrafanaManager__take_screenshot(browser, task, final_url, "panel.png")
+
+        self.assertEqual(browser.auth_generation, 1)
+        self.assertEqual(browser.refresh_count, 1)
+        self.assertEqual(browser.visited_urls, [fullscreen_url])
+
+    def test_auth_generation_renewal_immediately_before_navigation_reuses_new_login(self):
+        manager = self.create_manager(render=False, login="user", password="secret")
+        manager.authenticate = Mock()
+        task = self.create_screenshot_task()
+        final_url = "https://grafana.example/panel?viewPanel=17"
+        fullscreen_url = f"{final_url}&fullscreen"
+        browser = FakeScreenshotBrowser({
+            fullscreen_url: [
+                (200, "https://grafana.example/login"),
+                (200, fullscreen_url),
+            ],
+        })
+        browser.auth_generation = 0
+        manager.thread_local.is_fullscreen = None
+        manager._GrafanaManager__get_panel_data_sources = Mock(return_value=[])
+        original_get = browser.get
+        first_navigation = True
+
+        def renew_before_navigation(url):
+            nonlocal first_navigation
+            if first_navigation:
+                first_navigation = False
+                manager._auth_generation = 1
+            return original_get(url)
+
+        browser.get = renew_before_navigation
+
+        manager._GrafanaManager__take_screenshot(browser, task, final_url, "panel.png")
+
+        manager.authenticate.assert_not_called()
+        self.assertEqual(manager._auth_generation, 1)
+        self.assertEqual(browser.auth_generation, 1)
+        self.assertEqual(browser.visited_urls, [fullscreen_url, fullscreen_url])
+
+    def test_auth_generation_renewal_before_retry_refreshes_without_second_login(self):
+        manager = self.create_manager(render=False, login="user", password="secret")
+        manager.authenticate = Mock()
+        task = self.create_screenshot_task()
+        final_url = "https://grafana.example/panel?viewPanel=17"
+        fullscreen_url = f"{final_url}&fullscreen"
+        browser = FakeScreenshotBrowser({
+            fullscreen_url: [
+                (200, "https://grafana.example/login"),
+                (200, fullscreen_url),
+            ],
+        })
+        browser.auth_generation = 0
+        manager.thread_local.is_fullscreen = None
+        manager._GrafanaManager__get_panel_data_sources = Mock(return_value=[])
+        original_reauthenticate = manager._reauthenticate_grafana
+
+        def recover_then_publish_newer_generation(current_browser, observed_generation=None):
+            recovered = original_reauthenticate(
+                current_browser,
+                observed_generation=observed_generation,
+            )
+            manager._auth_generation = 2
+            return recovered
+
+        manager._reauthenticate_grafana = recover_then_publish_newer_generation
+
+        manager._GrafanaManager__take_screenshot(browser, task, final_url, "panel.png")
+
+        manager.authenticate.assert_called_once()
+        self.assertEqual(manager._auth_generation, 2)
+        self.assertEqual(browser.auth_generation, 2)
+        self.assertEqual(browser.refresh_count, 2)
+        self.assertEqual(browser.visited_urls, [fullscreen_url, fullscreen_url])
+
     def test_get_dashboard_uid_uses_timeout(self):
         manager = self.create_manager()
         manager.session.get = Mock(return_value=Mock(status_code=200, json=Mock(return_value=[
@@ -963,6 +1105,139 @@ class TestGrafanaPanels(unittest.TestCase):
         self.assertEqual(task.artifact["link"], "https://grafana.example/panel?viewPanel=17&fullscreen")
         self.assertEqual(browser.saved_paths, ["panel.png"])
 
+    def test_screenshot_logs_exact_navigable_url(self):
+        manager = self.create_manager(render=False, timeout=45)
+        task = self.create_screenshot_task()
+        final_url = (
+            "https://grafana.example/panel?viewPanel=17"
+            "&var-session-token=copy-me&var-pod=api-one"
+        )
+        fullscreen_url = f"{final_url}&fullscreen"
+        browser = FakeScreenshotBrowser({fullscreen_url: 200})
+        manager.thread_local.is_fullscreen = None
+        manager._GrafanaManager__get_panel_data_sources = Mock(return_value=[])
+
+        with self.assertLogs("grafconflux.grafana", level="INFO") as logs:
+            manager._GrafanaManager__take_screenshot(browser, task, final_url, "panel.png")
+
+        output = "\n".join(logs.output)
+        self.assertIn(f"url={fullscreen_url}", output)
+        self.assertNotIn("REDACTED", output)
+
+    def test_take_screenshot_reauthenticates_after_login_redirect(self):
+        manager = self.create_manager(render=False, login="user", password="secret")
+        task = self.create_screenshot_task()
+        final_url = "https://grafana.example/panel?viewPanel=17"
+        fullscreen_url = f"{final_url}&fullscreen"
+        browser = FakeScreenshotBrowser({
+            fullscreen_url: [
+                (200, "https://grafana.example/login"),
+                (200, fullscreen_url),
+            ],
+        })
+        manager.thread_local.is_fullscreen = None
+        manager._GrafanaManager__get_panel_data_sources = Mock(return_value=[])
+        manager._reauthenticate_grafana = Mock(
+            side_effect=lambda current_browser, observed_generation=None: (
+                current_browser.refresh_authentication() or True
+            )
+        )
+
+        manager._GrafanaManager__take_screenshot(browser, task, final_url, "panel.png")
+
+        self.assertEqual(browser.visited_urls, [fullscreen_url, fullscreen_url])
+        manager._reauthenticate_grafana.assert_called_once()
+        self.assertEqual(browser.refresh_count, 1)
+        self.assertEqual(browser.saved_paths, ["panel.png"])
+
+    def test_take_screenshot_repeated_login_redirect_is_bounded(self):
+        manager = self.create_manager(render=False, login="user", password="secret")
+        task = self.create_screenshot_task()
+        final_url = "https://grafana.example/panel?viewPanel=17"
+        fullscreen_url = f"{final_url}&fullscreen"
+        browser = FakeScreenshotBrowser({
+            fullscreen_url: [
+                (200, "https://grafana.example/login"),
+                (200, "https://grafana.example/login"),
+            ],
+        })
+        manager.thread_local.is_fullscreen = None
+        manager._GrafanaManager__get_panel_data_sources = Mock(return_value=[])
+        manager._reauthenticate_grafana = Mock(
+            side_effect=lambda current_browser, observed_generation=None: (
+                current_browser.refresh_authentication() or True
+            )
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "authentication"):
+            manager._GrafanaManager__take_screenshot(browser, task, final_url, "panel.png")
+
+        self.assertEqual(browser.visited_urls, [fullscreen_url, fullscreen_url])
+        manager._reauthenticate_grafana.assert_called_once()
+        self.assertEqual(browser.saved_paths, [])
+
+    def test_take_screenshot_reauthentication_refusal_does_not_fallback(self):
+        manager = self.create_manager(render=False, login="user", password="secret")
+        task = self.create_screenshot_task()
+        final_url = "https://grafana.example/panel?viewPanel=17"
+        fullscreen_url = f"{final_url}&fullscreen"
+        browser = FakeScreenshotBrowser({
+            fullscreen_url: (200, "https://grafana.example/login"),
+            final_url: 200,
+        })
+        manager.thread_local.is_fullscreen = None
+        manager._GrafanaManager__get_panel_data_sources = Mock(return_value=[])
+        manager._reauthenticate_grafana = Mock(return_value=False)
+
+        with self.assertRaisesRegex(RuntimeError, "authentication recovery failed"):
+            manager._GrafanaManager__take_screenshot(browser, task, final_url, "panel.png")
+
+        self.assertEqual(browser.visited_urls, [fullscreen_url])
+        self.assertEqual(browser.saved_paths, [])
+
+    def test_panel_datasource_login_redirect_reauthenticates_requests_session(self):
+        manager = self.create_manager(login="user", password="secret")
+        panel_url = "https://grafana.example/d/demo?viewPanel=17"
+        login_response = Mock(
+            status_code=200,
+            url="https://grafana.example/login",
+            text="<html></html>",
+        )
+        panel_response = Mock(
+            status_code=200,
+            url=panel_url,
+            text="<html></html>",
+        )
+        manager.session.get = Mock(side_effect=[login_response, panel_response])
+        manager._reauthenticate_grafana = Mock(return_value=True)
+
+        with self.assertLogs("grafconflux.grafana", level="INFO") as logs:
+            manager._GrafanaManager__get_panel_data_sources(panel_url)
+
+        self.assertEqual(manager.session.get.call_count, 2)
+        manager._reauthenticate_grafana.assert_called_once_with(observed_generation=0)
+        output = "\n".join(logs.output)
+        self.assertIn("original_status=200", output)
+        self.assertIn("original_challenge=login_redirect", output)
+        self.assertIn("retry_status=200", output)
+        self.assertIn("retry_challenge=none", output)
+
+    def test_panel_datasource_repeated_login_redirect_is_bounded(self):
+        manager = self.create_manager(login="user", password="secret")
+        panel_url = "https://grafana.example/d/demo?viewPanel=17"
+        login_response = Mock(
+            status_code=200,
+            url="https://grafana.example/login",
+            text="<html></html>",
+        )
+        manager.session.get = Mock(side_effect=[login_response, login_response])
+        manager._reauthenticate_grafana = Mock(return_value=True)
+
+        with self.assertRaisesRegex(RuntimeError, "authentication recovery exhausted"):
+            manager._GrafanaManager__get_panel_data_sources(panel_url)
+
+        self.assertEqual(manager.session.get.call_count, 2)
+
     def test_take_screenshot_first_use_falls_back_to_non_fullscreen_route(self):
         manager = self.create_manager(render=False, timeout=45)
         task = self.create_screenshot_task()
@@ -1128,11 +1403,71 @@ class TestGrafanaPanels(unittest.TestCase):
 
         self.assertEqual(values, ["prod-1", "prod-2", "db-1"])
 
+    def test_repeating_panel_omitted_repeat_values_defaults_to_all(self):
+        _, panels = self.get_repeating_panels(
+            self.repeating_dashboard(),
+            repeating_panels=[{"panel_id": 17}],
+        )
+
+        values = [
+            artifact["repeat_value"]
+            for artifact in panels[0].artifacts
+            if artifact["timestamp_tag"] == "tag0"
+        ]
+
+        self.assertEqual(values, ["prod-1", "prod-2", "db-1"])
+
+    def test_repeating_panel_filter_combines_include_regex_and_exclude(self):
+        _, panels = self.get_repeating_panels(
+            self.repeating_dashboard(),
+            repeating_panels=[{
+                "panel_id": 17,
+                "repeat_values": {
+                    "mode": "filter",
+                    "include": ["db-1"],
+                    "regex": ["^prod-.*", "^unused-.*"],
+                    "exclude": "prod-2",
+                },
+            }],
+        )
+
+        values = [
+            artifact["repeat_value"]
+            for artifact in panels[0].artifacts
+            if artifact["timestamp_tag"] == "tag0"
+        ]
+
+        self.assertEqual(values, ["prod-1", "db-1"])
+
+    def test_repeating_panel_title_shorthand_selects_source_and_all_values(self):
+        manager = self.create_manager(
+            enable_repeating_panels=True,
+            panel_filtering={
+                "mode": "include_only_selected",
+                "include_panels": {"titles": ["CPU by host"]},
+            },
+            repeating_panels=["CPU by host"],
+        )
+        manager.dashboard_uid = "dashboard-uid"
+        manager.dashboard_url = "/d/dashboard-uid/dashboard"
+        manager.session.get = Mock(return_value=Mock(
+            status_code=200,
+            json=Mock(return_value={"dashboard": self.repeating_dashboard()}),
+        ))
+
+        panels = manager.get_panels(self.create_timestamps(count=1))
+
+        self.assertEqual([panel.panel_id for panel in panels], [17])
+        self.assertEqual(
+            [artifact["repeat_value"] for artifact in panels[0].artifacts],
+            ["prod-1", "prod-2", "db-1"],
+        )
+
     def test_repeating_panel_fallback_uses_config_vars_before_current(self):
         _, panels = self.get_repeating_panels(
             self.repeating_dashboard(),
             vars={"host": ["from-config"]},
-            repeating_panels=[{"panel_id": 17}],
+            repeating_panels=[{"panel_id": 17, "repeat_values": {"mode": "auto"}}],
         )
 
         self.assertEqual(panels[0].artifacts[0]["repeat_value"], "from-config")
@@ -1140,7 +1475,7 @@ class TestGrafanaPanels(unittest.TestCase):
     def test_repeating_panel_fallback_uses_dashboard_current(self):
         _, panels = self.get_repeating_panels(
             self.repeating_dashboard(),
-            repeating_panels=[{"panel_id": 17}],
+            repeating_panels=[{"panel_id": 17, "repeat_values": {"mode": "auto"}}],
         )
 
         self.assertEqual(panels[0].artifacts[0]["repeat_value"], "prod-1")
@@ -1148,7 +1483,7 @@ class TestGrafanaPanels(unittest.TestCase):
     def test_repeating_panel_prometheus_label_values_discovers_all_current_values(self):
         manager = self.create_manager(
             enable_repeating_panels=True,
-            repeating_panels=[{"panel_id": 19}],
+            repeating_panels=[{"panel_id": 19, "repeat_values": {"mode": "auto"}}],
         )
         manager.dashboard_uid = "dashboard-uid"
         manager.dashboard_url = "/d/dashboard-uid/dashboard"
@@ -1175,7 +1510,7 @@ class TestGrafanaPanels(unittest.TestCase):
     def test_repeating_panel_prometheus_values_resolve_per_timestamp(self):
         manager = self.create_manager(
             enable_repeating_panels=True,
-            repeating_panels=[{"panel_id": 19}],
+            repeating_panels=[{"panel_id": 19, "repeat_values": {"mode": "auto"}}],
         )
         manager.dashboard_uid = "dashboard-uid"
         manager.dashboard_url = "/d/dashboard-uid/dashboard"
@@ -1202,7 +1537,7 @@ class TestGrafanaPanels(unittest.TestCase):
         variable.pop("options")
         manager = self.create_manager(
             enable_repeating_panels=True,
-            repeating_panels=[{"panel_id": 19}],
+            repeating_panels=[{"panel_id": 19, "repeat_values": {"mode": "auto"}}],
         )
         manager.dashboard_uid = "dashboard-uid"
         manager.dashboard_url = "/d/dashboard-uid/dashboard"
@@ -1240,7 +1575,7 @@ class TestGrafanaPanels(unittest.TestCase):
     def test_repeating_panel_prometheus_discovery_preserves_current_fallback_on_error(self):
         manager = self.create_manager(
             enable_repeating_panels=True,
-            repeating_panels=[{"panel_id": 19}],
+            repeating_panels=[{"panel_id": 19, "repeat_values": {"mode": "auto"}}],
         )
         manager.dashboard_uid = "dashboard-uid"
         manager.dashboard_url = "/d/dashboard-uid/dashboard"
@@ -1258,7 +1593,7 @@ class TestGrafanaPanels(unittest.TestCase):
         dashboard["templating"]["list"][0]["query"] = "metrics(database)"
         manager = self.create_manager(
             enable_repeating_panels=True,
-            repeating_panels=[{"panel_id": 19}],
+            repeating_panels=[{"panel_id": 19, "repeat_values": {"mode": "auto"}}],
         )
         manager.dashboard_uid = "dashboard-uid"
         manager.dashboard_url = "/d/dashboard-uid/dashboard"
@@ -1274,7 +1609,7 @@ class TestGrafanaPanels(unittest.TestCase):
         dashboard["templating"]["list"][0]["datasource"] = {"type": "loki", "uid": "logs"}
         manager = self.create_manager(
             enable_repeating_panels=True,
-            repeating_panels=[{"panel_id": 19}],
+            repeating_panels=[{"panel_id": 19, "repeat_values": {"mode": "auto"}}],
         )
         manager.dashboard_uid = "dashboard-uid"
         manager.dashboard_url = "/d/dashboard-uid/dashboard"
@@ -1464,10 +1799,12 @@ class FakeScreenshotBrowser:
     def save_screenshot(self, file_path):
         self.saved_paths.append(file_path)
 
-    def refresh_authentication(self):
+    def refresh_authentication(self, auth_generation=None):
         self.refresh_count += 1
         self.broken = False
         self.page = FakeScreenshotPage(self)
+        if auth_generation is not None:
+            self.auth_generation = auth_generation
 
 
 class FakeScreenshotPage:
@@ -1482,6 +1819,10 @@ class FakeScreenshotPage:
             status_code = 599
         else:
             status_code = self.browser.response_statuses.get(url, 404)
+            if isinstance(status_code, list):
+                status_code = status_code.pop(0) if status_code else 404
+            if isinstance(status_code, tuple):
+                status_code, self.browser.current_url = status_code
         if isinstance(status_code, Exception):
             self.browser.broken = True
             raise status_code

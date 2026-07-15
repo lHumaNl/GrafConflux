@@ -16,7 +16,11 @@ from grafconflux._grafana.matrix_config import (
     validated_render_matrix,
 )
 from grafconflux._grafana.matrix_dependencies import configured_dependencies, ordered_matrix_variables
-from grafconflux._grafana.matrix_discovery import MatrixValueResolver, safe_discovery_variable
+from grafconflux._grafana.matrix_discovery import (
+    MatrixValueResolver,
+    safe_discovery_variable,
+    timestamp_log_label,
+)
 from grafconflux._grafana.matrix_dynamic import DynamicOccurrence, DynamicValuePlanner
 from grafconflux._grafana.variable_lookup import resolve_matrix_variable_lookups
 from grafconflux._shared.grafana_models import ConfigurationError, Panel, PanelDescriptor, PanelRenderTask
@@ -220,6 +224,15 @@ def _extend_rows(config: Any, matrix: dict[str, Any], key: str, spec: dict[str, 
         values, provenance, occurrences = _values_for_spec(
             config, key, spec, dashboard, timestamp, row, static_vars, resolver,
         )
+        if spec.get("__dynamic_planner__") is not None:
+            logger.info(
+                "matrix_filtered variable=%s time=%s context=%s count=%s values=%s",
+                safe_discovery_variable(key),
+                timestamp_log_label(timestamp),
+                _public_row_context(row),
+                len(values),
+                values,
+            )
         if not values or occurrences == []:
             logger.warning(
                 "Render matrix branch skipped dashboard=%s variable=%s timestamp_id=%s context_vars=%s "

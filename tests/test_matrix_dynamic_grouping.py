@@ -807,7 +807,7 @@ class TestDynamicGroupingIntegration(unittest.TestCase):
         self.assertIn("pod: checkout-replica-a", content)
         self.assertIn("pod: checkout-replica-b", content)
 
-    def test_privacy_canaries_are_absent_from_logs_errors_and_provenance(self) -> None:
+    def test_raw_values_are_logged_but_config_secrets_stay_absent(self) -> None:
         canaries = (
             "RAW-POD-CANARY", "CAPTURE-VALUE-CANARY", "REGEX-BODY-CANARY",
             "CREDENTIAL-CANARY", "TOKEN-CANARY", "QUERY-CANARY",
@@ -849,7 +849,9 @@ class TestDynamicGroupingIntegration(unittest.TestCase):
                 grafana.get_panels([self.timestamp()])
 
         public = "\n".join(logs.output) + str(captured.exception)
-        for canary in canaries:
+        self.assertIn("RAW-POD-CANARY", public)
+        self.assertIn("CAPTURE-VALUE-CANARY", public)
+        for canary in ("REGEX-BODY-CANARY", "CREDENTIAL-CANARY", "TOKEN-CANARY", "QUERY-CANARY"):
             self.assertNotIn(canary, public)
 
         success = self.manager(config.replace("max_rows: 1", "max_rows: 2"), [
@@ -861,8 +863,12 @@ class TestDynamicGroupingIntegration(unittest.TestCase):
         with self.assertLogs("grafconflux._grafana.matrix_discovery", level="INFO") as success_logs:
             panels = success.get_panels([self.timestamp()])
         provenance = repr(panels[0].artifacts[0]["matrix"]["discovery"])
+        success_output = "\n".join(success_logs.output)
+        self.assertIn("RAW-POD-CANARY", success_output)
+        self.assertIn("CAPTURE-VALUE-CANARY", success_output)
+        for canary in ("REGEX-BODY-CANARY", "CREDENTIAL-CANARY", "TOKEN-CANARY", "QUERY-CANARY"):
+            self.assertNotIn(canary, success_output)
         for canary in canaries:
-            self.assertNotIn(canary, "\n".join(success_logs.output))
             self.assertNotIn(canary, provenance)
 
     def test_same_raw_value_in_different_parents_keeps_distinct_technical_identity(self) -> None:
@@ -995,13 +1001,71 @@ class TestDynamicGroupingIntegration(unittest.TestCase):
                             regex: "^allowed$"
         """, ["sensitive-raw-canary"])
 
-        with self.assertLogs("grafconflux._grafana.matrix", level="WARNING") as logs:
+        with self.assertLogs("grafconflux._grafana", level="INFO") as logs:
             with self.assertRaisesRegex(ConfigurationError, "reason=filtered_or_unmatched_empty") as captured:
                 grafana.get_panels([self.timestamp()])
         output = "\n".join(logs.output) + str(captured.exception)
-        self.assertNotIn("sensitive-raw-canary", output)
-        self.assertNotIn("RAW-NAMESPACE-CANARY", output)
+        self.assertIn("sensitive-raw-canary", output)
+        self.assertIn("RAW-NAMESPACE-CANARY", output)
         self.assertIn("parent_filter_empty", output)
+
+    def test_successful_dynamic_planning_logs_values_after_filtering(self) -> None:
+        grafana = self.manager("""
+            dashboards:
+              Demo:
+                grafana_url: https://grafana.example
+                dash_title: Demo
+                render_matrix:
+                  variables:
+                    namespace: {values: [payments]}
+                    pod:
+                      depends_on: namespace
+                      values_from:
+                        filters_by_parent:
+                          - when: {namespace: payments}
+                            regex: ["^api-", "^worker-"]
+        """, ["api-one", "worker-one", "other-one"])
+
+        with self.assertLogs("grafconflux._grafana", level="INFO") as logs:
+            grafana.get_panels([self.timestamp()])
+
+        output = "\n".join(logs.output)
+        self.assertIn(
+            "matrix_discovery variable=pod time=smoke context={'namespace': 'payments'} count=3 "
+            "values=['api-one', 'worker-one', 'other-one']",
+            output,
+        )
+        self.assertIn(
+            "matrix_filtered variable=pod time=smoke context={'namespace': 'payments'} "
+            "count=2 values=['api-one', 'worker-one']",
+            output,
+        )
+        self.assertNotIn("matrix_planning", output)
+
+    def test_dynamic_planning_log_reports_nonzero_unmatched_count(self) -> None:
+        grafana = self.manager("""
+            dashboards:
+              Demo:
+                grafana_url: https://grafana.example
+                dash_title: Demo
+                render_matrix:
+                  variables:
+                    namespace: {values: [payments]}
+                    pod:
+                      depends_on: namespace
+                      values_from:
+                        grouping:
+                          rules: [{name: api, regex: "^api-"}]
+        """, ["api-one", "worker-one"])
+
+        with self.assertLogs("grafconflux._grafana.matrix", level="INFO") as logs:
+            grafana.get_panels([self.timestamp()])
+
+        self.assertIn(
+            "matrix_filtered variable=pod time=smoke context={'namespace': 'payments'} "
+            "count=2 values=['api-one', 'worker-one']",
+            "\n".join(logs.output),
+        )
 
     def test_panel_variant_cannot_override_grouped_variable(self) -> None:
         grafana = self.manager("""
