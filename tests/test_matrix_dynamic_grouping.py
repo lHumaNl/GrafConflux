@@ -411,33 +411,33 @@ class TestDynamicMatrixConfig(unittest.TestCase):
             "render_matrix": {"variables": {
                 "namespace": {"values": ["payments"]},
                 "pod": {"depends_on": "namespace", "values_from": {
-                    "regex": ["^calculator-", "^matrix-"],
+                    "regex": ["^checkout-", "^platform-"],
                     "filters_by_parent": [{
                         "when": {"namespace": "payments"},
                         "group_name": "service",
-                        "regex": [{"calculators": ["calculator", "offer-generator"]}],
+                        "regex": [{"services": ["checkout", "reporting-worker"]}],
                     }],
                 }},
             }},
         })
 
         source = matrix["variables"]["pod"]["values_from"]
-        self.assertEqual(source["regex"], ["^calculator-", "^matrix-"])
-        self.assertEqual(source["filters_by_parent"][0]["regex"], ["calculator", "offer-generator"])
+        self.assertEqual(source["regex"], ["^checkout-", "^platform-"])
+        self.assertEqual(source["filters_by_parent"][0]["regex"], ["checkout", "reporting-worker"])
         self.assertEqual(
             source["grouping"]["rules"][0]["regex"],
-            ["calculator", "offer-generator"],
+            ["checkout", "reporting-worker"],
         )
         self.assertEqual(
             serializable_render_matrix(matrix)["variables"]["pod"]["values_from"]["regex"],
-            ["^calculator-", "^matrix-"],
+            ["^checkout-", "^platform-"],
         )
 
     def test_list_only_nested_global_regex_uses_or_planner(self) -> None:
         matrix = validated_render_matrix("Demo", {
             "render_matrix": {"variables": {
                 "pod": {"values_from": {
-                    "regex": ["^calculator-covenant-api-", "^matrix-calculator-rate-"],
+                    "regex": ["^checkout-api-", "^billing-api-"],
                 }},
             }},
         })
@@ -446,10 +446,10 @@ class TestDynamicMatrixConfig(unittest.TestCase):
         self.assertEqual(
             planner.plan([
                 "other-a",
-                "calculator-covenant-api-a",
-                "matrix-calculator-rate-b",
+                "checkout-api-a",
+                "billing-api-b",
             ], {}).values,
-            ["calculator-covenant-api-a", "matrix-calculator-rate-b"],
+            ["checkout-api-a", "billing-api-b"],
         )
 
     def test_rejects_invalid_regex_lists_with_indexed_paths(self) -> None:
@@ -609,43 +609,43 @@ class TestDynamicValuePlanner(unittest.TestCase):
 
     def test_regex_lists_are_or_within_each_filter_and_rules_emit_once(self) -> None:
         planner = DynamicValuePlanner.from_source({
-            "regex": ["^calculator-", "^matrix-"],
+            "regex": ["^checkout-", "^platform-"],
             "filters_by_parent": [
                 {
                     "when": {"namespace": ["payments"]},
-                    "regex": ["-rate-", "-offer-"],
+                    "regex": ["-api-", "-worker-"],
                     "mode": "and",
                 },
                 {
                     "when": {"namespace": ["payments"]},
-                    "regex": ["generator", "v2"],
+                    "regex": ["service", "v2"],
                     "mode": "and",
                 },
             ],
             "grouping": {
                 "rules": [{
-                    "name": "calculators",
-                    "label": "Calculators",
-                    "regex": ["calculator", "rate-v2"],
+                    "name": "services",
+                    "label": "Services",
+                    "regex": ["checkout", "billing-v3"],
                 }],
                 "unmatched": {"enabled": False},
             },
         })
 
         result = planner.plan([
-            "calculator-covenant-api-v2",
-            "matrix-calculator-rate-v2",
-            "matrix-offer-generator-v1",
-            "other-offer-generator",
+            "checkout-service-api-v2",
+            "platform-billing-api-v2",
+            "platform-reporting-worker-v1",
+            "other-reporting-worker-v1",
         ], {"namespace": "payments"})
 
         self.assertEqual(result.values, [
-            "matrix-calculator-rate-v2",
-            "matrix-offer-generator-v1",
+            "checkout-service-api-v2",
+            "platform-billing-api-v2",
         ])
         self.assertEqual(
             [(item.value, item.membership.identity) for item in result.occurrences],
-            [("matrix-calculator-rate-v2", "named:calculators")],
+            [("checkout-service-api-v2", "named:services")],
         )
 
         override_planner = DynamicValuePlanner.from_source({

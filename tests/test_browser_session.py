@@ -133,7 +133,7 @@ class TestGrafanaBrowserSession(unittest.TestCase):
         session.cookies = self.single_label_cookie_jar()
 
         cookies = GrafanaBrowserSession(
-            self.create_config(grafana_url="https://lt-ekpmon1/grafana"),
+            self.create_config(grafana_url="https://grafana-host/grafana"),
             session,
         ).playwright_cookies()
 
@@ -142,7 +142,7 @@ class TestGrafanaBrowserSession(unittest.TestCase):
             {"grafana_session", "grafana_session_expiry"},
         )
         for cookie in cookies:
-            self.assertEqual(cookie["url"], "https://lt-ekpmon1/grafana")
+            self.assertEqual(cookie["url"], "https://grafana-host/grafana")
             self.assertNotIn("domain", cookie)
             self.assertNotIn("path", cookie)
             self.assertEqual(cookie["sameSite"], "Lax")
@@ -155,18 +155,18 @@ class TestGrafanaBrowserSession(unittest.TestCase):
         session.cookies.set(
             "grafana_session",
             "cookie",
-            domain="lt-ekpmon1",
+            domain="grafana-host",
             path="/grafana",
             secure=True,
             rest={"SameSite": "Lax", "HttpOnly": None},
         )
 
         cookies = GrafanaBrowserSession(
-            self.create_config(grafana_url="https://lt-ekpmon1/grafana"),
+            self.create_config(grafana_url="https://grafana-host/grafana"),
             session,
         ).playwright_cookies()
 
-        self.assertEqual(cookies[0]["url"], "https://lt-ekpmon1/grafana")
+        self.assertEqual(cookies[0]["url"], "https://grafana-host/grafana")
         self.assertNotIn("domain", cookies[0])
         self.assertNotIn("path", cookies[0])
 
@@ -270,7 +270,7 @@ class TestGrafanaBrowserSession(unittest.TestCase):
     def single_label_cookie_jar():
         jar = requests.cookies.RequestsCookieJar()
         cookie_args = {
-            "domain": "lt-ekpmon1.local",
+            "domain": "grafana-host.local",
             "path": "/grafana",
             "secure": True,
             "rest": {"SameSite": "Lax", "HttpOnly": None},

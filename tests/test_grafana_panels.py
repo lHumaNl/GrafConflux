@@ -1666,14 +1666,14 @@ class TestGrafanaPanels(unittest.TestCase):
         manager.session.get = Mock(side_effect=[
             Mock(status_code=200, json=Mock(return_value={"dashboard": self.prometheus_repeating_dashboard()})),
             Mock(status_code=200, json=Mock(return_value={"status": "success", "data": [
-                "ad", "global", "nad", "postgres",
+                "orders", "global", "inventory", "postgres",
             ]})),
         ])
 
         panels = manager.get_panels(self.create_timestamps(count=1))
 
         values = [artifact["repeat_value"] for artifact in panels[0].artifacts]
-        self.assertEqual(values, ["ad", "global", "nad", "postgres"])
+        self.assertEqual(values, ["orders", "global", "inventory", "postgres"])
         datasource_call = manager.session.get.call_args_list[1]
         self.assertIn("/api/datasources/proxy/uid/prom-main/api/v1/label/database/values", datasource_call.args[0])
         self.assertEqual(datasource_call.kwargs["params"], {
@@ -1742,7 +1742,7 @@ class TestGrafanaPanels(unittest.TestCase):
                     })),
                     Mock(status_code=200, json=Mock(return_value={
                         "status": "success",
-                        "data": [{"database": "ad"}, {"database": "global"}],
+                        "data": [{"database": "orders"}, {"database": "global"}],
                     })),
                 ])
 
@@ -1750,7 +1750,7 @@ class TestGrafanaPanels(unittest.TestCase):
 
                 self.assertEqual(
                     [artifact["repeat_value"] for artifact in panels[0].artifacts],
-                    ["ad", "global"],
+                    ["orders", "global"],
                 )
                 self.assertEqual(manager.session.get.call_count, 2)
 

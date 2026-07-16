@@ -580,16 +580,16 @@ pod:
   depends_on: namespace
   values_from:
     filters_by_parent:
-      - when: {namespace: ekp-middle}
+      - when: {namespace: production}
         group_name: service
         regex:
-          - scoring-api: '^scoring-api.*'
-          - alfacapture-api:
-              label: AlfaCapture API Service
-              find: '^alfacapture-api.*'
-          - credits-api:
-              label: Credits API Service
-              find: ['^credits-api-.*', '^ufcr-credits-api-.*']
+          - checkout-api: '^checkout-api.*'
+          - billing-api:
+              label: Billing API Service
+              find: '^billing-api.*'
+          - reporting-api:
+              label: Reporting API Service
+              find: ['^reporting-api-.*', '^reporting-worker-.*']
 ```
 
 Do not use `values_from.grouping`: it is unsupported. Do not mix string and mapping items in one grouped `regex`
